@@ -1,0 +1,47 @@
+{
+    "name": "Channel Dev Environment",
+    "build": {
+        "dockerfile": "../DOCKERFILE",
+        "context": "."
+    },
+    "runArgs": [
+        "--network=host",
+        "--gpus=all",
+        "--privileged=true",
+        "-p", "6006:6006",
+        "-p", "6007:6007",
+        "-p", "6008:6008",
+        "-p", "6009:6009",
+        "-p", "6010:6010",
+        "-p", "6011:6011",
+        "-p", "6012:6012",
+        "-p", "6013:6013",
+        "-p", "6014:6014",
+        "-p", "6015:6015",
+        "-p", "6016:6016",
+        "-p", "6017:6017",
+        "-p", "6018:6018",
+        "-p", "6019:6019",
+        "-p", "6020:6020"
+    ],
+    "containerEnv": {
+        "NVIDIA_DRIVER_CAPABILITIES": "graphics,compute,utility"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-toolsai.jupyter"
+            ],
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                "python.linting.enabled": true,
+                "python.formatting.provider": "black"
+            }
+        }
+    },
+    "forwardPorts": [8888, 6006, 6007, 6008, 6009, 6010, 6011, 6012, 6013, 6014, 6015, 6016, 6017, 6018, 6019, 6020],
+    "postCreateCommand": "pip install black pylint",
+    "remoteUser": "root"
+}

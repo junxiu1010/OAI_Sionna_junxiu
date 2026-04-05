@@ -1,0 +1,173 @@
+# G1C Multi-UE MIMO Channel Proxy
+
+G1B v8 (Single-UE MIMO CUDA Graph Pipeline)을 기반으로 **N개 UE 동시 지원**을 구현한 Multi-UE Channel Proxy.
+
+## 개요
+
+- **DL Broadcast**: gNB의 DL 신호를 N개 UE 각각에 독립 채널 적용 후 전달
+- **UL Superposition**: N개 UE의 UL 신호를 각각 채널 적용 후 합산하여 gNB에 전달
+- **UL Bypass**: 채널 미적용 시 각 UE sequential copy (마지막 UE 데이터가 gNB에 도달)
+- **G1B v8 최적화 계승**: CUDA Graph, CH_COPY view+release, NoiseProducer batch 사전 생성
+
+## 아키텍처
+
+```
+gNB Process                                              UE[0] Process
+  dl_tx write ──┐                                  ┌── dl_rx read
+  ul_rx read  ──┤                                  ├── ul_tx write
+                │                                  │
+        [SHM: gpu_ipc_shm]              [SHM: gpu_ipc_shm_ue0]
+                │                                  │
+                └──────── Proxy (v0.py) ───────────┘
+                          │         │
+                     [SHM: gpu_ipc_shm_ue1]
+                          │         │
+                    UE[1] Process
+                      dl_rx read
+                      ul_tx write
+```
+
+### IPC V6 Multi-Instance 전략
+
+기존 IPC V6를 재사용하되, UE별로 독립 SHM 인스턴스를 생성:
+
+| 인스턴스 | SHM 경로 | 사용 버퍼 | 미사용 (메모리 낭비) |
+|----------|----------|-----------|---------------------|
+| gNB | `/tmp/oai_gpu_ipc/gpu_ipc_shm` | dl_tx, ul_rx | dl_rx, ul_tx |
+| UE[k] | `/tmp/oai_gpu_ipc/gpu_ipc_shm_ue{k}` | dl_rx, ul_tx | dl_tx, ul_rx |
+
+### DL 데이터 흐름
+
+```
+gNB dl_tx (timestamp polling)
+    │
+    ├── Channel[0](H_0) → UE[0] dl_rx
+    ├── Channel[1](H_1) → UE[1] dl_rx
+    └── Channel[N-1](H_{N-1}) → UE[N-1] dl_rx
+```
+
+### UL 데이터 흐름 (Channel Mode)
+
+```
+UE[0] ul_tx ── Channel[0](H_0^T) ──┐
+UE[1] ul_tx ── Channel[1](H_1^T) ──┤── Σ (complex128) ── clip(int16) ── gNB ul_rx
+UE[N-1] ul_tx ─ Channel[N-1] ──────┘
+```
+
+UL 타이밍: 모든 UE가 데이터를 제공할 때까지 대기 (slowest UE criterion).
+
+### UL 데이터 흐름 (Bypass Mode)
+
+```
+UE[0] ul_tx ── bypass_copy ── gNB ul_rx  (덮어씀)
+UE[1] ul_tx ── bypass_copy ── gNB ul_rx  (덮어씀)
+                                          → 마지막 UE 데이터만 남음
+```
+
+## Per-UE 독립 리소스
+
+각 UE는 완전히 독립된 리소스를 가짐:
+
+- `GPUIpcV6Interface`: SHM 경로 분리
+- `GPUSlotPipeline` (DL/UL): CUDA Graph 포함
+- `ChannelProducer`: Sionna 채널 생성 스레드
+- `RingBuffer`: 채널 계수 버퍼
+- `NoiseProducer`: AWGN 사전 생성 스레드
+
+## C 코드 변경 (gpu_ipc_v6)
+
+`gpu_ipc_v6.c`의 `gpu_ipc_v6_init()`에서 UE 역할일 때 `RFSIM_GPU_IPC_UE_IDX` 환경변수를 읽어 per-UE SHM 경로 생성:
+
+```c
+// UE role: RFSIM_GPU_IPC_UE_IDX=k → /tmp/oai_gpu_ipc/gpu_ipc_shm_ue{k}
+// gNB role: 기본 경로 유지 → /tmp/oai_gpu_ipc/gpu_ipc_shm
+```
+
+`gpu_ipc_v6_ctx_t`에 `char shm_path[256]` 필드 추가.
+
+**빌드 필요**: C 코드 변경 후 OAI 재빌드 필수.
+
+```bash
+cd ~/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets
+./build_oai -w SIMU --ninja --build-lib "telnetsrv" -c
+```
+
+## 파일 구조
+
+```
+G1C_MultiUE_MIMO_Channel_Proxy/
+├── v0.py              # Multi-UE proxy (G1B v8 기반)
+├── launch_all.sh      # 통합 런처 (gNB + N UE + Proxy)
+├── README.md          # 이 문서
+├── v0.py.bak          # 백업 (원본 G1B v8 복사본)
+└── launch_all.sh.bak  # 백업
+```
+
+## 실행 방법
+
+### 사전 조건
+
+1. OAI 재빌드 (C 코드 변경 반영)
+2. Sionna Docker 컨테이너 (`sionna-proxy`) 실행 중
+3. GPU (CUDA) 사용 가능
+
+### 검증 명령어
+
+**Test 1: 1 UE, Bypass (G1B 호환성 확인)**
+```bash
+sudo bash vRAN_Socket/G1C_MultiUE_MIMO_Channel_Proxy/launch_all.sh \
+    -n 1 -b -d 30
+```
+
+**Test 2: 2 UEs, Bypass, SISO**
+```bash
+sudo bash vRAN_Socket/G1C_MultiUE_MIMO_Channel_Proxy/launch_all.sh \
+    -n 2 -b -d 30
+```
+
+**Test 3: 2 UEs, Bypass, 2x1 MIMO**
+```bash
+sudo bash vRAN_Socket/G1C_MultiUE_MIMO_Channel_Proxy/launch_all.sh \
+    -n 2 -b -ga 2 1 -ua 2 1 -d 30
+```
+
+**Test 4: 2 UEs, Channel, SISO**
+```bash
+sudo bash vRAN_Socket/G1C_MultiUE_MIMO_Channel_Proxy/launch_all.sh \
+    -n 2 -d 60
+```
+
+**Test 5: 2 UEs, Channel, 2x1 MIMO, Noise**
+```bash
+sudo bash vRAN_Socket/G1C_MultiUE_MIMO_Channel_Proxy/launch_all.sh \
+    -n 2 -ga 2 1 -ua 2 1 -pl 5 -nf -50 -d 60
+```
+
+### 확인 사항
+
+- `proxy.log`: 모든 UE IPC 초기화 성공 메시지 확인
+- `gnb.log`: gNB DL/UL 정상 동작 확인
+- `ue{k}.log`: 각 UE의 PSS/SSS 검출 및 동기화 확인
+- `nrMAC_stats.log`: CQI/MCS/BLER 확인 (2 UE 모두 스케줄링)
+
+## G1B v8 대비 변경사항
+
+| 항목 | G1B v8 | G1C v0 |
+|------|--------|--------|
+| UE 수 | 1 | N (--num-ues) |
+| IPC 인스턴스 | 1 | 1 + N |
+| SHM 파일 | gpu_ipc_shm | gpu_ipc_shm + gpu_ipc_shm_ue{k} |
+| DL 처리 | 1:1 | 1:N broadcast |
+| UL 처리 | 1:1 | N:1 superposition/bypass |
+| 파이프라인 | DL 1개 + UL 1개 | DL N개 + UL N개 |
+| 채널 생성 | 1 producer | N producers |
+| GPU 메모리 | 4 buffers | 4 + 4N buffers |
+| C 코드 | gpu_ipc_v6 | + RFSIM_GPU_IPC_UE_IDX 지원 |
+
+## 알려진 제한사항 (v0)
+
+- **GPU 메모리 낭비**: 각 IPC 인스턴스가 4 버퍼를 할당하지만 2개만 사용 (v0 단순화)
+- **UL 노이즈 위치**: 수신기(gNB) 노이즈가 아닌 per-UE 노이즈 (물리적으로 부정확하지만 v0 허용)
+- **채널 독립성**: 모든 UE가 동일한 PDP 기반 (위치/속도만 랜덤)
+- **UL 타이밍**: slowest UE 기준으로 처리 — 느린 UE가 전체 UL 처리 지연 가능
+- **Socket 모드**: Multi-UE 미지원 (GPU IPC 모드 전용)

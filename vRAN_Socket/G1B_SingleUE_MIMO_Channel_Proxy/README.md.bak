@@ -1,0 +1,394 @@
+# G1B: Multi-UE MIMO Channel Proxy
+
+G0 v12 기반 1 gNB - N UE **MIMO** 채널 프록시.
+G1A(SISO Multi-UE)에서 MIMO로 확장하는 버전.
+
+## G0 → G1A → G1B 진화 경로
+
+| 세대 | 구성 | 안테나 | 핵심 특징 |
+|------|------|--------|----------|
+| **G0** | 1 gNB + 1 UE | SISO (1×1) | 단일 UE, GPU IPC V1, CUDA Graph |
+| **G1A** | 1 gNB + N UE | SISO (1×1) | Multi-UE, GPU IPC V2~V4, 배치 FFT |
+| **G1B** | 1 gNB + N UE | **MIMO (N_t×N_r)** | Multi-UE + MIMO, G0 기반 확장 |
+
+## 원래 계획 (A/B/C/D 세트)
+
+| 세트 | 내용 | 상태 | 해결 버전 |
+|------|------|------|-----------|
+| **B** | 초기 싱크 (timestamp 기반 circular buffer, SHM, CUDA IPC) | **완료** | v1 (IPC V5) |
+| **C** | 연속 싱크/안전 (range-based copy, gap zero-fill, 안정적 동작) | **완료** | v1 (IPC V5) |
+| **A** | MIMO (다중 안테나, Single UE) — bypass 모드 | **완료** | v2→v3 (IPC V6) |
+| **A** | MIMO 채널 적용 (Sionna MIMO channel modeling) + CSI CQI 리포팅 수정 | **구현+OAI수정** | v4 (IPC V6 + einsum + OAI CSI fix) |
+| **A** | CUDA Graph 통합 (einsum→broadcast*sum, GPU index array, pre-alloc) | **완료** | v5 |
+| **D** | Multi-UE | **미착수** | - |
+
+### B+C 세트 상세 (v1에서 해결)
+
+- GPU circular buffer + timestamp 인덱싱
+- SHM으로 CUDA IPC handle 교환
+- range-based copy (proxy가 delta 전체를 처리)
+- 초기 head 설정 (`max(0, head - cir_time)`)
+- gap zero-fill (C측 writer)
+- read availability 강화 (`last < target_ts + nsamps - 1`)
+- DL/UL 대칭 bypass (`-b` 시 DL+UL 모두 패스스루)
+
+### A 세트 상세 (v2→v3에서 해결, bypass 한정)
+
+- GPU IPC V6: per-buffer nbAnt/cir_size
+- 비대칭 안테나 지원 (gNB != UE antenna count)
+- bypass_copy: truncate/zero-pad (비대칭), gpu_circ_copy (대칭)
+- launch_all.sh: `-ga Nx Ny`, `-ua Nx Ny` 옵션
+- OAI 안테나 포트 오버라이드 (`pdsch_AntennaPorts_XP`, `N1`, `pusch_AntennaPorts`)
+- **채널 적용(non-bypass)은 미구현**: `-b` 없이 MIMO에서 Sionna 채널을 적용하는 로직 필요
+
+## 추가로 해결한 항목 (원래 세트 외)
+
+| 항목 | 내용 | 해결 버전 |
+|------|------|-----------|
+| DL/UL 대칭 bypass | `-b` 시 DL+UL 모두 패스스루 (v0는 DL만) | v1 |
+| warmup AttributeError | bypass 모드에서 channel_buffer 미초기화 크래시 | v1 |
+| IPC 명명 통일 | `gpu_circ` → `gpu_ipc_v5` 네이밍 정리 | v1 |
+| Proxy 누락 write 버그 | timestamp 변화만 감지 → range-based 전환 | v1 |
+| 초기 head overflow 버그 | `cir_size` → `cir_time` (nbAnt>1 시 GPU 버퍼 초과) | v3 |
+| gNB 4안테나 Segfault | OAI antenna port CLI 오버라이드 누락 | v3 |
+| CSI CQI 리포팅 미전달 | UE MAC `cri_RI_LI_PMI_CQI` 인코더 미구현 → `get_csirs_RI_PMI_CQI_payload` 호출 | v4 (OAI) |
+| SISO CQI 리포트 미설정 | gNB RRC가 1-port에서 CQI 리포트 미생성 → `config_csi_meas_report` 1-port 확장 | v4 (OAI) |
+| gNB 디코더 r_index OOB | `ri_bitlen=0`일 때 `r_index=-1` → `r_index=0` 기본값 | v4 (OAI) |
+| bitmap 디버그 핵 제거 | `meas_bitmap==1→0x1e` 강제 설정 → proper config으로 불필요, 주석 처리 | v4 (OAI) |
+| MIMO 채널 정규화 | FFT축 정규화 → TX 안테나축 정규화 (`axis=2`) | v4 (Proxy) |
+
+## 아직 해야 할 것
+
+| 항목 | 설명 | 난이도 |
+|------|------|--------|
+| **D 세트: Multi-UE** | UE별 별도 버퍼/채널, SHM 확장, 독립 동기화. IPC V6 구조 확장 필요 | 높음 |
+| **v5 CUDA Graph 성능 검증** | v5 SISO/MIMO 채널 적용 + CUDA Graph 캡처 성공 확인, v4 대비 속도 비교 | 중간 |
+
+## 버전 이력
+
+| 버전 | 파일 | IPC | 핵심 변경 |
+|------|------|-----|----------|
+| **v0** | `v0.py` | V1 | G0 v12 복사 (SISO 1UE 기준선) |
+| **v1** | `v1.py` | V5 | circular buffer, DL/UL 대칭, timestamp polling, range-based copy |
+| **v2** | `v2.py` | V6 | per-buffer antenna, MIMO bypass, 비대칭 안테나 지원 |
+| **v3** | `v3.py` | V6 | cir_time head 버그 수정, OAI antenna port 오버라이드 |
+| **v4** | `v4.py` | V6 | MIMO 채널 적용 (einsum), DL/UL pipeline, PanelArray(Nx,Ny), CSI CQI fix (OAI 4파일), TX축 정규화 |
+| **v5** | `v5.py` | V6 | CUDA Graph 통합: einsum→broadcast*sum, GPU index array, pre-alloc buffers |
+
+## v3 → v4 핵심 변경
+
+| 항목 | v3 | v4 |
+|------|-----|-----|
+| 채널 적용 | bypass만 (미구현) | Sionna MIMO einsum |
+| Pipeline | 단일 GPUSlotPipeline | DL/UL 별도 pipeline |
+| _gpu_compute_core | SISO 전용 (1D) | MIMO (de-interleave → einsum → re-interleave) |
+| ChannelProducer | tf.squeeze (SISO 함정) | 명시적 축 제거, (N_sym, N_r, N_t, FFT) |
+| RingBuffer shape | (FFT_SIZE,) | (ue_ant, gnb_ant, FFT_SIZE) |
+| _ipc_apply_channel | nbAnt 단일 | src/dst 분리, direction(DL/UL), H^T 자동 |
+| Sionna PanelArray | 하드코딩 1x1 | launch_all.sh Nx/Ny 동적 설정 |
+| warmup | 단일 pipeline | DL/UL 각각 identity-like channel로 워밍업 |
+
+## v4 → v5 핵심 변경
+
+| 항목 | v4 | v5 |
+|------|-----|-----|
+| MIMO 채널 적용 | `einsum('srtf,stf->srf')` (cuBLAS) | `broadcast multiply + sum` (CUDA Graph safe) |
+| OFDM 심볼 추출 | Python for-loop | GPU 인덱스 배열 (`gpu_ext_idx`) |
+| OFDM 재구성 | Python for-loop (scatter+CP) | GPU 인덱스 scatter (`gpu_data_dst`, `gpu_cp_dst/src`) |
+| 중간 버퍼 | `cp.zeros()` 동적 할당 | `__init__` 사전 할당 (`_buf_HX`, `_buf_Yf`, `_buf_out_2d`, `_buf_iq_out_3d`) |
+| CUDA Graph | capture 실패 (cuBLAS 비호환) | capture 성공 (모든 연산 graph-safe) |
+| 수학적 동치 | `Y = einsum(H, X)` | `Y = sum(H * X[newaxis], axis=tx)` — 완전 동치 |
+
+## v3 기능 지원 범위
+
+| 기능 | 지원 |
+|------|------|
+| GPU IPC V6 (per-buffer antenna) | O |
+| SISO bypass (1x1) | O |
+| 대칭 MIMO bypass (NxN) | O |
+| 비대칭 MIMO bypass (gNB != UE) | O |
+| gNB 최대 4안테나 | O |
+| UE 최대 2안테나 (검증 완료) | O |
+| OAI antenna port 자동 설정 | O (2, 4안테나) |
+| DL/UL 대칭 bypass | O |
+| 초기 싱크 (B set) | O |
+| 연속 싱크 (C set) | O |
+| Sionna 채널 적용 (SISO) | 코드 있음, **미검증** |
+| Sionna 채널 적용 (MIMO) | **미구현** |
+| Multi-UE (D set) | **미구현** |
+
+## v4 기능 지원 범위
+
+| 기능 | 지원 |
+|------|------|
+| v3 전체 기능 (bypass 포함) | O |
+| Sionna MIMO 채널 적용 (einsum) | O |
+| DL/UL 방향별 Pipeline | O |
+| DL: H@X, UL: H^T@X 자동 전환 | O |
+| Sionna PanelArray Nx/Ny 동적 설정 | O |
+| ChannelProducer MIMO H 정규화 | O |
+| identity-like 채널 패딩 (버퍼 언더런) | O |
+| SISO(1x1) MIMO 특수 경우 호환 | O |
+| Multi-UE (D set) | **미구현** |
+
+## v5 기능 지원 범위
+
+| 기능 | 지원 |
+|------|------|
+| v4 전체 기능 | O |
+| CUDA Graph MIMO 캡처 | O (einsum→broadcast*sum) |
+| GPU 인덱스 배열 OFDM | O (for-loop 제거) |
+| 사전 할당 버퍼 | O (out= 파라미터) |
+| Multi-UE (D set) | **미구현** |
+
+### v5 검증 명령어
+
+```bash
+cd /home/dclcom57/oai_sionna_junxiu/vRAN_Socket/G1B_MultiUE_MIMO_Channel_Proxy
+
+# v5 SISO bypass
+sudo bash launch_all.sh -v v5 -m gpu-ipc -b
+
+# v5 SISO 채널 적용
+sudo bash launch_all.sh -v v5 -m gpu-ipc
+
+# v5 대칭 MIMO bypass (2x2)
+sudo bash launch_all.sh -v v5 -m gpu-ipc -b -ga 2 1 -ua 2 1
+
+# v5 대칭 MIMO 채널 적용 (2x2)
+sudo bash launch_all.sh -v v5 -m gpu-ipc -ga 2 1 -ua 2 1
+
+# v5 비대칭 MIMO 채널
+sudo bash launch_all.sh -v v5 -m gpu-ipc -ga 2 1
+```
+
+### v4 검증 명령어
+
+```bash
+cd /home/dclcom57/oai_sionna_junxiu/vRAN_Socket/G1B_MultiUE_MIMO_Channel_Proxy
+
+# v4 SISO bypass (v3 호환 확인)
+sudo bash launch_all.sh -v v4 -m gpu-ipc -b
+
+# v4 SISO 채널 적용
+sudo bash launch_all.sh -v v4 -m gpu-ipc
+
+# v4 대칭 MIMO 채널
+sudo bash launch_all.sh -v v4 -m gpu-ipc -ga 2 1 -ua 2 1
+
+# v4 비대칭 MIMO 채널
+sudo bash launch_all.sh -v v4 -m gpu-ipc -ga 2 1
+```
+
+## 검증된 테스트 구성 및 성능
+
+모든 테스트는 **bypass 모드 (`-b`)** 로 수행. 채널 적용 테스트는 아직 미수행.
+
+| 구성 | 버전 | DL/s | Proxy/slot | Wall/slot | IPC+OAI/slot | DL BLER | 상태 |
+|------|------|------|-----------|----------|-------------|---------|------|
+| SISO (1x1) | v2 | ~947 | 0.14ms | 0.25ms | 0.11ms | ~0 | 성공 |
+| gNB=2, UE=1 | v2 | ~894 | 0.22ms | 0.40ms | 0.17ms | ~0 | 성공 |
+| gNB=2, UE=2 | v2 | - | - | - | - | - | 크래시 (head overflow) |
+| gNB=4, UE=1 | v2 | - | - | - | - | - | gNB Segfault |
+| **gNB=2, UE=2** | **v3** | **~515** | **0.12ms** | **0.37ms** | **0.25ms** | **~0** | **성공** |
+| **gNB=4, UE=1** | **v3** | **~844** | **0.22ms** | **0.54ms** | **0.32ms** | **0.45** | **성공** |
+| **gNB=4, UE=2** | **v3** | **~760** | **0.23ms** | **0.50ms** | **0.28ms** | **0.02** | **성공** |
+
+### 성능 분석 참고
+
+- DL/s 차이는 TDD 스케줄링에서 UL 비중 변화 때문 (UE 안테나 증가 → UL 활발)
+- Proxy 처리 시간은 대칭(gpu_circ_copy)이 비대칭(de-interleave/re-interleave)보다 빠름
+- gNB 4안테나 + UE 1안테나 시 DL BLER 0.45: bypass에서 4→1 truncate로 3안테나 데이터 유실
+- gNB 4안테나 + UE 2안테나 시 DL BLER 0.02: 수신 다이버시티 효과로 품질 개선
+
+### 검증 명령어
+
+```bash
+cd /home/dclcom57/oai_sionna_junxiu/vRAN_Socket/G1B_MultiUE_MIMO_Channel_Proxy
+
+# v3 SISO bypass
+sudo bash launch_all.sh -v v3 -m gpu-ipc -b
+
+# v3 비대칭 (gNB 2x1)
+sudo bash launch_all.sh -v v3 -m gpu-ipc -b -ga 2 1
+
+# v3 대칭 (gNB 2x1, UE 2x1)
+sudo bash launch_all.sh -v v3 -m gpu-ipc -b -ga 2 1 -ua 2 1
+
+# v3 4안테나 gNB
+sudo bash launch_all.sh -v v3 -m gpu-ipc -b -ga 4 1
+
+# v3 4안테나 gNB + 2안테나 UE
+sudo bash launch_all.sh -v v3 -m gpu-ipc -b -ga 4 1 -ua 2 1
+```
+
+## v2에서 v3로의 버그 수정 내용
+
+### 버그 1: 초기 head overflow (Proxy 크래시)
+
+`run_ipc()`에서 초기 proxy head를 `cir_size` 기준으로 계산하면, `nbAnt > 1`일 때 `delta * nbAnt > cir_size` → GPU 버퍼 초과 접근.
+
+```python
+# v2 (버그): cir_size = cir_time * nbAnt
+proxy_dl_head = max(0, gnb_dl_head - self.ipc.dl_tx_cir_size)
+# v3 (수정): cir_time = 시간 샘플 기준 순환 주기
+proxy_dl_head = max(0, gnb_dl_head - self.ipc.cir_time)
+```
+
+- SISO(nbAnt=1): `cir_size == cir_time` → 변화 없음
+- MIMO(nbAnt>1): `delta <= cir_time` → `total = delta * nbAnt <= cir_size` → 안전
+
+### 버그 2: gNB 4안테나 Segfault (OAI 크래시)
+
+`launch_all.sh`에서 `--RUs.[0].nb_tx 4`만 전달하고, OAI 상위 레이어 안테나 포트 설정을 누락.
+
+```bash
+# v2: RU 안테나만 설정 → PHY/MAC과 불일치 → Segfault
+GNB_ANT_ARGS="--RUs.[0].nb_tx 4 --RUs.[0].nb_rx 4"
+
+# v3: 안테나 포트도 함께 설정
+GNB_ANT_ARGS="--RUs.[0].nb_tx 4 --RUs.[0].nb_rx 4"
+GNB_ANT_ARGS+=" --gNBs.[0].pdsch_AntennaPorts_XP 2"
+GNB_ANT_ARGS+=" --gNBs.[0].pusch_AntennaPorts 4"
+GNB_ANT_ARGS+=" --gNBs.[0].pdsch_AntennaPorts_N1 2"  # 4안테나 시
+```
+
+## OAI 안테나 제한 (현재 버전 2025.w28)
+
+- 최대 MIMO 레이어: `NR_MAX_NB_LAYERS 4` (`nr_common.h`)
+- RU 안테나: 1, 2, 4 지원
+- 안테나 포트 설정 패턴:
+  - 2안테나: `pdsch_AntennaPorts_XP=2`, `pusch_AntennaPorts=2`
+  - 4안테나: `pdsch_AntennaPorts_XP=2`, `pdsch_AntennaPorts_N1=2`, `pusch_AntennaPorts=4`
+- OAI 현재 버전: **2025.w28** (2025-07-25), 최신: **2026.w08** (약 7개월 차이)
+
+## v0 → v1 핵심 변경
+
+| 항목 | v0 (GPU IPC V1) | v1 (GPU IPC V5) |
+|------|-----------------|-----------------|
+| 버퍼 | 4 flat buffers (240KB) | 4 circular buffers (460800 samples each) |
+| 동기 | ready-flag 핑퐁 | timestamp polling |
+| UL 처리 | 항상 패스스루 | `-b` 없으면 채널 적용, `-b` 있으면 패스스루 |
+| DL 처리 | custom_channel 조건 | 동일 (v0과 같음) |
+| Gap 처리 | 없음 | C측 writer가 gap zero-fill |
+| 초기 sync | Proxy ready → client open | C측 reader가 첫 ts로 nextRxTstamp 설정 |
+| 환경변수 | `RFSIM_GPU_IPC=1` | `RFSIM_GPU_IPC_V5=1` |
+
+## v1 → v2 핵심 변경
+
+| 항목 | v1 (GPU IPC V5) | v2 (GPU IPC V6) |
+|------|-----------------|-----------------|
+| 버퍼 크기 | 4 동일 cir_size=460800 | 4 독립 cir_size (cir_time*nbAnt) |
+| 안테나 | 전역 nbAnt | per-buffer nbAnt (gNB/UE 분리) |
+| SHM magic | 0x47505536 | 0x47505537 |
+| Bypass copy | 동일 nbAnt 가정 | 대칭=직접, 비대칭=truncate/pad |
+| 환경변수 | `RFSIM_GPU_IPC_V5=1` | `RFSIM_GPU_IPC_V6=1` |
+| 런처 옵션 | (없음) | `-ga Nx Ny`, `-ua Nx Ny` |
+
+## v2 → v3 핵심 변경
+
+| 항목 | v2 | v3 |
+|------|-----|-----|
+| 초기 head 상한 | `cir_size` (nbAnt>1 시 overflow) | `cir_time` (항상 안전) |
+| gNB antenna port | RU만 설정 (4ant segfault) | RU + PHY/MAC port 동시 설정 |
+| 대칭 MIMO | 크래시 | 정상 동작 |
+| gNB 4안테나 | Segfault | 정상 동작 |
+
+## 파일 구조
+
+```
+G1B_MultiUE_MIMO_Channel_Proxy/
+  v0.py                 # G0 v12 복사 (SISO 1UE 기준선, GPU IPC V1)
+  v1.py                 # GPU IPC V5 circular buffer (DL/UL 대칭 채널)
+  v2.py                 # GPU IPC V6 per-buffer antenna (MIMO bypass)
+  v3.py                 # GPU IPC V6 + cir_time head fix + antenna port override
+  v4.py                 # GPU IPC V6 + MIMO Channel Application (einsum, DL/UL pipeline)
+  v5.py                 # GPU IPC V6 + MIMO CUDA Graph Pipeline (broadcast*sum, GPU index)
+  launch_all.sh         # 통합 런처 (v0~v5 자동 분기)
+  launch_all.sh.bak     # launch_all.sh 백업 (v2 시점)
+  실행_매뉴얼.txt        # 실행 방법
+  README.md             # 이 문서
+```
+
+## CLI 옵션
+
+### launch_all.sh
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `-v VERSION` | v0 | Proxy 버전: v0, v1, v2, v3, v4, v5 |
+| `-m MODE` | gpu-ipc | 통신 모드: socket, gpu-ipc |
+| `-n NUM_UES` | 1 | UE 수 |
+| `-b` | off | Sionna 채널 바이패스 (IQ 패스스루) |
+| `-ga Nx Ny` | 1 1 | gNB 안테나 배열 (가로 x 세로) |
+| `-ua Nx Ny` | 1 1 | UE 안테나 배열 (가로 x 세로) |
+| `-pl dB` | 0 | 경로 손실 |
+| `-snr dB` | off | AWGN SNR |
+
+### Proxy (v5.py)
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--mode` | socket | socket / gpu-ipc |
+| `--gnb-ant` | 1 | gNB 총 안테나 수 |
+| `--ue-ant` | 1 | UE 총 안테나 수 |
+| `--gnb-nx` | 1 | gNB 안테나 가로 (Sionna PanelArray) |
+| `--gnb-ny` | 1 | gNB 안테나 세로 |
+| `--ue-nx` | 1 | UE 안테나 가로 |
+| `--ue-ny` | 1 | UE 안테나 세로 |
+| `--custom-channel` | on | Sionna 채널 활성화 |
+| `--no-custom-channel` | - | 채널 비활성화 (IQ 패스스루) |
+| `--path-loss-dB` | 0 | 경로 손실 (dB) |
+| `--snr-dB` | None | AWGN 노이즈 (None=off) |
+| `--enable-gpu` | on | GPU 가속 |
+| `--use-cuda-graph` | on | CUDA Graph |
+
+## OAI 빌드
+
+```bash
+cd ~/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets
+
+# 초기 빌드
+./build_oai -w SIMU --ninja --gNB --nrUE --build-lib "nrscope"
+
+# 증분 빌드 (Makefile 환경)
+cd ran_build/build
+make rfsimulator       # librfsimulator.so (V1~V6 포함)
+make nr-softmodem      # gNB
+make nr-uesoftmodem    # UE
+```
+
+## 참고: G1A에서 배운 교훈
+
+| 교훈 | G1A 경험 | G1B 대응 |
+|------|---------|---------|
+| IPC 프로토콜 안정성 | V2~V4 여러 시도 끝에 timestamp 오프셋/역점프 문제 미해결 | G0 V1 기반으로 시작, 안정 확인 후 확장 |
+| DL partial read | ring slot 단위 pop으로 sub-slot read 시 데이터 유실 | V5의 circular buffer + range-based copy |
+| TDD 데드락 | DL/UL 비대칭 + 블로킹 → 교착 | timestamp polling, non-blocking |
+| complex128 필수 | complex64로 PSS/SSS 동기화 실패 | complex128 유지 |
+| CUDA Graph 효과 | 커널 launch 오버헤드가 주 병목 | v0부터 CUDA Graph 유지 |
+
+## MIMO 채널 적용 구현 (v4→v5)
+
+```
+# 핵심 연산 (per subcarrier, per OFDM symbol):
+# v4: cp.einsum('srtf,stf->srf', H, X)
+# v5: cp.multiply(H, X[:, newaxis, :, :], out=buf_HX) + cp.sum(buf_HX, axis=2, out=buf_Yf)
+#     → 수학적 동치, CUDA Graph capturable
+
+DL:  Y[s,r,f] = sum_t H[s,r,t,f] * X[s,t,f]
+UL:  Z[s,r,f] = sum_t H^T[s,r,t,f] * X[s,t,f]
+
+# SISO 호환: n_tx=1, n_rx=1 → 스칼라곱과 동치
+```
+
+### 데이터 흐름 (DL, v5)
+
+```
+OAI gNB → interleave [s*nbAnt+a] → gpu_dl_tx(circ)
+  → Proxy de-interleave → (30720, N_t, 2) → complex(30720, N_t)
+  → OFDM extract via GPU index array (14, N_t, 2048) → FFT(14, N_t, 2048)
+  → broadcast*sum with H(14, N_r, N_t, 2048) → Yf(14, N_r, 2048) [CUDA Graph]
+  → IFFT → reconstruct via GPU index scatter (30720, N_r) → PL/AWGN → re-interleave
+  → gpu_dl_rx(circ) → OAI UE de-interleave
+```

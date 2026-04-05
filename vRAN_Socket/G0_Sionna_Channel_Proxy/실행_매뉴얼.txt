@@ -1,0 +1,208 @@
+================================================================================
+  G0 실행 매뉴얼 — 1 gNB + 1 UE (SISO) Sionna Channel Proxy
+================================================================================
+
+  구성: gNB 1대 + UE 1대, SISO (단일 안테나)
+  Proxy: v12_gpu_ipc.py (GPU IPC + Socket 듀얼 모드)
+  채널: Sionna 3GPP TR 38.901 (OFDM FFT convolution, complex128)
+
+  실행 순서: 컨테이너 확인 → Proxy/gNB/UE 실행 (모드별 순서 다름)
+  ※ 터미널 추가: Ctrl+Shift+`
+
+================================================================================
+  0. 사전 준비
+================================================================================
+
+  ── 컨테이너 관리 ──────────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu
+
+  docker compose ps                    # 상태 확인
+  docker compose up -d oai_sionna_proxy    # 컨테이너 시작
+  docker compose down                  # 컨테이너 종료
+
+  ── OAI 최초 빌드 (한 번만) ────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets
+  ./build_oai -w SIMU --ninja --nrUE --gNB --build-lib "nrscope"
+
+  ※ CMakeLists.txt에 GPU IPC V1/V2 모두 포함되어 있음 — 별도 플래그 불필요
+  ※ 모드 전환은 런타임 환경변수로 수행 (Socket / GPU IPC V1 / GPU IPC V2)
+  ※ -C 옵션은 clean-all (전체 삭제) 이므로 초기 빌드 시에만 사용
+  ※ 완료 후 ran_build/build/ 생성. 이후에는 ninja 증분 빌드만 사용.
+
+================================================================================
+  모드 A: GPU IPC 모드 (v12, 최고 성능, Socket 제거)
+================================================================================
+
+  통신: CUDA IPC (GPU 공유 메모리, 소켓 없음)
+  순서: Proxy → gNB → UE
+
+  ── 터미널 1: Sionna Proxy ────────────────────────────────────────────
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=gpu-ipc
+
+  ※ "Entering main loop..." 메시지 확인 후 gNB 실행
+
+  ── 터미널 2: OAI gNB ─────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem
+  sudo RFSIM_GPU_IPC=1 ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim
+
+  ── 터미널 3: OAI UE ──────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-uesoftmodem
+  sudo RFSIM_GPU_IPC=1 ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 --rfsim
+
+  ※ RFSIM_GPU_IPC=1 환경변수로 GPU IPC 활성화
+  ※ 공유 메모리 경로: /tmp/oai_gpu_ipc/gpu_ipc_shm
+
+================================================================================
+  모드 B: Socket 모드 (기존 방식)
+================================================================================
+
+  통신: TCP Socket (gNB:6017, Proxy:6018)
+  순서: gNB → Proxy → UE
+
+  ── 터미널 1: OAI gNB ─────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem
+  sudo ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim --rfsimulator.serverport 6017
+
+  ── 터미널 2: Sionna Proxy ────────────────────────────────────────────
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=socket
+
+  ── 터미널 3: OAI UE ──────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-uesoftmodem
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 \
+    --rfsim --rfsimulator.serverport 6018
+
+  ※ gNB → Proxy → UE 순서 필수 (gNB 6017 대기 → Proxy 연결 후 6018 대기 → UE 연결)
+
+================================================================================
+  Proxy CLI 옵션
+================================================================================
+
+  옵션                     기본값    설명
+  ────────────────────────  ────────  ──────────────────────────────
+  --mode <socket|gpu-ipc>  socket    통신 모드
+  --path-loss-dB <값>      0         Path Loss (음수=감쇠, 0=무손실)
+  --snr-dB <값>            None      AWGN noise SNR (미지정=off)
+  --no-ch-en               -         채널 비활성화 (bypass)
+  --custom-channel         on        Sionna 채널 모델 활성화
+  --enable-gpu/--disable-gpu  on     GPU 가속
+  --use-pinned-memory      on        Pinned Memory
+  --use-cuda-graph         on        CUDA Graph (커널 런치 최적화)
+  --ipc-shm-path <경로>    /tmp/oai_gpu_ipc/gpu_ipc_shm
+  --profile-interval <N>   100       프로파일 출력 간격 (슬롯)
+  --profile-window <N>     500       롤링 윈도우 크기
+  --dual-timer-compare     on        CPU+GPU 듀얼 타이머
+
+  ■ 사용 예시:
+
+  # GPU IPC 기본 (채널만, noise 없음)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=gpu-ipc
+
+  # GPU IPC + 채널 + AWGN noise (SNR 20 dB)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=gpu-ipc --snr-dB 20
+
+  # GPU IPC + PL 감쇠 + noise
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=gpu-ipc --path-loss-dB -3 --snr-dB 15
+
+  # Socket 모드 (채널 bypass, 디버깅용)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=socket --no-ch-en
+
+  # 이전 버전 사용 (v10 CUDA Graph)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v10_cuda_graph.py
+
+  # 이전 버전 사용 (v11 E2E 프로파일)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v11_profile_instrumented.py \
+    --path-loss-dB -3 --snr-dB 3
+
+================================================================================
+  프로세스 종료
+================================================================================
+
+  sudo pkill -9 nr-softmodem
+  sudo pkill -9 nr-uesoftmodem
+
+  ※ Proxy는 Ctrl+C로 종료
+
+================================================================================
+  신호 흐름
+================================================================================
+
+  DL: gNB → Proxy(Sionna 채널 적용) → UE
+  UL: UE → Proxy(passthrough 또는 bypass) → gNB
+
+  Tx → Sionna(multipath FFT conv) → ×PL → +AWGN → int16 clip → OAI UE
+  ※ OAI rfsimulator는 channel_mode=2 (bypass) 상태로 사용
+
+================================================================================
+  정상 동작 확인 체크리스트
+================================================================================
+
+  컨테이너:
+  [ ] docker compose ps → oai_sionna_proxy가 Up 상태
+  [ ] docker exec -it oai_sionna_proxy nvidia-smi → GPU 인식
+
+  GPU IPC 모드:
+  [ ] Proxy 시작 후 "Entering main loop..." 출력
+  [ ] gNB 시작 후 Proxy에 "DL slot" 로그 출력 시작
+  [ ] UE 시작 후 SSB 동기화 → RACH → 접속 성공
+
+  Socket 모드:
+  [ ] gNB 시작 후 "rfsimulator: accepting connection" 대기
+  [ ] Proxy 시작 후 gNB 연결 + UE 포트 6018 대기
+  [ ] UE 시작 후 Proxy 연결 → SSB 동기화 → RACH → 접속 성공
+
+  공통:
+  [ ] UE 로그에 "Received RRCSetup" 확인
+  [ ] gNB 로그에 "UE RNTI" 할당 확인
+
+================================================================================
+  관련 파일
+================================================================================
+
+  Proxy 코드:
+    vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py   (메인, 듀얼 모드)
+    vRAN_Socket/G0_Sionna_Channel_Proxy/v10_cuda_graph.py (Socket only)
+    vRAN_Socket/G0_Sionna_Channel_Proxy/v11_profile_instrumented.py
+
+  OAI 코드:
+    openairinterface5g_whan/radio/rfsimulator/simulator.c
+    openairinterface5g_whan/radio/rfsimulator/gpu_ipc.h
+    openairinterface5g_whan/radio/rfsimulator/gpu_ipc.c
+
+  기술 문서:
+    vRAN_Socket/G0_Sionna_Channel_Proxy/README.md (성능 측정, 아키텍처)
+
+================================================================================

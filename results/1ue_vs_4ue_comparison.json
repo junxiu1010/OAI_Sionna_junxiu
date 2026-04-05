@@ -1,0 +1,72 @@
+{
+  "label_a": "1 UE",
+  "label_b": "4 UE",
+  "mac_comparison": {
+    "cqi": {
+      "a": null,
+      "b": null
+    },
+    "dl_mcs": {
+      "a": null,
+      "b": null
+    },
+    "ul_mcs": {
+      "a": null,
+      "b": null
+    },
+    "dl_bler": {
+      "a": null,
+      "b": null
+    },
+    "ul_bler": {
+      "a": null,
+      "b": null
+    },
+    "rsrp": {
+      "a": null,
+      "b": null
+    },
+    "snr_db": {
+      "a": null,
+      "b": null
+    },
+    "dl_total_bytes": {
+      "a": null,
+      "b": null
+    },
+    "ul_total_bytes": {
+      "a": null,
+      "b": null
+    },
+    "dlsch_errors": {
+      "a": null,
+      "b": null
+    },
+    "ulsch_errors": {
+      "a": null,
+      "b": null
+    }
+  },
+  "proxy_comparison": {
+    "e2e_avg_ms": {
+      "a": 24.438638328530256,
+      "b": 36.57449118046126
+    },
+    "e2e_max_ms": {
+      "a": 48.23,
+      "b": 114.87
+    },
+    "dl_avg_ms": {
+      "a": 4.536887608069163,
+      "b": 15.430800542740865
+    },
+    "ul_avg_ms": {
+      "a": 19.556123919308348,
+      "b": 20.757937584803265
+    },
+    "total_frames": {
+      "a": 13890,
+      "b": 7380
+    }
+  }
+}

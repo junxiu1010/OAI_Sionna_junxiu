@@ -1,0 +1,96 @@
+# Core Emulator Master Configuration
+# All PHY/channel parameters in a single file.
+# The Core Emulator reads this and distributes settings to proxy, gNB, and UEs.
+
+system:
+  num_ues: 4
+  mode: gpu-ipc            # gpu-ipc | socket
+  channel_mode: static     # dynamic | static
+  batch_size: 4            # UE startup batch size
+  mu_mimo: true            # Enable MU-MIMO scheduling
+  force_mu_dl_traffic: true # Inject dummy DL bytes for MU-MIMO testing
+
+antenna:
+  gnb:
+    nx: 2
+    ny: 1
+    polarization: dual     # single | dual
+  ue:
+    nx: 2
+    ny: 1
+
+codebook:
+  type: type2              # type1 | type2
+  sub_type: typeII_PortSelection   # typeI_SinglePanel | typeII_PortSelection
+  mode: 1
+  pmi_restriction: 0xff
+  ri_restriction: 0x03
+  n1_n2_config: two_one
+  # Type-II specific
+  phase_alphabet_size: n4  # n4 (QPSK) | n8 (8PSK)
+  subband_amplitude: 0
+  number_of_beams: 2
+  port_selection_sampling_size: 2
+
+csi_rs:
+  periodicity: 20
+  first_symbol: 13
+  power_offset: 0
+  density: 1
+  freq_start_rb: 0
+  freq_nrof_rbs: 106
+  freq_allocation: [32, 0]
+  cdm_type: fd_CDM2
+  nrof_ports: 4
+  qcl_info: 0
+
+srs:
+  periodicity: 20
+  start_position: 0
+  num_symbols: 1
+  repetition_factor: 1
+  comb_offset: 0
+  cyclic_shift: 0
+  freq_domain_position: 0
+  freq_domain_shift: 0
+  freq_hopping_b_srs: 0
+  freq_hopping_b_hop: 0
+  freq_hopping_c_srs: 0
+  group_hopping: neither
+  alpha: alpha1
+  p0: -84
+  nrof_srs_ports: 1
+
+csi_measurement:
+  cqi_table: table1
+  ri_table: table1
+  pmi_table: table1
+  report_periodicity: 20
+  report_offset: 0
+  cqi_threshold: 0
+  ri_threshold: 0
+  enable_rsrp: 1
+  enable_ri: 1
+  enable_pmi: 1
+  enable_cqi: 1
+  enable_sinr: 1
+
+channel:
+  path_loss_dB: 0.0
+  snr_dB: null
+  noise_dBFS: null
+  speed: 3.0
+  scenario: UMa-NLOS       # UMi-LOS | UMi-NLOS | UMa-LOS | UMa-NLOS
+  sector_half_deg: 90.0    # half-sector span for UE angular placement (default was 60)
+  jitter_std_deg: 20.0     # AoD/AoA jitter std dev per UE (default was 10)
+
+carrier:
+  frequency_GHz: 3.5
+  bandwidth_prb: 106
+  scs_kHz: 30
+  band: 78
+
+network:
+  amf_ip: 192.168.70.132
+  gnb_ip: 192.168.70.129
+  gnb_ip_prefix: 24

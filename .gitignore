@@ -1,0 +1,37 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Large data files
+*.npy
+*.npz
+
+# Log files
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Build files
+build/
+dist/
+*.o
+*.so
+*.a
+*.dylib
+*.out
+*.elf
+*.bin
+*.hex
+*.exe
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# OS
+.DS_Store
+Thumbs.db

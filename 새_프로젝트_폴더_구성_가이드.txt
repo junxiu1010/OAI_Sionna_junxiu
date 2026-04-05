@@ -1,0 +1,146 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  새 프로젝트 폴더 구성 가이드
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【개요】
+
+  이 문서는 DevChannelProxyJIN/ 이라는 최상위 폴더에서
+  OAI(openairinterface5g_whan)와 Sionna Channel Proxy(vRAN_Socket)를
+  통합 관리하는 구조를 설명한다.
+
+  - OAI:          호스트에서 직접 실행 (CPU 기반)
+  - Sionna Proxy:  Docker 컨테이너에서 실행 (GPU 기반)
+  - Cursor AI:    호스트에서 양쪽 코드를 동시에 편집/분석
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【폴더 구조 - 호스트 (실제 파일 위치)】
+
+  DevChannelProxyJIN/                      ← 최상위 폴더
+  │
+  ├── DevChannelProxyJIN.code-workspace    ← Cursor 멀티루트 워크스페이스
+  ├── docker-compose.yml                   ← 컨테이너 오케스트레이션
+  │
+  ├── vRAN_Socket/                         ← 컨테이너로 실행됨 (GPU)
+  │   ├── Dockerfile                       ← 컨테이너 이미지 정의
+  │   └── G0_Sionna_Channel_Proxy/
+  │       ├── v8_cupy_slot_batch_pinned_fastest.py
+  │       └── ...
+  │
+  └── openairinterface5g_whan/             ← 호스트에서 직접 실행 (CPU)
+      ├── cmake_targets/
+      └── ...
+
+【폴더 구조 - 컨테이너 안 (/workspace)】
+
+  /workspace/                              ← 컨테이너 내부 경로
+  ├── vRAN_Socket/                         ← 볼륨 마운트 (호스트와 동일 파일)
+  └── openairinterface5g_whan/             ← 볼륨 마운트 (호스트와 동일 파일)
+
+  docker-compose.yml에서 양쪽 폴더를 모두 컨테이너의 /workspace 아래에 마운트.
+  볼륨 마운트이므로 호스트에서 수정하면 컨테이너에도 즉시 반영되고,
+  그 반대도 마찬가지다.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【어디가 컨테이너이고, 어디가 아닌가】
+
+  DevChannelProxyJIN/            → 컨테이너 아님. 호스트의 일반 폴더.
+  openairinterface5g_whan/       → 컨테이너 아님. 호스트에서 직접 빌드/실행.
+  vRAN_Socket/                   → 컨테이너임. Dockerfile로 이미지 빌드 후 실행.
+
+  즉, 컨테이너는 vRAN_Socket 딱 하나뿐.
+  나머지는 전부 호스트에서 동작.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【개발 언어 및 빌드 특성】
+
+                OAI (openairinterface5g_whan)    Sionna (vRAN_Socket)
+  ──────────    ───────────────────────────────  ─────────────────────
+  언어          C                                Python
+  수정 후       ninja 재빌드 필요                  빌드 불필요 (저장 즉시 반영)
+  실행 위치     호스트 터미널                       컨테이너 안 (docker exec)
+  실행 명령     sudo ./nr-softmodem ...           python ...
+
+  OAI는 C 코드이므로 수정할 때마다 빌드(컴파일)가 필요하다.
+  Sionna는 Python이므로 저장만 하면 바로 실행 가능하다.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【작업 방식】
+
+  ■ 방식 A: 호스트에서 열기 (추천)
+
+    Cursor SSH 접속 → DevChannelProxyJIN/ 폴더 열기
+    Cursor 한 창에서 양쪽 코드 편집 + OAI 빌드/실행 + Sionna 실행 전부 가능
+    Sionna 실행은 docker exec로 컨테이너 안에서 실행
+
+    장점: 한 창에서 편집, 빌드, 실행 전부 가능
+    단점: Python IntelliSense(자동완성) 안 됨 (TF, CuPy 등이 호스트에 없으므로)
+
+  ■ 방식 B: Dev Containers로 컨테이너에 접속
+
+    Cursor SSH 접속 → 컨테이너 실행 → Dev Containers: Attach → /workspace 열기
+    컨테이너 안에서 양쪽 코드 편집 가능, Python IntelliSense 동작
+    단, OAI 빌드/실행은 별도 호스트 터미널이 반드시 필요
+
+    장점: Python IntelliSense 동작
+    단점: OAI 빌드/실행을 Cursor 창 안에서 할 수 없음 (별도 터미널 필요)
+
+  ※ 한 창에서 편집과 실행을 모두 하려면 방식 A를 사용한다.
+    방식 B는 Python 자동완성이 꼭 필요할 때만 사용한다.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【구성파일 3개의 정체와 역할】
+
+  ① DevChannelProxyJIN.code-workspace
+     - 정체: Cursor(VS Code) 멀티루트 워크스페이스 설정 파일 (JSON)
+     - 역할: vRAN_Socket과 openairinterface5g_whan 두 폴더를
+             하나의 Cursor 창에서 동시에 열어줌
+     - 위치: DevChannelProxyJIN/ 루트
+     - 필요한가?: DevChannelProxyJIN/ 폴더 자체를 열면 양쪽 폴더가
+                 이미 보이므로, 일반적으로 안 써도 된다.
+
+  ② docker-compose.yml
+     - 정체: Docker Compose 설정 파일 (YAML)
+     - 역할: Sionna 컨테이너를 어떤 조건으로 띄울지 정의
+             (포트 매핑, GPU 할당, 볼륨 마운트 등)
+     - 위치: DevChannelProxyJIN/ 루트
+     - 핵심: vRAN_Socket/과 openairinterface5g_whan/ 모두
+             컨테이너 안 /workspace에 마운트한다.
+
+  ③ Dockerfile
+     - 정체: Docker 이미지 빌드 스크립트
+     - 역할: vRAN_Socket 컨테이너 안에 설치할 것들 정의
+             (Python, TensorFlow, CuPy, CUDA 등)
+     - 위치: vRAN_Socket/ 안
+     - 핵심: 이 파일이 있는 폴더가 곧 컨테이너 이미지의 기반
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【실행 흐름 요약】
+
+  1. Cursor에서 Remote SSH로 서버 접속
+  2. DevChannelProxyJIN/ 폴더 열기
+  3. 호스트 터미널: docker-compose up -d oai_sionna_proxy → 컨테이너 실행
+  4. Cursor 터미널을 여러 개 띄워서 작업:
+     - 터미널 1: OAI 빌드 (ninja) 및 gNB 실행
+     - 터미널 2: OAI UE 실행
+     - 터미널 3: Sionna 실행 (docker exec)
+  5. gNB ↔ Sionna Proxy(컨테이너) ↔ UE 가 TCP 소켓으로 통신
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+【통신 구조】
+
+  호스트                              컨테이너
+  ┌──────────┐                    ┌──────────────────┐
+  │   gNB    │ ── port 6017 ───→ │  Sionna Channel  │
+  │          │                    │     Proxy        │
+  │   UE     │ ← port 6018 ──── │                  │
+  └──────────┘                    └──────────────────┘
+    (CPU)                            (GPU, Docker)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

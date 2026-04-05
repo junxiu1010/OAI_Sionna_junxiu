@@ -1,0 +1,30 @@
+---
+description: OAI rfsimulator build commands - rfsimulator is a separate shared library
+globs: openairinterface5g_whan/radio/rfsimulator/**
+alwaysApply: false
+---
+
+# OAI rfsimulator 빌드 규칙
+
+`rfsimulator`는 `librfsimulator.so`로 별도 빌드되며 런타임에 `dlopen()`으로 로드됨.
+`ninja nr-softmodem`이나 `ninja nr-uesoftmodem`으로는 재컴파일되지 않음.
+
+## rfsimulator 파일 수정 시 빌드
+
+```bash
+cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets/ran_build/build
+ninja rfsimulator
+```
+
+## gNB/UE 본체 수정 시 빌드
+
+```bash
+ninja nr-softmodem      # gNB
+ninja nr-uesoftmodem    # UE
+```
+
+## 테스트 실행 순서 (GPU IPC 모드)
+
+1. Proxy 먼저: `docker exec -it oai_sionna_proxy python3 /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py --mode=gpu-ipc`
+2. gNB: `sudo RFSIM_GPU_IPC=1 ./nr-softmodem -O <conf> --gNBs.[0].min_rxtxtime 6 --rfsim`
+3. UE: `sudo RFSIM_GPU_IPC=1 ./nr-uesoftmodem -r 106 --numerology 1 --band 78 -C 3619200000 --uicc0.imsi 001010000000001 --rfsim`

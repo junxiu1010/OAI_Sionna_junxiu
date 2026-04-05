@@ -1,0 +1,145 @@
+{
+  "session_info": {
+    "filter_timestamp": "20250929_050626",
+    "filter_datetime_iso": "2025-09-29T05:06:26.679378",
+    "pipeline_version": "P1B_Valid_RX_Filter_v1",
+    "filter_description": "Enhanced RX and Ray level filtering with Path-Ray relationship support",
+    "area_index": 1,
+    "frequency_ghz": 7.5,
+    "combination_key": "Area1_7.5GHz"
+  },
+  "configuration": {
+    "tau_min_threshold": -0.1,
+    "ray_efficiency_filter": {
+      "enabled": true,
+      "threshold": 1.0
+    },
+    "los_nlos_filter": {
+      "mode": "nlos_only",
+      "description": "Keep only NLoS rays (remove LoS rays)"
+    },
+    "target_filters": {
+      "target_areas": null,
+      "target_frequencies": null
+    },
+    "file_patterns": {
+      "input_pattern": "Area{area}_{freq}GHz_Rays_ALL_RXs.npz",
+      "output_pattern": "Area{area}_{freq}GHz_Rays_Valid_RXs.npz",
+      "info_pattern": "Area{area}_{freq}GHz_Rays_Valid_RXs_FilterInfo.json"
+    },
+    "directories": {
+      "input_dir": "/workspaces/Paper2/250929_Ch_Separ/P1A_RT_Results",
+      "output_dir": "/workspaces/Paper2/250929_Ch_Separ/P1B_Valid_Results"
+    }
+  },
+  "input_data_info": {
+    "filename": "Area1_7.5GHz_Rays_ALL_RXs.npz",
+    "filepath": "/workspaces/Paper2/250929_Ch_Separ/P1A_RT_Results/Area1_7.5GHz_Rays_ALL_RXs.npz",
+    "file_exists": true,
+    "file_size_mb": 12.07,
+    "p1a_format": "enhanced",
+    "metadata_source": {
+      "file": null,
+      "type": "original"
+    }
+  },
+  "filtering_pipeline": {
+    "stages_applied": [
+      "stage_1_rx_metadata_filter",
+      "stage_2_ray_efficiency_filter",
+      "stage_3_los_nlos_ray_filter"
+    ],
+    "stage_1_rx_metadata_filter": {
+      "description": "RX-level filtering based on metadata validity",
+      "method": "metadata_based_rx_exclusion",
+      "original_rx_count": 1600,
+      "filtered_rx_count": 1037,
+      "excluded_rx_count": 563,
+      "exclusion_ratio": 0.351875
+    },
+    "stage_2_ray_efficiency_filter": {
+      "description": "Ray-level efficiency filtering",
+      "enabled": true,
+      "threshold": 1.0,
+      "method": "valid_rays_ratio_threshold"
+    },
+    "stage_3_los_nlos_ray_filter": {
+      "description": "Ray-level LoS/NLoS filtering",
+      "enabled": true,
+      "mode": "nlos_only",
+      "filter_details": {
+        "status": "applied",
+        "filter_mode": "nlos_only",
+        "filter_description": "NLoS rays only (LoS rays removed)",
+        "total_rays": 414800,
+        "original_los_rays": 7920,
+        "original_nlos_rays": 406880,
+        "kept_rays": 406880,
+        "filtered_rays": 7920,
+        "filter_ratio": 0.01909353905496625
+      }
+    }
+  },
+  "output_data_info": {
+    "filename": "Area1_7.5GHz_Rays_Valid_RXs.npz",
+    "filepath": "/workspaces/Paper2/250929_Ch_Separ/P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz",
+    "final_rx_count": 1037,
+    "data_fields": [
+      "area_index",
+      "frequency_ghz",
+      "rx_indices",
+      "num_rx",
+      "tau",
+      "power",
+      "theta_r_deg",
+      "theta_t_deg",
+      "phi_r_deg",
+      "phi_t_deg",
+      "source_path_idx",
+      "los_nlos_flag",
+      "counts"
+    ],
+    "enhanced_fields": [
+      "source_path_idx",
+      "los_nlos_flag"
+    ],
+    "has_path_ray_relationship": true,
+    "file_size_mb": 8.19,
+    "size_reduction_ratio": 0.32081716467900406,
+    "size_reduction_mb": 3.87
+  },
+  "statistics": {
+    "rx_level": {
+      "original_count": 1600,
+      "filtered_count": 1037,
+      "exclusion_count": 563,
+      "retention_ratio": 0.648125,
+      "exclusion_ratio": 0.351875
+    },
+    "ray_level": {
+      "original_total_rays": 414800,
+      "original_los_rays": 7920,
+      "original_nlos_rays": 406880,
+      "filtered_rays": 7920,
+      "kept_rays": 406880,
+      "ray_filter_ratio": 0.01909353905496625,
+      "ray_retention_ratio": 0.9809064609450338
+    },
+    "data_quality": {
+      "has_enhanced_p1a_format": true,
+      "filtering_completeness": 1.0
+    }
+  },
+  "performance": {
+    "processing_timestamp": "20250929_050626",
+    "total_stages_applied": 3,
+    "filtering_efficiency": {
+      "rx_processing_efficiency": 0.648125,
+      "overall_data_reduction": 0.35187500000000005
+    }
+  },
+  "filtering_applied": true,
+  "filter_timestamp": "20250929_050626",
+  "area_index": 1,
+  "frequency_ghz": 7.5
+}

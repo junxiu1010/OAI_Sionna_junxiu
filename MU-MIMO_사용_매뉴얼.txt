@@ -1,0 +1,345 @@
+================================================================================
+  MU-MIMO Downlink 사용 매뉴얼
+  — OpenAirInterface 5G NR Multi-User MIMO 구현
+================================================================================
+
+  논문 기반: Duc Tung Bui, Le-Nam Tran,
+  "An Implementation of Multi-User MIMO Downlink for O-RAN 5G New Radio
+   using OpenAirInterface" (2025)
+
+  구현 일자: 2026-03-12
+  기반 코드: openairinterface5g_whan (OAI 5G RAN)
+  경로: /home/dclcom57/oai_sionna_junxiu/
+
+================================================================================
+  1. 개요
+================================================================================
+
+  ■ MU-MIMO란?
+    하나의 gNB(2 TX 안테나)가 동일한 주파수 자원(RB)에서
+    2개의 UE(각 1 RX 안테나)에 동시 전송하는 기술.
+
+    전송 신호:  s = α₁·W₁·x₁ + α₂·W₂·x₂
+    전력 계수:  α₁ = α₂ = 1/√2  (총 전력 보존)
+
+  ■ 동작 조건
+    - gNB: 2 TX 안테나 (pdsch_AntennaPorts: N1=1, N2=1, XP=2)
+    - UE:  각 1 RX 안테나
+    - UE가 보고한 PMI가 직교 쌍일 때 자동 활성화:
+      · PMI 0과 PMI 2  (pm_index {1,3})
+      · PMI 1과 PMI 3  (pm_index {2,4})
+    - 초기 전송(new TX)에만 적용, 재전송(HARQ retx)은 기존 PF 스케줄링
+
+  ■ 기존 코드 호환성
+    mu_mimo 설정을 켜지 않으면 기존 SU-MIMO/PF 스케줄링과 동일하게 동작.
+
+================================================================================
+  2. 빌드
+================================================================================
+
+  ── 전체 빌드 (최초 1회) ─────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets
+  ./build_oai -w SIMU --ninja --nrUE --gNB --build-lib "nrscope"
+
+  ── 증분 빌드 (MU-MIMO 코드 수정 후) ────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+
+  ninja nr-softmodem              # gNB 빌드 (MAC 스케줄러 + PHY 변경 반영)
+  ninja nr-uesoftmodem            # UE 빌드 (변경 없지만 확인용)
+  ninja rfsimulator               # rfsimulator 라이브러리 (simulator.c 수정 시)
+
+  ※ MAC 스케줄러(gNB_scheduler_dlsch.c), PHY(nr_dlsch.c, nr_modulation.c),
+    헤더(nr_mac_gNB.h, nfapi_nr_interface_scf.h) 수정은 모두 nr-softmodem에 포함
+
+================================================================================
+  3. 설정
+================================================================================
+
+  ── gNB config 파일에 mu_mimo 옵션 추가 ──────────────────────
+
+  설정 파일 경로:
+    openairinterface5g_whan/targets/PROJECTS/GENERIC-NR-5GC/CONF/
+    gnb.sa.band78.fr1.106PRB.usrpb210.conf
+
+  MACRLCs 섹션에 mu_mimo = 1 추가:
+
+    MACRLCs = (
+    {
+      num_cc                      = 1;
+      tr_s_preference             = "local_L1";
+      tr_n_preference             = "local_RRC";
+      pusch_TargetSNRx10          = 150;
+      pucch_TargetSNRx10          = 200;
+      mu_mimo                     = 1;        # ★ MU-MIMO 활성화
+    }
+    );
+
+  ※ mu_mimo = 0 또는 줄 삭제 시 기존 PF 스케줄링 (기본값)
+  ※ mu_mimo = 1 일 때도 조건(직교 PMI)이 안 맞으면 자동으로 SU-MIMO
+
+  ── gNB 안테나 설정 (2 TX 필수) ──────────────────────────────
+
+  동일 config 파일의 gNBs 섹션에서 pdsch_AntennaPorts 확인:
+
+    pdsch_AntennaPorts_N1         = 1;
+    pdsch_AntennaPorts_N2         = 1;
+    pdsch_AntennaPorts_XP         = 2;    # XP=2 → Cross-Polarized 2포트
+
+  ※ N1*N2*XP = 2 (2 TX 안테나) 이어야 MU-MIMO 가능
+  ※ 1 안테나(XP=1) 또는 4안테나 이상에서는 MU-MIMO 비활성화
+
+  ── UE 안테나 설정 (각 1 RX) ─────────────────────────────────
+
+  UE capability XML에서 1 안테나 포트 사용:
+    targets/PROJECTS/GENERIC-NR-5GC/CONF/uecap_ports1.xml
+
+================================================================================
+  4. 실행 방법
+================================================================================
+
+  ── A. launch_all.sh 사용 (권장) ─────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/vRAN_Socket/G1B_SingleUE_MIMO_Channel_Proxy
+
+  # MU-MIMO 테스트에는 2 UE가 필요하므로 -n 2 옵션 사용.
+  # 단, 현재 G1B는 Single-UE 전용이므로, rfsimulator 모드 또는 G1A 사용.
+  # 아래는 rfsimulator(소켓) 기반 2 UE 수동 실행 예시.
+
+  ── B. 수동 실행 (rfsimulator, 2 UE) ────────────────────────
+
+  ※ MU-MIMO는 2개의 UE가 동시에 접속해야 동작합니다.
+  ※ 터미널 3개 사용 (gNB 1개 + UE 2개)
+
+  [터미널 1] gNB 실행:
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+
+  sudo ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 \
+    --rfsim \
+    --log_config.global_log_options level,nocolor,time
+
+  ※ config 파일에 mu_mimo = 1 이 설정되어 있어야 함
+
+  [터미널 2] UE 1 실행:
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 \
+    --rfsim
+
+  [터미널 3] UE 2 실행 (UE 1 접속 확인 후):
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000002 \
+    --rfsim
+
+  ※ UE 1이 완전히 접속(RRC Connected)된 후에 UE 2 실행
+  ※ IMSI가 서로 다른 값이어야 함 (001010000000001 / 002)
+
+================================================================================
+  5. MU-MIMO 동작 확인
+================================================================================
+
+  ── gNB 로그에서 확인 ────────────────────────────────────────
+
+  MU-MIMO가 활성화되면 gNB 로그에 다음 메시지가 표시됩니다:
+
+  (1) 기동 시 (LOG_I):
+      "MU-MIMO downlink scheduling enabled"
+
+  (2) 스케줄링 시 (LOG_I, 직교 PMI 감지 시마다):
+      "[MU-MIMO] Pairing UE 0001 (PMI 1, rb 0-85) with UE 0002 (PMI 3) on same RBs"
+
+  (3) PDU 생성 시 (LOG_D, -d 옵션 또는 로그레벨 debug):
+      "[MU-MIMO] 1234.05 RNTI 0001 PRIMARY PMI 1 rb 0+85 MCS 15 TBS 8000 alpha_q15 23170 dmrsPorts 0x1"
+      "[MU-MIMO] 1234.05 RNTI 0002 SECONDARY PMI 3 rb 0+85 MCS 15 TBS 8000 alpha_q15 23170 dmrsPorts 0x2"
+
+  ── 로그 확인 명령 ───────────────────────────────────────────
+
+  # 실시간 gNB 로그에서 MU-MIMO 메시지 필터링:
+  tail -f ~/oai_sionna_junxiu/logs/latest/gnb.log | grep "MU-MIMO"
+
+  # MAC 통계에서 UE별 CQI/PMI/MCS 확인:
+  cat ~/oai_sionna_junxiu/logs/latest/nrMAC_stats.log
+
+  ── MU-MIMO 성공 판단 기준 ───────────────────────────────────
+
+  1. "[MU-MIMO] Pairing" 로그가 반복적으로 출력됨
+  2. 두 UE의 DMRS port가 다름 (0x1 vs 0x2)
+  3. 두 UE가 동일한 RB 범위를 공유함
+  4. alpha_q15 = 23170 (1/√2 전력 스케일링 적용)
+  5. 두 UE 모두 데이터 수신 가능 (iperf 테스트)
+
+================================================================================
+  6. 성능 테스트 (iperf)
+================================================================================
+
+  ── UE 네트워크 인터페이스 확인 ───────────────────────────────
+
+  UE가 접속하면 oaitun_ue1 (UE 1), oaitun_ue2 (UE 2) 인터페이스 생성.
+  ip addr show | grep oaitun
+
+  ── iperf 다운링크 테스트 ─────────────────────────────────────
+
+  # UE 1에서 iperf 서버:
+  iperf -s -B <UE1_IP> -i 1
+
+  # UE 2에서 iperf 서버:
+  iperf -s -B <UE2_IP> -i 1
+
+  # gNB 측에서 두 UE에 동시 다운링크 전송:
+  iperf -c <UE1_IP> -t 30 -i 1 &
+  iperf -c <UE2_IP> -t 30 -i 1 &
+
+  ── 기대 결과 ────────────────────────────────────────────────
+
+  - SU-MIMO (mu_mimo=0): 한 슬롯에 1 UE만 서비스 → 총 처리량 = 1 UE 속도
+  - MU-MIMO (mu_mimo=1): 한 슬롯에 2 UE 동시 서비스 → 총 처리량 ≈ 2 × UE 속도
+    (각 UE는 3dB SNR 손실이 있으나, 총 시스템 처리량은 크게 향상)
+  - 높은 SNR에서 MU-MIMO 이득이 더 큼 (간섭 대비 신호 우위)
+
+================================================================================
+  7. 수정된 파일 목록
+================================================================================
+
+  ■ MAC 레이어 (스케줄러):
+    openair2/LAYER2/NR_MAC_gNB/gNB_scheduler_dlsch.c
+      - is_pmi_orthogonal(): PMI 직교성 판별
+      - pf_dl(): MU-MIMO 페어링 로직 (PF 스케줄링 후 실행)
+      - prepare_pdsch_pdu(): DMRS port 분리 + power scaling 설정
+
+  ■ PHY 레이어 (PDSCH 생성):
+    openair1/PHY/NR_TRANSPORT/nr_dlsch.c
+      - do_one_dlsch(): amplitude power scaling (alpha = 1/√2)
+      - do_txdataF(): MU-MIMO secondary UE용 ADD 모드
+
+    openair1/PHY/MODULATION/nr_modulation.c
+      - nr_layer_precoder_simd_add(): SIMD precoder (기존값에 더하기)
+      - nr_layer_precoder_cm_mu(): 스칼라 precoder (ADD 버전)
+
+  ■ 헤더 파일:
+    openair2/LAYER2/NR_MAC_gNB/nr_mac_gNB.h
+      - NR_sched_pdsch_t: mu_mimo_paired, mu_mimo_secondary 필드
+      - gNB_MAC_INST: mu_mimo_enabled 플래그
+
+    openair1/PHY/MODULATION/nr_modulation.h
+      - 새 함수 선언 (nr_layer_precoder_simd_add, nr_layer_precoder_cm_mu)
+
+    nfapi/open-nFAPI/nfapi/public_inc/nfapi_nr_interface_scf.h
+      - PDSCH PDU: mu_mimo_secondary, mu_mimo_alpha_q15 필드
+
+  ■ 설정:
+    openair2/GNB_APP/MACRLC_nr_paramdef.h
+      - mu_mimo 파라미터 정의 (bool, 기본값 0)
+
+    openair2/GNB_APP/gnb_config.c
+      - mu_mimo_enabled 초기화
+
+================================================================================
+  8. 아키텍처 요약
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  MAC Scheduler (gNB_scheduler_dlsch.c)                     │
+  │                                                             │
+  │  pf_dl()                                                    │
+  │    ├─ 기존 PF 스케줄링 (UE별 RB 할당)                       │
+  │    └─ MU-MIMO 페어링:                                      │
+  │        1. new-TX UE 중 nrOfLayers == 1인 UE 수집            │
+  │        2. PMI 직교 쌍 검색 ({1,3} 또는 {2,4})               │
+  │        3. UE2의 RB/MCS/TBS를 UE1과 동기화                   │
+  │        4. mu_mimo_paired=true, UE2는 secondary              │
+  │                                                             │
+  │  prepare_pdsch_pdu()                                        │
+  │    ├─ UE1: DMRS port 0 (0x01), pm_index = UE1의 PMI        │
+  │    ├─ UE2: DMRS port 1 (0x02), pm_index = UE2의 PMI        │
+  │    └─ 양쪽 모두: alpha_q15 = 23170 (1/√2)                  │
+  └─────────────────────┬───────────────────────────────────────┘
+                        │ FAPI PDSCH PDU
+                        ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  PHY Layer (nr_dlsch.c)                                    │
+  │                                                             │
+  │  nr_generate_pdsch()                                        │
+  │    ├─ do_one_dlsch(UE1):                                   │
+  │    │    amp = TX_AMP * alpha → 스케일된 신호                │
+  │    │    do_txdataF(): WRITE 모드 → txdataF = α₁·W₁·x₁     │
+  │    │                                                        │
+  │    └─ do_one_dlsch(UE2):                                   │
+  │         amp = TX_AMP * alpha → 스케일된 신호                │
+  │         do_txdataF(): ADD 모드 → txdataF += α₂·W₂·x₂      │
+  │                                                             │
+  │  결과: txdataF = α₁·W₁·x₁ + α₂·W₂·x₂                     │
+  └─────────────────────────────────────────────────────────────┘
+
+================================================================================
+  9. Type I Codebook (2 TX, 1 Layer) 참고
+================================================================================
+
+  PMI    pm_index    프리코딩 벡터 W              직교 대응
+  ───    ────────    ──────────────────────       ────────
+   0        1        1/√2 × [1,  1]^T             PMI 2
+   1        2        1/√2 × [1,  j]^T             PMI 3
+   2        3        1/√2 × [1, -1]^T             PMI 0
+   3        4        1/√2 × [1, -j]^T             PMI 1
+
+  직교 쌍: {PMI 0, PMI 2} 또는 {PMI 1, PMI 3}
+  → W₁^H · W₂ = 0 (완전 직교)
+
+  ※ 이상적 채널에서는 UE간 간섭이 0
+  ※ 현실 채널에서는 잔여 간섭 발생하나, 적절한 프리코딩으로 최소화
+
+================================================================================
+  10. 트러블슈팅
+================================================================================
+
+  ■ "[MU-MIMO] Pairing" 로그가 출력되지 않는 경우:
+    → config 파일에 mu_mimo = 1 이 설정되어 있는지 확인
+    → gNB 안테나가 2 TX인지 확인 (XP=2)
+    → UE 2개가 모두 접속(RRC Connected) 상태인지 확인
+    → 두 UE의 PMI가 직교 쌍인지 확인 (nrMAC_stats.log의 PMI 값)
+    → 재전송(retx) 중에는 MU-MIMO 적용 안됨 (new TX만)
+
+  ■ UE가 MU-MIMO 모드에서 디코딩 실패하는 경우:
+    → SNR이 충분한지 확인 (MU-MIMO는 3dB SNR 손실)
+    → MCS를 낮추어 테스트 (안정적인 MCS 10~15 권장)
+    → BLER이 10% 미만인지 확인
+
+  ■ mu_mimo = 1 설정했는데 "MU-MIMO downlink scheduling enabled" 미출력:
+    → 빌드가 최신인지 확인 (ninja nr-softmodem)
+    → config 파일의 MACRLCs 섹션에 올바르게 추가했는지 확인
+
+  ■ 빌드 에러 발생 시:
+    → MACRLC_nr_paramdef.h의 인덱스 번호가 순차적인지 확인
+    → nfapi_nr_interface_scf.h에 추가한 필드의 세미콜론 확인
+    → 전체 클린 빌드: ./build_oai --gNB --nrUE -c
+
+================================================================================
+  11. 제약 사항 및 향후 과제
+================================================================================
+
+  ■ 현재 제약:
+    - 2 TX 안테나, 2 UE × 1 RX 안테나 구성에서만 동작
+    - 슬롯당 최대 1개의 MU-MIMO 쌍만 지원
+    - MCS 자동 선택이 MU-MIMO의 3dB 손실을 반영하지 않음
+      (수동 MCS 제한 또는 CQI 보정 필요)
+    - 채널 프록시(G1B)는 현재 Single-UE 전용
+      → MU-MIMO 테스트는 rfsimulator 사용
+
+  ■ 향후 과제:
+    - MU-MIMO용 MCS adaptation (CQI에서 3dB 보정)
+    - 4 TX 안테나 확장 (4 UE MU-MIMO)
+    - G1C 채널 프록시: Multi-UE MIMO 채널 모델 통합
+    - UL MU-MIMO 지원
+    - 동적 SU/MU-MIMO 전환 (채널 상태 기반)
+
+================================================================================

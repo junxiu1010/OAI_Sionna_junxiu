@@ -1,0 +1,324 @@
+================================================================================
+  G1B 실행 매뉴얼 — Multi-UE MIMO Sionna Channel Proxy
+================================================================================
+
+  목표: G0 v12 기반 → SISO 확인 → MIMO 확장 → Multi-UE MIMO
+  현재 상태: v5 (GPU IPC V6 + MIMO CUDA Graph Pipeline)
+  기반 코드: G0 v12_gpu_ipc.py (GPU IPC V1, CUDA Graph)
+
+  Proxy 코드:
+    v0.py  ← G0 v12 복사 (SISO 1UE, 동작 확인용 기준선)
+    v1.py  ← GPU IPC V5 circular buffer (DL/UL 대칭 채널, timestamp polling)
+    v2.py  ← GPU IPC V6 per-buffer antenna (MIMO bypass, 비대칭 안테나 지원)
+    v3.py  ← V6 + cir_time head fix + gNB antenna port CLI
+    v4.py  ← V6 + MIMO Channel Application (einsum, DL/UL pipeline, CSI CQI fix, TX축 정규화)
+    v5.py  ← V6 + MIMO CUDA Graph Pipeline (broadcast*sum, GPU index array, pre-alloc)
+
+  ※ G0에서 확장한 버전 (G1A가 아닌 G0 기반)
+  ※ v0: G1A의 IPC V2~V4 미사용 — G0의 검증된 IPC V1 사용
+  ※ v1: GPU IPC V5 (circular buffer) — socket mode 1:1 대응
+
+  실행 순서: 컨테이너 확인 → OAI 빌드 → Proxy/gNB/UE 실행
+  ※ 터미널 추가: Ctrl+Shift+`
+
+================================================================================
+  0. 사전 준비
+================================================================================
+
+  ── 컨테이너 관리 ──────────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu
+
+  docker compose ps                    # 상태 확인
+  docker compose up -d oai_sionna_proxy    # 컨테이너 시작
+  docker compose down                  # 컨테이너 종료
+
+  ── OAI 빌드 ──────────────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets
+
+  # 초기 빌드 (gNB + UE 동시)
+  ./build_oai -w SIMU --ninja --nrUE --gNB --build-lib "nrscope"
+
+  # gNB만 빌드
+  ./build_oai --gNB
+
+  # UE만 빌드
+  ./build_oai --nrUE
+
+  ※ G1B v0는 GPU IPC V1만 사용 (RFSIM_GPU_IPC=1)
+  ※ G1B v1은 GPU IPC V5 사용 (RFSIM_GPU_IPC_V5=1)
+  ※ G1B v2~v5는 GPU IPC V6 사용 (RFSIM_GPU_IPC_V6=1)
+  ※ CMakeLists.txt에 V1~V6 모두 포함 (런타임에 환경변수로 선택)
+
+  ★ -c 옵션 주의사항:
+    -c 는 clean-all (build 폴더 전체 삭제 후 재빌드)
+    → -c 사용 후에는 반드시 gNB/UE 모두 다시 빌드해야 함
+    → 권장: -c 쓸 때는 ./build_oai --gNB --nrUE -c (둘 다 한번에)
+
+  ── 증분 빌드 (코드 수정 후, clean 없이) ─────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja rfsimulator              # librfsimulator.so (★ simulator.c 수정 시 필수!)
+  ninja nr-softmodem             # gNB만 증분 빌드
+  ninja nr-uesoftmodem           # UE만 증분 빌드
+
+================================================================================
+  ★ 통합 런처 (launch_all.sh) — 터미널 1개로 전체 실행
+================================================================================
+
+  Proxy + gNB + UE를 한번에 시작하는 셸 스크립트.
+
+  ── 사용법 ───────────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/vRAN_Socket/G1B_MultiUE_MIMO_Channel_Proxy
+
+  sudo bash launch_all.sh                            # v0, gpu-ipc, 1 UE (기본)
+  sudo bash launch_all.sh -v v5 -m gpu-ipc -b       # v5, bypass, SISO
+  sudo bash launch_all.sh -v v5 -m gpu-ipc          # v5, SISO 채널 적용
+  sudo bash launch_all.sh -v v5 -b -ga 2 1          # v5, bypass, gNB 2x1 MIMO
+  sudo bash launch_all.sh -v v5 -b -ga 2 1 -ua 2 1  # v5, 대칭 2x1 bypass
+  sudo bash launch_all.sh -v v5 -ga 2 1 -ua 2 1     # v5, 대칭 2x1 MIMO 채널
+  sudo bash launch_all.sh -m socket -n 1             # v0, socket, 1 UE
+  sudo bash launch_all.sh -pl 3 -snr 30              # PL=3dB, SNR=30dB
+  sudo bash launch_all.sh -h                         # 도움말
+
+  옵션:
+    -v VERSION   Proxy 버전: v0 이상         (기본: v0)
+    -m MODE      모드: socket, gpu-ipc       (기본: gpu-ipc)
+    -n NUM_UES   UE 수: 1 이상              (기본: 1)
+    -pl dB       경로 손실                   (기본: 0)
+    -snr dB      AWGN SNR                   (기본: off)
+    -b           채널 바이패스
+    -ga Nx Ny    gNB 안테나 배열             (기본: 1 1)
+    -ua Nx Ny    UE 안테나 배열              (기본: 1 1)
+
+  ── 동작 순서 (자동) ─────────────────────────────────────────────
+
+  1. 이전 프로세스 정리 (pkill)
+  2. Proxy 시작 → "Entering main loop" 대기 (최대 120초)
+  3. gNB 시작 → 3초 대기
+  4. UE 0, 1, ..., N-1 순차 시작 (각 2초 간격)
+  5. Proxy 로그를 화면에 실시간 출력
+  6. Ctrl+C → 전체 프로세스 자동 종료
+
+  ── 로그 파일 ────────────────────────────────────────────────────
+
+  실행할 때마다 타임스탬프 폴더에 로그 보존:
+
+  ~/oai_sionna_junxiu/logs/20260306_023500_G1B_v0_ipc_1ue/
+    proxy.log                        Proxy 출력
+    gnb.log                          gNB 출력
+    ue0.log                          UE 0 출력
+    nrMAC_stats.log                  gNB MAC 통계 (CQI/RI/PMI/RSRP/BLER/MCS)
+    nrL1_stats.log                   gNB L1 통계 (PRB I0, PRACH I0)
+    nrRRC_stats.log                  gNB RRC 통계 (연결된 DU/UE 목록)
+
+  ~/oai_sionna_junxiu/logs/latest/  ← 최근 실행 바로가기 (심링크)
+
+  gNB/UE 로그 실시간 확인 (별도 터미널):
+    tail -f ~/oai_sionna_junxiu/logs/latest/gnb.log
+    tail -f ~/oai_sionna_junxiu/logs/latest/ue0.log
+
+  OAI 통계 확인 (별도 터미널):
+    cat ~/oai_sionna_junxiu/logs/latest/nrMAC_stats.log
+    cat ~/oai_sionna_junxiu/logs/latest/nrRRC_stats.log
+    cat ~/oai_sionna_junxiu/logs/latest/nrL1_stats.log
+
+  ── 종료 ─────────────────────────────────────────────────────────
+
+  Ctrl+C 한번 → 전체 프로세스 (Proxy, gNB, 모든 UE) 자동 종료
+
+================================================================================
+  모드 A: GPU IPC V1 모드 — 터미널별 수동 실행
+================================================================================
+
+  ※ 위의 launch_all.sh를 사용하면 아래를 수동으로 할 필요 없음
+  ※ 개별 터미널에서 직접 실행하고 싶을 때만 참고
+
+  통신: CUDA IPC V1 (단일 UE GPU 공유 메모리, 소켓 없음)
+  환경변수:
+    gNB  → RFSIM_GPU_IPC=1
+    UE   → RFSIM_GPU_IPC=1
+
+  순서: Proxy → gNB → UE (반드시 순서대로)
+
+  ── 터미널 1: Sionna Proxy ────────────────────────────────────────────
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1B_MultiUE_MIMO_Channel_Proxy/v0.py \
+    --mode=gpu-ipc
+
+  ※ "Entering main loop..." 메시지 확인 후 gNB 실행
+
+  ── 터미널 2: OAI gNB ─────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  sudo RFSIM_GPU_IPC=1 ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim
+
+  ── 터미널 3: OAI UE ──────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  sudo RFSIM_GPU_IPC=1 ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 --rfsim
+
+  ※ 공유 메모리: /tmp/oai_gpu_ipc/gpu_ipc_shm
+  ※ --rfsimulator.serverport 옵션 불필요 (소켓 미사용)
+
+================================================================================
+  모드 B: Socket 모드 (디버깅 및 호환)
+================================================================================
+
+  통신: TCP Socket (gNB:6013, Proxy:6014)
+  순서: gNB → Proxy → UE
+
+  ── 터미널 1: OAI gNB ─────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  sudo ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim --rfsimulator.serverport 6013
+
+  ── 터미널 2: Sionna Proxy ────────────────────────────────────────────
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1B_MultiUE_MIMO_Channel_Proxy/v0.py \
+    --mode=socket
+
+  ── 터미널 3: OAI UE ──────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 \
+    --rfsim --rfsimulator.serverport 6014
+
+  ※ gNB → Proxy → UE 순서 필수
+
+================================================================================
+  Proxy CLI 옵션 (v0 — G0 v12 동일)
+================================================================================
+
+  옵션                           기본값    설명
+  ────────────────────────────  ────────  ──────────────────────────────
+  --mode <socket|gpu-ipc>      socket    통신 모드
+  --path-loss-dB <값>           0         Path Loss (음수=감쇠, 0=무손실)
+  --snr-dB <값>                 None      AWGN noise SNR (미지정=off)
+  --no-custom-channel           -         채널 비활성화 (bypass)
+  --custom-channel              on        Sionna 채널 모델 활성화
+  --enable-gpu/--disable-gpu    on        GPU 가속
+  --use-pinned-memory           on        Pinned Memory
+  --use-cuda-graph              on        CUDA Graph
+  --ipc-shm-path <경로>         /tmp/oai_gpu_ipc/gpu_ipc_shm
+  --profile-interval <N>        100       프로파일 출력 간격 (슬롯)
+  --profile-window <N>          500       롤링 윈도우 크기
+  --dual-timer-compare          on        CPU+GPU 듀얼 타이머
+
+================================================================================
+  프로세스 종료
+================================================================================
+
+  sudo pkill -9 nr-softmodem
+  sudo pkill -9 nr-uesoftmodem
+
+  ※ Proxy는 Ctrl+C로 종료
+  ※ 컨테이너 내 좀비 프로세스 정리:
+     docker exec oai_sionna_proxy pkill -9 -f "v[0-9]"
+
+================================================================================
+  G0 → G1B 주요 차이점 (v0 시점)
+================================================================================
+
+  항목             G0 (v12)                  G1B (v0)
+  ──────────────  ────────────────────────  ──────────────────────────
+  코드             동일 (G0 v12 복사)        동일 (SISO 1UE 기준선)
+  UE 수           1                         1 (추후 N UE 확장 예정)
+  안테나           SISO (1×1)                SISO (추후 MIMO 확장 예정)
+  GPU IPC         V1 (플래그 기반)            V1 (동일)
+  환경변수 (gNB)   RFSIM_GPU_IPC=1           RFSIM_GPU_IPC=1 (동일)
+  환경변수 (UE)    RFSIM_GPU_IPC=1           RFSIM_GPU_IPC=1 (동일)
+  Proxy 파일       v12_gpu_ipc.py            v0.py (이름만 변경)
+  목적             단일 UE 채널 시뮬레이션     MIMO 확장의 시작점
+
+================================================================================
+  G1B 확장 로드맵
+================================================================================
+
+  단계     버전    목표                                상태
+  ──────  ──────  ──────────────────────────────────  ──────
+  0단계    v0      G0 v12 기준선 확인 (SISO 1UE)        완료
+  1단계    v1      GPU IPC V5 circular buffer            완료
+  2단계    v2      GPU IPC V6 MIMO bypass               완료
+  3단계    v3      head 버그 수정 + antenna port CLI     완료
+  4단계    v4      MIMO 채널 적용 + CSI CQI 수정 + TX축 정규화  완료
+  5단계    v5      CUDA Graph 통합 (broadcast*sum, GPU index)  현재
+  6단계    v?      Multi-UE MIMO (D set)                예정
+
+  ※ 각 단계는 이전 단계가 안정적으로 동작하는 것을 확인한 후 진행
+
+================================================================================
+  G1A에서 배운 교훈 (G1B에 반영)
+================================================================================
+
+  ■ IPC V2~V4의 FIFO ring 방식은 timestamp 오프셋, DL partial read,
+    TDD 데드락 등 구조적 문제가 있었음 → G1B는 G0의 V1 (플래그 기반) 유지
+
+  ■ complex128 (float64)은 필수 — complex64로 PSS/SSS 동기화 실패
+
+  ■ CUDA Graph가 성능의 핵심 — 커널 launch 오버헤드가 주 병목
+
+  ■ B-light 페이싱 (RU-L1TX 갭 제한)이 PRACH 크래시 방지에 중요
+
+  ■ PL/AWGN 적용 시 PSS 동기화 threshold 주의 — PL=10dB에서 실패,
+    PL=3~5dB 범위 권장
+
+================================================================================
+  트러블슈팅
+================================================================================
+
+  ■ "SHM magic mismatch" 또는 IPC 연결 실패:
+    → Proxy가 먼저 실행 중인지 확인
+    → SHM 파일 삭제: sudo rm -rf /tmp/oai_gpu_ipc/*
+    → Proxy 재시작
+
+  ■ UE가 SSB sync 실패:
+    → --no-custom-channel 로 채널 바이패스 테스트
+    → Path Loss 0 (기본값)으로 시작
+    → gNB 로그에서 SSB 전송 확인
+
+  ■ PBCH 디코딩 실패:
+    → G0에서도 동일 현상인지 확인 (v0는 G0과 동일 코드)
+    → complex128인지 확인 (complex64면 실패)
+
+  ■ Proxy GPU 메모리 부족:
+    → nvidia-smi로 VRAM 확인
+    → 좀비 프로세스 정리: docker exec oai_sionna_proxy pkill -9 -f "v[0-9]"
+
+  ■ librfsimulator.so 미갱신:
+    → simulator.c 수정 후 반드시 ninja rfsimulator 실행
+    → ninja nr-softmodem만으로는 반영 안됨
+
+================================================================================
+  관련 파일
+================================================================================
+
+  Proxy 코드:
+    vRAN_Socket/G1B_MultiUE_MIMO_Channel_Proxy/v0.py   (G0 v12 복사)
+
+  OAI 코드 (GPU IPC V1):
+    openairinterface5g_whan/radio/rfsimulator/gpu_ipc.h
+    openairinterface5g_whan/radio/rfsimulator/gpu_ipc.c
+    openairinterface5g_whan/radio/rfsimulator/simulator.c   (#ifdef USE_GPU_IPC)
+
+  G0 원본 (참고):
+    vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py
+    vRAN_Socket/G0_Sionna_Channel_Proxy/실행_매뉴얼.txt
+
+  G1A 참고 (SISO Multi-UE):
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/README.md
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/실행_매뉴얼.txt
+
+================================================================================

@@ -1,0 +1,51 @@
+FROM tensorflow/tensorflow:2.17.0-gpu-jupyter
+# 안되면 2.18.0-gpu-jupyter
+# 기본 개발 도구 및 라이브러리 설치
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    llvm \
+    libegl1 \
+    libgl1 \
+    libgomp1 \
+    libx11-6 \
+    libx11-dev \
+    libffi-dev \
+    git \
+    wget \
+    curl \
+    software-properties-common \
+    && rm -rf /var/lib/apt/lists/*
+
+# RUN pip install --upgrade sionna
+RUN pip install sionna==1.0.2
+# RUN pip install --upgrade pre sionna
+
+RUN pip uninstall -y tensorflow tensorflow-gpu
+RUN pip install tensorflow==2.17.0
+
+# 패키지 설치
+
+RUN pip install --upgrade  --ignore-installed \
+    ipykernel \
+    jupyterlab \
+    geopandas \
+    shapely \
+    open3d \
+    #open3d-cpu \
+    contextily \
+    tensorboard-plugin-profile \
+    cupy-cuda12x
+
+# numpy downgrade
+RUN pip uninstall -y numpy
+RUN pip install numpy==1.26.4
+
+
+
+#RUN pip install -U tensorboard-nightly
+
+# 작업 디렉토리 설정
+WORKDIR /workspace
+
+# 컨테이너 실행 시 실행할 명령어
+CMD ["jupyter", "lab", "--port=8888", "--no-browser", "--NotebookApp.token=''", "--ip=0.0.0.0", "--allow-root", "--NotebookApp.allow_origin='*'"]

@@ -1,0 +1,419 @@
+================================================================================
+  G1A 실행 매뉴얼 — 1 gNB + N UE (SISO) Multi-UE Sionna Channel Proxy
+================================================================================
+
+  구성: gNB 1대 + UE N대 (최대 8), SISO (단일 안테나)
+  Proxy 코드:
+    v4_multi_ue.py  ← 최신 (통합 채널 생성: 1 Producer, 1 RingBuffer)
+    v3_multi_ue.py  ← DL+UL 배치 처리, per-UE 로그
+    v2_multi_ue.py  ← DL 배치 + UL 순차, per-UE 로그
+    v1_multi_ue.py  ← 기본 (순차 처리, 보존)
+  채널: UE별 독립 Sionna 채널 (서로 다른 속도, 거리, Topology)
+  신호 흐름:
+    DL: gNB → Proxy(UE별 채널 적용) → 각 UE에 다른 신호 전달
+    UL: 각 UE → Proxy(UE별 채널 적용) → 합산 → gNB
+
+  ※ G0 (1 gNB + 1 UE)에서 확장한 버전
+  ※ 아직 테스트 전 — 문제 발생 시 이 매뉴얼 하단 트러블슈팅 참고
+
+  실행 순서: 컨테이너 확인 → OAI 빌드 → Proxy/gNB/UE 실행
+  ※ 터미널 추가: Ctrl+Shift+`
+
+================================================================================
+  0. 사전 준비 (G0과 다른 부분에 주의)
+================================================================================
+
+  ── 컨테이너 관리 ──────────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu
+
+  docker compose ps                    # 상태 확인
+  docker compose up -d oai_sionna_proxy    # 컨테이너 시작
+  docker compose down                  # 컨테이너 종료
+
+  ── OAI 빌드 (★ G1A는 빌드 플래그가 다름) ─────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets
+
+  # 초기 빌드 (gNB + UE 동시) — 반드시 --gNB --nrUE 둘 다 지정
+  ./build_oai -w SIMU --ninja --nrUE --gNB --build-lib "nrscope"
+
+  # gNB만 빌드 (UE 바이너리는 생성되지 않음)
+  ./build_oai --gNB
+
+  # UE만 빌드 (gNB 바이너리는 생성되지 않음)
+  ./build_oai --nrUE
+
+  ※ CMakeLists.txt에 GPU IPC V1/V2 모두 포함되어 있음
+  ※ 빌드 플래그 구분 불필요 — 모드 전환은 런타임 환경변수로 수행
+
+  ★ -c 옵션 주의사항:
+    -c 는 clean-all (build 폴더 전체 삭제 후 재빌드)
+    → ./build_oai --gNB -c  실행 시 기존 nr-uesoftmodem도 삭제됨
+    → ./build_oai --nrUE -c 실행 시 기존 nr-softmodem도 삭제됨
+    → -c 사용 후에는 반드시 gNB/UE 모두 다시 빌드해야 함
+    → 권장: -c 쓸 때는 ./build_oai --gNB --nrUE -c (둘 다 한번에)
+
+  ── 증분 빌드 (코드 수정 후, clean 없이) ─────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem            # gNB만 증분 빌드
+  ninja nr-uesoftmodem          # UE만 증분 빌드
+  ninja nr-softmodem nr-uesoftmodem   # 둘 다 증분 빌드
+
+================================================================================
+  ★ 통합 런처 (launch_all.sh) — 터미널 1개로 전체 실행
+================================================================================
+
+  Proxy + gNB + UE N대를 한번에 시작하는 셸 스크립트.
+  UE 수가 많아도 터미널 1개로 실행 가능.
+
+  ── 사용법 ───────────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/vRAN_Socket/G1A_MultiUE_Channel_Proxy
+
+  sudo bash launch_all.sh                        # v4, gpu-ipc, 2 UE (기본)
+  sudo bash launch_all.sh -v v3 -n 4             # v3, gpu-ipc, 4 UE
+  sudo bash launch_all.sh -m socket -n 2         # v4, socket, 2 UE
+  sudo bash launch_all.sh -v v1 -m socket -n 1   # v1, socket, 1 UE
+  sudo bash launch_all.sh -h                     # 도움말
+
+  옵션:
+    -v VERSION   Proxy 버전: v1, v2, v3, v4  (기본: v4)
+    -m MODE      모드: socket, gpu-ipc        (기본: gpu-ipc)
+    -n NUM_UES   UE 수: 1~8                  (기본: 2)
+
+  ── 동작 순서 (자동) ─────────────────────────────────────────────
+
+  1. 이전 프로세스 정리 (pkill)
+  2. Proxy 시작 → "Entering main loop" 대기 (최대 120초)
+  3. gNB 시작 → 3초 대기
+  4. UE 0, 1, ..., N-1 순차 시작 (각 2초 간격)
+  5. Proxy 로그를 화면에 실시간 출력
+  6. Ctrl+C → 전체 프로세스 자동 종료
+
+  ── 로그 파일 ────────────────────────────────────────────────────
+
+  실행할 때마다 타임스탬프 폴더에 로그 보존:
+
+  /tmp/g1a_logs/20260226_163000/    ← 실행 시각별 폴더
+    proxy.log                        Proxy 출력 (E2E frame 통계)
+    gnb.log                          gNB 출력 (초기화, RRC, PRACH, 에러)
+    ue0.log                          UE 0 출력 (SSB, RACH, RRC, PHY)
+    ue1.log                          UE 1 출력 (UE 수에 따라 증가)
+    nrMAC_stats.log                  gNB MAC 통계 (CQI/RI/PMI/RSRP/BLER/MCS)
+    nrL1_stats.log                   gNB L1 통계 (PRB I0, PRACH I0)
+    nrRRC_stats.log                  gNB RRC 통계 (연결된 DU/UE 목록)
+    nrL1_UE_stats-0.log              UE 0 L1 CPU 통계
+
+  /tmp/g1a_logs/latest/              ← 최근 실행 바로가기 (심링크)
+
+  ※ nrMAC_stats.log 등 OAI stats 파일은 OAI가 1초마다 덮어쓰기로 갱신
+  ※ 메인 터미널에는 Proxy만 표시 — gNB/UE는 별도 터미널에서 확인
+
+  gNB/UE 로그 실시간 확인 (별도 터미널):
+    tail -f /tmp/g1a_logs/latest/gnb.log
+    tail -f /tmp/g1a_logs/latest/ue0.log
+    tail -f /tmp/g1a_logs/latest/ue1.log
+
+  OAI 통계 확인 (별도 터미널):
+    cat /tmp/g1a_logs/latest/nrMAC_stats.log    # UE별 CQI/PMI/RSRP/BLER/MCS
+    cat /tmp/g1a_logs/latest/nrRRC_stats.log    # 연결된 DU/UE
+    cat /tmp/g1a_logs/latest/nrL1_stats.log     # PRB I0, PRACH I0
+
+  ── 종료 ─────────────────────────────────────────────────────────
+
+  Ctrl+C 한번 → 전체 프로세스 (Proxy, gNB, 모든 UE) 자동 종료
+
+  ※ sudo로 실행하므로 비밀번호는 처음 1번만 입력
+  ※ 스크립트 위치: G1A_MultiUE_Channel_Proxy/launch_all.sh
+
+================================================================================
+  모드 A: GPU IPC V2 모드 — 터미널별 수동 실행
+================================================================================
+
+  ※ 위의 launch_all.sh를 사용하면 아래를 수동으로 할 필요 없음
+  ※ 개별 터미널에서 직접 실행하고 싶을 때만 참고
+
+  통신: CUDA IPC V2 (per-UE GPU 공유 메모리, 소켓 없음)
+  환경변수:
+    gNB  → RFSIM_GPU_IPC_V2=1
+    UE k → RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=k (k = 0, 1, 2, ...)
+
+  순서: Proxy → gNB → UE 0 → UE 1 → ...
+
+  ── 예시: UE 2대 (기본값) ──────────────────────────────────────────────
+
+  ── 터미널 1: Sionna Proxy ────────────────────────────────────────────
+
+  # v4 (통합 채널 생성, 최신)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v4_multi_ue.py \
+    --mode=gpu-ipc --num-ues 2
+
+  # v3 (DL+UL 배치, per-UE producer)
+  # docker exec -it oai_sionna_proxy python3 \
+  #   /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v3_multi_ue.py \
+  #   --mode=gpu-ipc --num-ues 2
+
+  ※ "Entering main loop..." 메시지 확인 후 gNB 실행
+
+  ── 터미널 2: OAI gNB ─────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem
+  sudo RFSIM_GPU_IPC_V2=1 ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim
+
+  ── 터미널 3: OAI UE 0 ────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-uesoftmodem
+  sudo RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=0 ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 --rfsim
+
+  ── 터미널 4: OAI UE 1 ────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  sudo RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=1 ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000002 --rfsim
+
+  ※ RFSIM_GPU_IPC_UE_IDX: 각 UE의 인덱스 (0부터 시작, --num-ues 미만)
+  ※ --uicc0.imsi: 각 UE마다 다른 IMSI 사용
+  ※ 공유 메모리: /tmp/oai_gpu_ipc/gpu_ipc_shm (G0과 같은 경로, 다른 포맷)
+  ※ --rfsimulator.serverport 옵션 불필요 (소켓 미사용)
+
+  ── 예시: UE 4대 ──────────────────────────────────────────────────────
+
+  # Proxy
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v2_multi_ue.py \
+    --mode=gpu-ipc --num-ues 4
+
+  # gNB
+  sudo RFSIM_GPU_IPC_V2=1 ./nr-softmodem -O <conf> --gNBs.[0].min_rxtxtime 6 --rfsim
+
+  # UE 0~3 (각각 별도 터미널)
+  sudo RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=0 ./nr-uesoftmodem ... --uicc0.imsi 001010000000001
+  sudo RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=1 ./nr-uesoftmodem ... --uicc0.imsi 001010000000002
+  sudo RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=2 ./nr-uesoftmodem ... --uicc0.imsi 001010000000003
+  sudo RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=3 ./nr-uesoftmodem ... --uicc0.imsi 001010000000004
+
+================================================================================
+  모드 B: Socket 모드 (디버깅 및 호환)
+================================================================================
+
+  통신: TCP Socket (gNB:6017, Proxy:6018)
+  순서: gNB → Proxy → UE 0 → UE 1 → ...
+
+  ※ 모든 UE가 같은 포트(6018)에 연결 — Proxy가 내부적으로 UE 구분
+
+  ── 터미널 1: OAI gNB ─────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem
+  sudo ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim --rfsimulator.serverport 6017
+
+  ── 터미널 2: Sionna Proxy ────────────────────────────────────────────
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v2_multi_ue.py \
+    --mode=socket --num-ues 2
+
+  ── 터미널 3: OAI UE 0 ────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-uesoftmodem
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 \
+    --rfsim --rfsimulator.serverport 6018
+
+  ── 터미널 4: OAI UE 1 ────────────────────────────────────────────────
+
+  cd /home/dclcom57/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000002 \
+    --rfsim --rfsimulator.serverport 6018
+
+  ※ gNB → Proxy → UE 순서 필수
+
+================================================================================
+  Proxy CLI 옵션 (★ G1A 전용 옵션에 주목)
+================================================================================
+
+  ■ G1A 전용 옵션:
+
+  옵션                     기본값    설명
+  ────────────────────────  ────────  ──────────────────────────────
+  --num-ues <N>            2         UE 수 (1~8)
+  --batch-mode             on        배치 FFT (N UE 동시 GPU 처리)
+  --no-batch-mode          -         배치 비활성화 (순차 per-UE 처리)
+
+  ■ G0과 공통 옵션:
+
+  옵션                     기본값    설명
+  ────────────────────────  ────────  ──────────────────────────────
+  --mode <socket|gpu-ipc>  socket    통신 모드
+  --path-loss-dB <값>      0         Path Loss (음수=감쇠, 0=무손실)
+  --snr-dB <값>            None      AWGN noise SNR (미지정=off)
+  --no-ch-en               -         채널 비활성화 (bypass)
+  --custom-channel         on        Sionna 채널 모델 활성화
+  --enable-gpu/--disable-gpu  on     GPU 가속
+  --use-pinned-memory      on        Pinned Memory
+  --use-cuda-graph         on        CUDA Graph
+  --ipc-shm-path <경로>    /tmp/oai_gpu_ipc/gpu_ipc_shm
+  --profile-interval <N>   100       프로파일 출력 간격 (슬롯)
+  --profile-window <N>     500       롤링 윈도우 크기
+  --dual-timer-compare     on        CPU+GPU 듀얼 타이머
+
+  ■ 사용 예시:
+
+  # GPU IPC V2, 2 UE, Sionna 채널
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v2_multi_ue.py \
+    --mode=gpu-ipc --num-ues 2
+
+  # GPU IPC V2, 4 UE, PL 감쇠 + noise
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v2_multi_ue.py \
+    --mode=gpu-ipc --num-ues 4 --path-loss-dB -3 --snr-dB 15
+
+  # Socket, 2 UE, 채널 bypass (디버깅용)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v2_multi_ue.py \
+    --mode=socket --num-ues 2 --no-ch-en
+
+  # Socket, 2 UE, 배치 비활성화 (디버깅)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G1A_MultiUE_Channel_Proxy/v2_multi_ue.py \
+    --mode=socket --num-ues 2 --no-batch-mode
+
+================================================================================
+  프로세스 종료
+================================================================================
+
+  sudo pkill -9 nr-softmodem
+  sudo pkill -9 nr-uesoftmodem
+
+  ※ Proxy는 Ctrl+C로 종료
+
+================================================================================
+  G0 → G1A 주요 차이점
+================================================================================
+
+  항목             G0 (v12)                  G1A (v1)
+  ──────────────  ────────────────────────  ──────────────────────────
+  UE 수           1                         N (1~8)
+  DL 채널         단일                       per-UE 독립 채널
+  UL 처리         passthrough               per-UE 채널 + 합산
+  GPU IPC SHM     512B (4버퍼 고정)          4096B (2+2N 버퍼)
+  SHM Magic       0x47505549                0x47505532
+  OAI 빌드 플래그  -DUSE_GPU_IPC             -DUSE_GPU_IPC -DUSE_GPU_IPC_V2
+  환경변수 (gNB)   RFSIM_GPU_IPC=1           RFSIM_GPU_IPC_V2=1
+  환경변수 (UE)    RFSIM_GPU_IPC=1           RFSIM_GPU_IPC_V2=1 RFSIM_GPU_IPC_UE_IDX=k
+  FFT 배치         14 sym                    N×14 sym (배치 모드)
+  Proxy 파일       v12_gpu_ipc.py            v4_multi_ue.py
+  OAI IPC 파일     gpu_ipc.h/c               gpu_ipc_v2.h/c
+
+================================================================================
+  G1A 환경변수 정리
+================================================================================
+
+  환경변수                값      역할
+  ──────────────────────  ──────  ──────────────────────────────
+  RFSIM_GPU_IPC_V2        1       G1A GPU IPC V2 활성화
+  RFSIM_GPU_IPC_UE_IDX    0~7     UE 프로세스의 인덱스 (UE에만 사용)
+
+  ※ gNB는 RFSIM_GPU_IPC_UE_IDX 불필요 (단일 dl_tx, ul_rx 버퍼)
+  ※ UE_IDX를 빠뜨리면 기본값 0으로 동작 (첫 번째 UE)
+
+================================================================================
+  트러블슈팅 (테스트 전 예상 이슈)
+================================================================================
+
+  ■ "SHM magic mismatch" 또는 IPC 연결 실패:
+    → Proxy가 먼저 실행 중인지 확인
+    → SHM 파일 남아있으면 삭제: sudo rm -rf /tmp/oai_gpu_ipc/*
+    → Proxy 재시작
+
+  ■ UE가 연결되지 않음 (GPU IPC V2):
+    → RFSIM_GPU_IPC_V2=1 환경변수 확인 (V2 없이 V1으로 동작하면 호환 안됨)
+    → OAI가 -DUSE_GPU_IPC_V2 플래그로 빌드되었는지 확인
+    → RFSIM_GPU_IPC_UE_IDX가 Proxy의 --num-ues 미만인지 확인
+
+  ■ 두 번째 UE가 접속 실패 (Socket 모드):
+    → 첫 번째 UE가 정상 접속된 후 두 번째 UE 실행
+    → 같은 포트(6018) 사용하되, IMSI가 서로 다른지 확인
+    → Proxy 로그에서 UE 연결 수 확인
+
+  ■ gNB PRACH detection 실패:
+    → --no-ch-en 으로 채널 비활성화하여 bypass 테스트
+    → Path Loss 0 (기본값)으로 시작
+    → complex128 정밀도 문제는 G0에서 해결 완료 (G1A에도 적용됨)
+
+  ■ Proxy GPU 메모리 부족:
+    → nvidia-smi로 VRAM 확인
+    → --num-ues를 줄여서 테스트 (UE당 채널 버퍼 사용량 증가)
+    → --no-custom-channel 로 Sionna 채널 비활성화 (채널 없이 동작 확인)
+
+  ■ OAI 빌드 에러 ("gpu_ipc_v2.c not found"):
+    → gpu_ipc_v2.h, gpu_ipc_v2.c 파일이 아래 경로에 있는지 확인:
+      openairinterface5g_whan/radio/rfsimulator/gpu_ipc_v2.h
+      openairinterface5g_whan/radio/rfsimulator/gpu_ipc_v2.c
+    → CMakeLists.txt에 gpu_ipc_v2.c가 소스 목록에 포함되어 있는지 확인
+
+================================================================================
+  관련 파일
+================================================================================
+
+  Proxy 코드:
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/v4_multi_ue.py    (최신, 통합 채널 생성)
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/v3_multi_ue.py    (DL+UL 배치)
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/v2_multi_ue.py    (per-UE 로그)
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/v1_multi_ue.py    (기본, 보존)
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/channel_coefficients_JIN.py  (→ G0 심링크)
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/saved_rays_data/  (→ G0 심링크)
+
+  OAI 코드 (G1A 신규):
+    openairinterface5g_whan/radio/rfsimulator/gpu_ipc_v2.h   (Multi-UE SHM 4096B)
+    openairinterface5g_whan/radio/rfsimulator/gpu_ipc_v2.c   (Multi-UE IPC 구현)
+
+  OAI 코드 (수정):
+    openairinterface5g_whan/radio/rfsimulator/simulator.c    (#ifdef USE_GPU_IPC_V2)
+
+  문서:
+    vRAN_Socket/G1A_MultiUE_Channel_Proxy/README.md          (기술 문서)
+
+  G0 원본 (참고):
+    vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py
+    vRAN_Socket/G0_Sionna_Channel_Proxy/실행_매뉴얼.txt
+
+================================================================================
+  테스트 계획 (향후)
+================================================================================
+
+  1단계: Socket + 채널 bypass (--no-ch-en)
+    → gNB + UE 1대로 기본 통신 확인 (G0과 동일해야 함)
+    → UE 2대로 확장 테스트
+
+  2단계: Socket + Sionna 채널 (--custom-channel)
+    → UE 1대로 RACH → RRC 성공 확인
+    → UE 2대로 동시 접속 확인
+
+  3단계: GPU IPC V2 + 채널 bypass
+    → OAI 빌드 (-DUSE_GPU_IPC_V2) 확인
+    → gNB + UE 1대로 IPC V2 통신 확인
+    → UE 2대로 확장 테스트
+
+  4단계: GPU IPC V2 + Sionna 채널 (최종)
+    → 2 UE 동시 채널 적용
+    → 성능 측정 (프로파일 로그 확인)
+
+================================================================================

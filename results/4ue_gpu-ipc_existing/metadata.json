@@ -1,0 +1,10 @@
+{
+    "timestamp": "2026-03-02T01:46:36+09:00",
+    "num_ues": 4,
+    "duration_sec": 57,
+    "mode": "gpu-ipc",
+    "proxy_ver": "v4",
+    "bypass_channel": false,
+    "ue_connected": false,
+    "note": "existing run data (20260302_014636), PRACH fix applied, PBCH decode failure"
+}

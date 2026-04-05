@@ -1,0 +1,384 @@
+================================================================================
+  DevChannelProxyJIN - Cursor AI 사용 매뉴얼
+================================================================================
+
+================================================================================
+  ★ 빠른 실행 — 터미널별 명령어 (복사-붙여넣기용)
+================================================================================
+
+  실행 순서: 컨테이너 → gNB → Sionna → UE
+  ※ Ctrl+Shift+` 로 터미널 추가
+
+  ── 0. 컨테이너 관리 ─────────────────────────────────────────────────────
+
+  cd /home/dclcom57/DevChannelProxyJIN
+
+  # 컨테이너 상태 확인
+  docker compose ps
+
+  # 컨테이너 켜기 (꺼져 있을 때)
+  docker compose up -d oai_sionna_proxy
+
+  # 컨테이너 끄기 (작업 끝났을 때)
+  docker compose down
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  모드 A: GPU IPC 모드 (v12, 소켓 제거, 최고 성능)                          │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  실행 순서: 컨테이너 → gNB(GPU IPC) → Proxy(GPU IPC) → UE(GPU IPC)
+  ※ 포트 번호 불필요 — GPU 공유 메모리로 직접 통신
+
+  ── 터미널 1: Sionna Proxy (GPU IPC) ──────────────────────────────────
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=gpu-ipc
+
+  ── 터미널 2: OAI gNB (GPU IPC) ────────────────────────────────────────
+
+  cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem
+  sudo RFSIM_GPU_IPC=1 ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim
+
+  ── 터미널 3: OAI UE (GPU IPC) ────────────────────────────────────────
+
+  cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-uesoftmodem
+  sudo RFSIM_GPU_IPC=1 ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 --rfsim
+
+  ※ RFSIM_GPU_IPC=1 환경변수로 GPU IPC 모드 활성화
+  ※ --rfsimulator.serverport 옵션 불필요 (소켓 미사용)
+  ※ gNB가 먼저 실행되어 GPU 버퍼 할당 후 → Proxy/UE가 IPC 핸들 오픈
+  ※ 공유 메모리 파일: /tmp/oai_gpu_ipc/gpu_ipc_shm
+
+  ── 터미널 4: OAI 터미널 종료 ────────────────────────────────────────
+
+  # gNB 프로세스 찾아서 강제 종료
+  # UE 프로세스 찾아서 강제 종료
+  sudo pkill -9 nr-softmodem
+  sudo pkill -9 nr-uesoftmodem
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  모드 B: 소켓 모드 (v10/v12 호환, 기존 방식)                               │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ── 터미널 1: OAI gNB ────────────────────────────────────────────────────
+
+  cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem
+  sudo ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim --rfsimulator.serverport 6017
+
+  ── 터미널 2: Sionna Proxy ───────────────────────────────────────────────
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=socket [옵션]
+
+  또는 기존 v10 사용:
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v10_cuda_graph.py \
+    [옵션]
+
+  ■ 주요 옵션:
+    --mode <socket|gpu-ipc>  통신 모드 (v12만 해당, 기본=socket)
+    --path-loss-dB <값>      Path Loss (OAI 규약: 음수=감쇠, 0=무손실, 기본=0)
+    --snr-dB <값>            AWGN noise SNR (미지정 시 noise 없음)
+    --no-ch-en               채널 비활성화 (bypass, 디버깅용)
+    --ipc-shm-path <경로>    GPU IPC 공유 메모리 경로 (기본=/tmp/oai_gpu_ipc/gpu_ipc_shm)
+
+  ■ 사용 예시:
+
+  # GPU IPC + 채널 기본 (noise 없음, PL 0 dB)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=gpu-ipc
+
+  # GPU IPC + 채널 + AWGN noise (SNR 20 dB)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=gpu-ipc --snr-dB 20
+
+  # 소켓 모드 (v10 호환) - 채널만 적용
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v12_gpu_ipc.py \
+    --mode=socket
+
+  # 채널 + PL 3dB 감쇠 + noise (소켓 모드)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v10_cuda_graph.py \
+    --path-loss-dB -3 --snr-dB 3
+
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v11_profile_instrumented.py \
+    --path-loss-dB -3 --snr-dB 3
+
+  # 채널 없이 bypass (디버깅용)
+  docker exec -it oai_sionna_proxy python3 \
+    /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v10_cuda_graph.py \
+    --no-ch-en
+
+  ※ 신호 체인: Tx → Sionna(multipath) → xPL → +AWGN → int16 → OAI UE
+  ※ OAI rfsimulator는 channel_mode=2 (bypass) 상태로 사용
+
+  ── 터미널 3: OAI UE (소켓 모드) ──────────────────────────────────────
+
+  cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-uesoftmodem
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 \
+    --rfsim --rfsimulator.serverport 6018
+
+  ※ SA 모드는 기본값이므로 --sa 옵션 불필요.
+  ※ gNB → Sionna → UE 순서로 실행해야 한다.
+     gNB가 포트 6017에서 대기 → Sionna가 연결 후 6018 대기 → UE가 6018에 연결.
+  ※ 코드를 수정하지 않았으면 ninja 빌드 단계는 생략 가능.
+
+================================================================================
+
+[개요]
+  이 문서는 DevChannelProxyJIN 프로젝트에서 Cursor AI를 사용하여
+  OAI(호스트)와 Sionna Channel Proxy(컨테이너)를 동시에 개발/제어하는
+  방법을 설명한다.
+
+  핵심: 호스트에서 프로젝트 폴더를 열고, Cursor 한 창 안에서
+  코드 편집, 빌드, 실행을 전부 수행한다.
+
+================================================================================
+  프로젝트 구조
+================================================================================
+
+  DevChannelProxyJIN/
+  ├── docker compose.yml                  ← 컨테이너 오케스트레이션
+  │
+  ├── vRAN_Socket/                        ← Docker 컨테이너 (GPU)
+  │   ├── Dockerfile
+  │   └── G0_Sionna_Channel_Proxy/
+  │       └── v8_cupy_slot_batch_pinned_fastest.py ...
+  │
+  └── openairinterface5g_whan/            ← 호스트 직접 실행 (CPU)
+      ├── cmake_targets/
+      └── ...
+
+  vRAN_Socket/은 컨테이너 안에서 실행되지만, 볼륨 마운트로 호스트와
+  동일한 파일을 공유한다. 따라서 호스트에서 수정하면 컨테이너에 즉시 반영된다.
+
+================================================================================
+  사전 준비 (최초 1회)
+================================================================================
+
+  1) OAI 최초 빌드 (빌드 시스템 생성)
+     cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets
+     ./build_oai -w SIMU --ninja --nrUE --gNB --build-lib "nrscope"
+
+     ※ 이 명령은 cmake 설정 + 전체 컴파일을 수행한다 (수 분~수십 분 소요).
+       완료되면 ran_build/build/ 디렉토리가 생성되며,
+       이후부터는 ninja 증분 빌드만 하면 된다.
+
+     ★ build_oai 사용 시 주의사항:
+       - --gNB만 지정하면 nr-softmodem만, --nrUE만 지정하면 nr-uesoftmodem만 빌드
+       - -c (clean) 옵션은 build 폴더 전체를 삭제하므로, 이전에 빌드한 바이너리도 삭제됨
+         → -c 사용 후에는 gNB/UE 모두 재빌드 필요
+         → 권장: ./build_oai --gNB --nrUE -c (한번에 둘 다)
+       - 증분 빌드 (코드 수정 후):
+         cd openairinterface5g_whan/cmake_targets/ran_build/build
+         ninja nr-softmodem nr-uesoftmodem
+
+  2) Sionna 컨테이너 이미지 빌드
+     cd /home/dclcom57/DevChannelProxyJIN
+     docker compose build oai_sionna_proxy
+
+================================================================================
+  사용 순서
+================================================================================
+
+  1) Cursor에서 Remote SSH로 서버 접속
+
+  2) DevChannelProxyJIN 폴더 열기
+     - File > Open Folder > /home/dclcom57/DevChannelProxyJIN 선택
+     - 왼쪽 파일 탐색기에 vRAN_Socket/, openairinterface5g_whan/ 둘 다 보임
+
+  3) 컨테이너 실행 (Cursor 통합 터미널에서)
+     cd /home/dclcom57/DevChannelProxyJIN
+     docker compose up -d oai_sionna_proxy
+
+  4) 코드 수정
+     - 파일 탐색기에서 OAI든 Sionna든 원하는 코드를 수정하고 저장
+
+  5) 실행 (Cursor 터미널을 여러 개 띄워서 작업)
+     - 터미널 추가: Ctrl+Shift+` (백틱)
+
+     ※ 아래 "터미널 구성" 및 "수정 → 빌드 → 실행 워크플로우" 참고
+
+================================================================================
+  터미널 구성
+================================================================================
+
+  gNB, UE, Sionna는 실행하면 프로세스가 계속 돌면서 터미널을 점유한다.
+  따라서 각각 별도 터미널이 필요하다.
+
+  터미널     용도                         비고
+  ────────  ──────────────────────────  ──────────────────────
+  터미널 1   OAI gNB 빌드 + 실행          빌드 후 그대로 gNB 실행
+  터미널 2   OAI UE 빌드 + 실행           빌드 후 그대로 UE 실행
+  터미널 3   Sionna 실행 (docker exec)    컨테이너 안에서 실행됨
+
+  ※ 컨테이너 관리(docker compose up/down 등)나 기타 작업이 필요하면
+    터미널을 하나 더 추가하면 된다.
+
+  ※ Cursor Agent 모드에서 "빌드하고 실행해"라고 지시하면
+    AI가 터미널을 자동으로 만들고 명령어를 실행해준다.
+    실행 후 터미널이 Cursor 하단에 남아있으므로 직접 이어서 작업 가능.
+
+================================================================================
+  수정 → 빌드 → 실행 워크플로우
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                                                         │
+  │  OAI (C 코드):    수정 → ninja 빌드 → 실행              │
+  │  Sionna (Python):  수정 → 바로 실행 (빌드 불필요)         │
+  │                                                         │
+  └─────────────────────────────────────────────────────────┘
+
+  [OAI 수정 후 빌드 & 실행]
+
+  # 터미널 1: OAI 빌드 + gNB 실행
+  cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem                    ← 변경된 파일만 재컴파일 (수 초~수십 초)
+  sudo ./nr-softmodem \
+    -O ../../../targets/PROJECTS/GENERIC-NR-5GC/CONF/gnb.sa.band78.fr1.106PRB.usrpb210.conf \
+    --gNBs.[0].min_rxtxtime 6 --rfsim --rfsimulator.serverport 6017
+
+  # 터미널 2: OAI UE 실행
+  cd /home/dclcom57/DevChannelProxyJIN/openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-uesoftmodem                  ← UE 코드 수정했으면 빌드
+  sudo ./nr-uesoftmodem \
+    -r 106 --numerology 1 --band 78 -C 3619200000 \
+    --uicc0.imsi 001010000000001 \
+    --rfsim --rfsimulator.serverport 6018
+
+  참고: gNB만 수정했으면 ninja nr-softmodem만,
+        UE만 수정했으면 ninja nr-uesoftmodem만,
+        둘 다 수정했으면 ninja nr-softmodem nr-uesoftmodem
+
+  [Sionna 수정 후 실행]
+
+  # 터미널 3: Sionna 실행 (컨테이너 안에서)
+  docker exec -it oai_sionna_proxy python3 /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v8_cupy_slot_batch_pinned_fastest.py
+
+  Python이므로 빌드 없이 저장 후 바로 위 명령어로 실행하면 된다.
+  호스트에서 수정한 파일이 볼륨 마운트로 컨테이너에 즉시 반영된다.
+
+================================================================================
+  Cursor 한 창 운영 모습
+================================================================================
+
+  ┌─────────────────────────────────────────────────────┐
+  │  Cursor (Remote SSH → 호스트)                        │
+  │                                                     │
+  │  파일 탐색기 (DevChannelProxyJIN/):                   │
+  │    vRAN_Socket/              ← Sionna 코드 편집      │
+  │    openairinterface5g_whan/  ← OAI 코드 편집         │
+  │                                                     │
+  │  터미널 1: OAI gNB 빌드/실행                          │
+  │    $ ninja nr-softmodem                             │
+  │    $ sudo ./nr-softmodem ...                        │
+  │                                                     │
+  │  터미널 2: OAI UE 실행                                │
+  │    $ sudo ./nr-uesoftmodem ...                      │
+  │                                                     │
+  │  터미널 3: Sionna 실행                                │
+  │    $ docker exec -it oai_sionna_proxy python ...        │
+  └─────────────────────────────────────────────────────┘
+
+  전부 Cursor 한 창 안에서 동작한다.
+  터미널은 Ctrl+Shift+` 로 추가할 수 있다.
+
+================================================================================
+  정상 동작 확인 체크리스트
+================================================================================
+
+  폴더 열었을 때:
+  [ ] 왼쪽 파일 탐색기에 vRAN_Socket/ 폴더 보이는가?
+  [ ] 왼쪽 파일 탐색기에 openairinterface5g_whan/ 폴더 보이는가?
+
+  컨테이너 상태:
+  [ ] docker compose ps 실행 시 oai_sionna_proxy가 Up 상태인가?
+
+  OAI 빌드:
+  [ ] ninja nr-softmodem 실행 시 에러 없이 완료되는가?
+
+  Sionna 실행:
+  [ ] docker exec -it oai_sionna_proxy python ... 실행 시 동작하는가?
+
+  파일 수정 반영:
+  [ ] Cursor에서 vRAN_Socket/ 안의 파일을 수정하고 저장
+  [ ] docker exec -it oai_sionna_proxy cat <수정한 파일> → 변경사항 반영되었는가?
+
+  위 항목이 모두 통과하면 정상.
+
+================================================================================
+  자주 쓰는 명령어 모음
+================================================================================
+
+  # 컨테이너 관련
+  docker compose up -d oai_sionna_proxy       ← 컨테이너 실행
+  docker compose ps                       ← 컨테이너 상태 확인
+  docker compose logs -f oai_sionna_proxy     ← 컨테이너 로그 보기
+  docker compose down                     ← 컨테이너 중지
+  docker compose up -d --build oai_sionna_proxy  ← 컨테이너 재빌드 (Dockerfile 수정 후)
+
+  # OAI 빌드
+  cd openairinterface5g_whan/cmake_targets/ran_build/build
+  ninja nr-softmodem                      ← gNB 빌드
+  ninja nr-uesoftmodem                    ← UE 빌드
+  ninja nr-softmodem nr-uesoftmodem       ← 둘 다 빌드
+
+  # Sionna 실행
+  docker exec -it oai_sionna_proxy python3 /workspace/vRAN_Socket/G0_Sionna_Channel_Proxy/v8_cupy_slot_batch_pinned_fastest.py
+
+  # 컨테이너 안 셸 접속 (디버깅용)
+  docker exec -it oai_sionna_proxy bash
+
+================================================================================
+  팁: Docker 확장으로 컨테이너 UI 관리
+================================================================================
+
+  Extensions에서 "Docker" 검색 → 설치하면,
+  컨테이너 관련 작업을 터미널 없이 UI로 할 수 있다.
+
+  좌측 Docker 아이콘 클릭 → Containers 패널에서:
+  - 컨테이너 상태 바로 확인        (docker compose ps 대신)
+  - 우클릭 → Start / Stop          (docker compose up/down 대신)
+  - 우클릭 → View Logs             (docker compose logs 대신)
+  - 우클릭 → Attach Shell          (docker exec bash 대신)
+
+  ※ 코드 빌드(ninja)와 실행(nr-softmodem, python)은 UI로 안 되며,
+    반드시 터미널 명령어를 사용해야 한다.
+
+================================================================================
+  참고: Python IntelliSense가 필요한 경우
+================================================================================
+
+  위 방식(호스트에서 열기)에서는 Python 자동완성(IntelliSense)이 동작하지
+  않는다. TensorFlow, CuPy 등 패키지가 호스트가 아닌 컨테이너 안에 있기
+  때문이다.
+
+  Python 자동완성이 꼭 필요하면 Dev Containers 방식을 사용할 수 있다:
+  1) Ctrl+Shift+P → "Dev Containers: Attach to Running Container..."
+  2) oai_sionna_proxy 선택
+  3) 새 창에서 /workspace 열기
+  4) Python 확장 설치 (최초 1회)
+
+  단, 이 방식에서는 OAI 빌드/실행을 Cursor 창 안에서 할 수 없다.
+  별도 호스트 터미널이 필요하다.
+
+================================================================================
