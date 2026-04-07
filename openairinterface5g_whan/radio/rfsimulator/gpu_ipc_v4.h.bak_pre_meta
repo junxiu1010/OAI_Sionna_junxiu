@@ -1,0 +1,150 @@
+/*
+ * gpu_ipc_v4.h - CUDA IPC Circular Buffers (G1A)
+ *
+ * Timestamp-indexed circular buffer matching socket-mode semantics.
+ * Position: offset = (timestamp * nbAnt) % CirSize (sample index)
+ * Supports variable nsamps natively (no packetizer).
+ *
+ * Architecture:
+ *   Proxy (SERVER) allocates (2 + 2*N) GPU circular buffers:
+ *     dl_tx    : 1 buf  (gNB writes, Proxy reads)
+ *     ul_rx    : 1 buf  (Proxy writes, gNB reads)
+ *     dl_rx[k] : N buf  (Proxy writes, UE_k reads)
+ *     ul_tx[k] : N buf  (UE_k writes, Proxy reads)
+ *
+ *   Each buffer = CirSize * sizeof(c16_t) bytes (contiguous samples).
+ *   Access: gpu_base + (offset % CirSize) * 4
+ *
+ * SHM layout: 2048 bytes
+ */
+
+#ifndef GPU_IPC_V4_H
+#define GPU_IPC_V4_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define GPU_IPC_V4_SHM_DIR          "/tmp/oai_gpu_ipc"
+#define GPU_IPC_V4_SHM_PATH         "/tmp/oai_gpu_ipc/gpu_ipc_shm"
+#define GPU_IPC_V4_MAGIC            0x47505535  /* "GPU5" */
+#define GPU_IPC_V4_VERSION          5
+#define GPU_IPC_V4_HANDLE_SIZE      64
+#define GPU_IPC_V4_MAX_UE           8
+#define GPU_IPC_V4_SHM_SIZE         2048
+
+/* CirSize = 10ms @ 40MHz NR (matches simulator.c minCirSize) */
+#define GPU_IPC_V4_CIR_SIZE         460800
+#define GPU_IPC_V4_SAMPLE_SIZE      4   /* sizeof(c16_t) */
+#define GPU_IPC_V4_BUF_BYTES        (GPU_IPC_V4_CIR_SIZE * GPU_IPC_V4_SAMPLE_SIZE)
+
+/* Read return codes */
+#define GPU_IPC_V4_OK               1   /* data read successfully */
+#define GPU_IPC_V4_EMPTY            0   /* data not yet written */
+#define GPU_IPC_V4_OVERWRITTEN      (-2)/* slot overwritten */
+#define GPU_IPC_V4_ERROR            (-1)/* general error */
+
+/*
+ * SHM layout (2048 bytes):
+ *
+ * === IPC Handle area (0-1151) ===
+ *   0      : dl_tx handle (64B)
+ *   64     : ul_rx handle (64B)
+ *   128    : dl_rx handles[MAX_UE] (64*8 = 512B)
+ *   640    : ul_tx handles[MAX_UE] (64*8 = 512B)
+ *
+ * === Global area (1152-1200) ===
+ *   1152   : cir_size      (uint32)
+ *   1156   : chan_offset   (uint32)
+ *   1160   : num_ues       (uint32)
+ *   1164   : magic         (uint32)
+ *   1168   : version       (uint32)
+ *   1172   : last_dl_tx_ts (uint64) - gNB last written
+ *   1180   : last_dl_tx_nsamps (uint32) - gNB last block size
+ *   1184   : last_dl_tx_nbAnt (uint32) - gNB last block nbAnt
+ *   1188   : last_ul_rx_ts (uint64) - Proxy last written (gNB reads)
+ *   1188   : last_dl_rx_ts[0] (uint64) - Proxy last written per UE
+ *   ...    : last_dl_rx_ts[7]
+ *   1244   : last_ul_tx_ts[0] (uint64) - UE last written
+ *   ...    : last_ul_tx_ts[7]
+ *   1300   : last_ul_tx_nsamps[8] (uint32) - UE last block size
+ *   1332   : last_ul_tx_nbAnt[8] (uint32) - UE last block nbAnt
+ *   1364   : dl_rx_consumer_ts[0] (uint64) - UE last read
+ *   ...    : dl_rx_consumer_ts[7]
+ *   1356   : ul_rx_consumer_ts (uint64) - gNB last read
+ *   1364+  : reserved
+ */
+
+#define _V4_OFF_DL_TX_HANDLE     0
+#define _V4_OFF_UL_RX_HANDLE     64
+#define _V4_OFF_DL_RX_HANDLES    128   /* + k*64 */
+#define _V4_OFF_UL_TX_HANDLES    640   /* + k*64 */
+
+#define _V4_OFF_GLOBAL           1152
+#define _V4_OFF_CIR_SIZE         (_V4_OFF_GLOBAL)
+#define _V4_OFF_CHAN_OFFSET      (_V4_OFF_GLOBAL + 4)
+#define _V4_OFF_NUM_UES          (_V4_OFF_GLOBAL + 8)
+#define _V4_OFF_MAGIC            (_V4_OFF_GLOBAL + 12)
+#define _V4_OFF_VERSION          (_V4_OFF_GLOBAL + 16)
+#define _V4_OFF_LAST_DL_TX_TS    (_V4_OFF_GLOBAL + 20)
+#define _V4_OFF_LAST_DL_TX_NSAMPS (_V4_OFF_GLOBAL + 28)
+#define _V4_OFF_LAST_DL_TX_NBANT (_V4_OFF_GLOBAL + 32)
+#define _V4_OFF_LAST_UL_RX_TS    (_V4_OFF_GLOBAL + 36)
+#define _V4_OFF_LAST_DL_RX_TS    (_V4_OFF_GLOBAL + 44)   /* + k*8 */
+#define _V4_OFF_LAST_UL_TX_TS    (_V4_OFF_GLOBAL + 108)  /* + k*8 */
+#define _V4_OFF_LAST_UL_TX_NSAMPS (_V4_OFF_GLOBAL + 172) /* + k*4 */
+#define _V4_OFF_LAST_UL_TX_NBANT  (_V4_OFF_GLOBAL + 204) /* + k*4 */
+#define _V4_OFF_DL_RX_CONSUMER_TS (_V4_OFF_GLOBAL + 236) /* + k*8 */
+#define _V4_OFF_UL_RX_CONSUMER_TS (_V4_OFF_GLOBAL + 300)
+
+typedef enum {
+    GPU_IPC_V4_ROLE_GNB = 0,
+    GPU_IPC_V4_ROLE_UE  = 1
+} gpu_ipc_v4_role_t;
+
+typedef struct {
+    char    *shm_raw;
+    void    *gpu_dl_tx;
+    void    *gpu_ul_rx;
+    void    *gpu_dl_rx;
+    void    *gpu_ul_tx;
+    gpu_ipc_v4_role_t role;
+    int     ue_idx;
+    int     num_ues;
+    int     shm_fd;
+    void    *cuda_lib;
+    uint32_t cir_size;
+    uint32_t chan_offset;
+    int     initialized;
+    int     ul_ts_synced;
+} gpu_ipc_v4_ctx_t;
+
+/* ── Initialization / Cleanup ── */
+
+int  gpu_ipc_v4_init(gpu_ipc_v4_ctx_t *ctx, gpu_ipc_v4_role_t role, int ue_idx);
+void gpu_ipc_v4_cleanup(gpu_ipc_v4_ctx_t *ctx);
+
+/* ── gNB DL write ── */
+int  gpu_ipc_v4_dl_write(gpu_ipc_v4_ctx_t *ctx, const void *samples,
+                         int nsamps, int nbAnt, uint64_t timestamp);
+
+/* ── UE DL read ── */
+int  gpu_ipc_v4_dl_read(gpu_ipc_v4_ctx_t *ctx, void *samples,
+                        int nsamps, int nbAnt, uint64_t target_ts);
+
+/* ── UE UL write ── */
+int  gpu_ipc_v4_ul_write(gpu_ipc_v4_ctx_t *ctx, const void *samples,
+                         int nsamps, int nbAnt, uint64_t timestamp);
+
+/* ── gNB UL read ── */
+int  gpu_ipc_v4_ul_read(gpu_ipc_v4_ctx_t *ctx, void *samples,
+                        int nsamps, int nbAnt, uint64_t target_ts);
+
+/* ── Convenience: latest ts for sync ── */
+uint64_t gpu_ipc_v4_dl_latest_ts(gpu_ipc_v4_ctx_t *ctx);
+uint64_t gpu_ipc_v4_ul_latest_ts(gpu_ipc_v4_ctx_t *ctx);
+uint64_t gpu_ipc_v4_dl_consumer_ts(gpu_ipc_v4_ctx_t *ctx);
+uint64_t gpu_ipc_v4_ul_consumer_ts(gpu_ipc_v4_ctx_t *ctx);
+void gpu_ipc_v4_set_dl_consumer_ts(gpu_ipc_v4_ctx_t *ctx, uint64_t ts);
+void gpu_ipc_v4_set_ul_consumer_ts(gpu_ipc_v4_ctx_t *ctx, uint64_t ts);
+
+#endif /* GPU_IPC_V4_H */

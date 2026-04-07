@@ -210,6 +210,10 @@ noise_enabled = False
 noise_std_abs = None
 Speed = 3
 
+DL_USE_IDENTITY_CHANNEL = False
+PURE_DL_BYPASS = True   # DIAG: skip OFDM pipeline for DL, raw copy gNB TX → UE RX
+UL_GAIN_LINEAR = 16.0   # UL signal amplification factor (1.0 = no gain)
+
 def radian_to_degree(radian):
     return radian * (180.0 / PI)
 
@@ -426,6 +430,87 @@ class GPUIpcV6Interface:
             return cp.ndarray(n_elem, dtype=dtype, memptr=cp.cuda.MemoryPointer(mem, 0)), False
         else:
             return None, True
+
+    def circ_read(self, base_ptr, ts, nsamps, nbAnt, cir_size, dtype=cp.int16):
+        """Read from GPU circular buffer with wrap-around handling.
+        Always returns a valid contiguous CuPy array (copy when wrapping)."""
+        off = self.circ_offset(ts, nbAnt, cir_size)
+        total = nsamps * nbAnt
+        sz = GPU_IPC_V6_SAMPLE_SIZE
+        elem_sz = dtype().itemsize
+        if off + total <= cir_size:
+            n_elem = (total * sz) // elem_sz
+            mem = cp.cuda.UnownedMemory(base_ptr + off * sz,
+                                        total * sz, owner=None)
+            return cp.ndarray(n_elem, dtype=dtype,
+                              memptr=cp.cuda.MemoryPointer(mem, 0))
+        tail = cir_size - off
+        head = total - tail
+        tail_n = (tail * sz) // elem_sz
+        head_n = (head * sz) // elem_sz
+        arr_tail = cp.ndarray(tail_n, dtype=dtype,
+                              memptr=cp.cuda.MemoryPointer(
+                                  cp.cuda.UnownedMemory(base_ptr + off * sz,
+                                                        tail * sz, owner=None), 0))
+        arr_head = cp.ndarray(head_n, dtype=dtype,
+                              memptr=cp.cuda.MemoryPointer(
+                                  cp.cuda.UnownedMemory(base_ptr,
+                                                        head * sz, owner=None), 0))
+        return cp.concatenate([arr_tail, arr_head])
+
+    def circ_write(self, base_ptr, ts, nsamps, nbAnt, cir_size, data):
+        """Write data to GPU circular buffer with wrap-around handling."""
+        off = self.circ_offset(ts, nbAnt, cir_size)
+        total = nsamps * nbAnt
+        sz = GPU_IPC_V6_SAMPLE_SIZE
+        elem_sz = data.dtype.itemsize
+        if off + total <= cir_size:
+            n_elem = (total * sz) // elem_sz
+            mem = cp.cuda.UnownedMemory(base_ptr + off * sz,
+                                        total * sz, owner=None)
+            dst = cp.ndarray(n_elem, dtype=data.dtype,
+                             memptr=cp.cuda.MemoryPointer(mem, 0))
+            dst[:] = data
+        else:
+            tail = cir_size - off
+            head = total - tail
+            tail_n = (tail * sz) // elem_sz
+            head_n = (head * sz) // elem_sz
+            dst_t = cp.ndarray(tail_n, dtype=data.dtype,
+                               memptr=cp.cuda.MemoryPointer(
+                                   cp.cuda.UnownedMemory(base_ptr + off * sz,
+                                                         tail * sz, owner=None), 0))
+            dst_t[:] = data[:tail_n]
+            dst_h = cp.ndarray(head_n, dtype=data.dtype,
+                               memptr=cp.cuda.MemoryPointer(
+                                   cp.cuda.UnownedMemory(base_ptr,
+                                                         head * sz, owner=None), 0))
+            dst_h[:] = data[tail_n:]
+        cp.cuda.Stream.null.synchronize()
+
+    def circ_zero(self, base_ptr, ts, nsamps, nbAnt, cir_size):
+        """Zero-fill GPU circular buffer with wrap-around handling."""
+        off = self.circ_offset(ts, nbAnt, cir_size)
+        total = nsamps * nbAnt
+        sz = GPU_IPC_V6_SAMPLE_SIZE
+        if off + total <= cir_size:
+            n16 = (total * sz) // 2
+            mem = cp.cuda.UnownedMemory(base_ptr + off * sz,
+                                        total * sz, owner=None)
+            cp.ndarray(n16, dtype=cp.int16,
+                       memptr=cp.cuda.MemoryPointer(mem, 0))[:] = 0
+        else:
+            tail = cir_size - off
+            head = total - tail
+            cp.ndarray((tail * sz) // 2, dtype=cp.int16,
+                       memptr=cp.cuda.MemoryPointer(
+                           cp.cuda.UnownedMemory(base_ptr + off * sz,
+                                                 tail * sz, owner=None), 0))[:] = 0
+            cp.ndarray((head * sz) // 2, dtype=cp.int16,
+                       memptr=cp.cuda.MemoryPointer(
+                           cp.cuda.UnownedMemory(base_ptr,
+                                                 head * sz, owner=None), 0))[:] = 0
+        cp.cuda.Stream.null.synchronize()
 
     def gpu_circ_copy(self, dst_ptr, src_ptr, ts, nsamps, nbAnt, cir_size):
         off = self.circ_offset(ts, nbAnt, cir_size)
@@ -1128,6 +1213,34 @@ class GPUSlotPipeline:
                 self.warmup_count += 1
             if do_dual:
                 e_gpu_e.record(self.stream)
+
+            _do_diag = (self.slot_counter in (5, 10, 50, 100, 200, 500, 1000)
+                        or (self.slot_counter > 0 and self.slot_counter % 500 == 0))
+            if _do_diag:
+                self.stream.synchronize()
+                in_rms = float(cp.sqrt(cp.mean(self.gpu_iq_in.astype(cp.float64)**2)))
+                in_max = float(cp.max(cp.abs(self.gpu_iq_in.astype(cp.float64))))
+                in_nonzero = int(cp.count_nonzero(self.gpu_iq_in))
+                h_mean_sq = float(cp.mean(cp.abs(self.gpu_H)**2))
+                h_max = float(cp.max(cp.abs(self.gpu_H)))
+                out_rms = float(cp.sqrt(cp.mean(cp.abs(self.gpu_out)**2)))
+                out_max = float(cp.max(cp.abs(self.gpu_out)))
+                noise_pwr = 0.0
+                if noise_on and noise_std_abs is not None:
+                    noise_pwr = 2.0 * float(noise_std_abs)**2
+                    sig_pwr = max(out_rms**2 - noise_pwr, 1e-30)
+                    snr_est = 10.0 * np.log10(sig_pwr / max(noise_pwr, 1e-30))
+                else:
+                    sig_pwr = out_rms**2
+                    snr_est = float('inf')
+                expected_out_pwr = in_rms**2 * h_mean_sq * self.n_tx / max(4.0 * self.fft_size, 1)
+                print(f"[SIGNAL DIAG] slot#{self.slot_counter} "
+                      f"({self.n_tx}tx→{self.n_rx}rx) graph={self.graph_captured} "
+                      f"in_rms={in_rms:.1f} in_max={in_max:.0f} in_nz={in_nonzero}/{self.total_int16_in} "
+                      f"|H|²={h_mean_sq:.6f} |H|_max={h_max:.4f} "
+                      f"out_rms={out_rms:.1f} out_max={out_max:.0f} "
+                      f"noise_pwr={noise_pwr:.1f} sig_pwr={sig_pwr:.1f} "
+                      f"SNR_est={snr_est:.1f}dB")
 
             if do_profile:
                 self.stream.synchronize(); t3 = time.perf_counter()
@@ -1865,10 +1978,14 @@ class Proxy:
         """Initialize per-UE channel producer processes and GPU pipelines (Multi-UE MIMO v2).
         Channel generation runs in independent processes (multiprocessing.Process).
         Pipelines and noise producers remain in the main process."""
+        _use_graph = self.use_cuda_graph
+        if _use_graph:
+            print("[v4] CUDA Graph DISABLED for DL BLER diagnostic — using _gpu_compute_core directly")
+            _use_graph = False
         pipeline_common = dict(
             enable_gpu=self.enable_gpu,
             use_pinned_memory=self.use_pinned_memory,
-            use_cuda_graph=self.use_cuda_graph,
+            use_cuda_graph=_use_graph,
             profile_interval=self.profile_interval,
             profile_window=self.profile_window,
             dual_timer_compare=self.dual_timer_compare)
@@ -1883,6 +2000,9 @@ class Proxy:
         self.channel_producers = []
         self._channel_stop_events = []
         self._last_ch_cache = [None] * self.num_ues
+        self._dl_ch_count = 0
+        self._dl_bypass_wrap_count = 0
+        self._dl_bypass_timeout_count = 0
 
         total_cpx = sum(SYMBOL_SIZES)
         noise_len_dl = total_cpx * self.ue_ant
@@ -2137,16 +2257,14 @@ class Proxy:
                            direction):
         """Apply Sionna MIMO channel to one full slot at ts.
         direction: 'DL' uses H, 'UL' uses H^T.
-        Falls back to bypass_copy on circular buffer wrap."""
-        arr_in, wraps = self.ipc.get_gpu_array_at(
-            src_ptr, ts, nsamps, src_nbAnt, src_cir_size, cp.int16)
-        if wraps:
-            self.ipc.bypass_copy(dst_ptr, src_ptr, ts, nsamps,
-                                 src_nbAnt, src_cir_size, dst_nbAnt, dst_cir_size)
-            return
+        Handles circular buffer wrap via circ_read/circ_write."""
+        arr_in = self.ipc.circ_read(src_ptr, ts, nsamps, src_nbAnt, src_cir_size, cp.int16)
 
-        arr_out, _ = self.ipc.get_gpu_array_at(
+        arr_out, wraps_out = self.ipc.get_gpu_array_at(
             dst_ptr, ts, nsamps, dst_nbAnt, dst_cir_size, cp.int16)
+        use_tmp_out = wraps_out
+        if use_tmp_out:
+            arr_out = cp.zeros(nsamps * dst_nbAnt * 2, dtype=cp.int16)
 
         try:
             channels, n_held = self.channel_buffer.get_batch_view(N_SYM)
@@ -2171,6 +2289,8 @@ class Proxy:
         pipeline.process_slot_ipc(
             arr_in, channels, pathLossLinear, snr_dB, noise_enabled, arr_out, noise_std_abs
         )
+        if use_tmp_out:
+            self.ipc.circ_write(dst_ptr, ts, nsamps, dst_nbAnt, dst_cir_size, arr_out)
         self.channel_buffer.release_batch(n_held)
 
     def _ipc_process_range(self, src_ptr, dst_ptr, set_ts_fn,
@@ -2215,20 +2335,15 @@ class Proxy:
                                    src_nbAnt, src_cir_size, dst_nbAnt, dst_cir_size,
                                    src_ipc, dst_ipc, direction, ue_idx):
         """Apply channel for a specific UE. Uses per-UE channel buffer and pipeline.
-        Falls back to bypass on timeout (ChannelProducerProcess may be slow/dead)."""
-        arr_in, wraps = src_ipc.get_gpu_array_at(
-            src_ptr, ts, nsamps, src_nbAnt, src_cir_size, cp.int16)
-        if wraps:
-            src_ipc.bypass_copy(dst_ptr, src_ptr, ts, nsamps,
-                                src_nbAnt, src_cir_size, dst_nbAnt, dst_cir_size)
-            return
+        Falls back to bypass on timeout (ChannelProducerProcess may be slow/dead).
+        Handles circular buffer wrap via circ_read/circ_write."""
+        arr_in = src_ipc.circ_read(src_ptr, ts, nsamps, src_nbAnt, src_cir_size, cp.int16)
 
         arr_out, wraps_out = dst_ipc.get_gpu_array_at(
             dst_ptr, ts, nsamps, dst_nbAnt, dst_cir_size, cp.int16)
-        if wraps_out:
-            src_ipc.bypass_copy(dst_ptr, src_ptr, ts, nsamps,
-                                src_nbAnt, src_cir_size, dst_nbAnt, dst_cir_size)
-            return
+        use_tmp_out = wraps_out
+        if use_tmp_out:
+            arr_out = cp.zeros(nsamps * dst_nbAnt * 2, dtype=cp.int16)
 
         n_held = 0
         try:
@@ -2241,6 +2356,8 @@ class Proxy:
             else:
                 src_ipc.bypass_copy(dst_ptr, src_ptr, ts, nsamps,
                                     src_nbAnt, src_cir_size, dst_nbAnt, dst_cir_size)
+                if direction == "DL" and ue_idx == 0:
+                    self._dl_bypass_timeout_count += 1
                 return
 
         if channels.shape[0] < N_SYM:
@@ -2252,13 +2369,44 @@ class Proxy:
                 pad[:, j, j, :] = 1.0
             channels = lib.concatenate([channels, pad])
 
+        if DL_USE_IDENTITY_CHANNEL and direction == "DL":
+            n_r, n_t = channels.shape[1], channels.shape[2]
+            channels = cp.zeros_like(channels)
+            for j in range(min(n_r, n_t)):
+                channels[:, j, j, :] = 1.0
+
         if direction == "UL":
             channels = channels.transpose(0, 2, 1, 3)
 
         pipeline = self.pipelines_dl[ue_idx] if direction == "DL" else self.pipelines_ul[ue_idx]
+
+        if DL_USE_IDENTITY_CHANNEL and direction == "DL" and ue_idx == 0:
+            if not hasattr(self, '_identity_diag_cnt'):
+                self._identity_diag_cnt = 0
+            self._identity_diag_cnt += 1
+            if self._identity_diag_cnt in (1, 5, 50, 500, 2000):
+                in_snap = arr_in[:min(len(arr_in), 2048)].copy()
+
         pipeline.process_slot_ipc(
             arr_in, channels, pathLossLinear, snr_dB, noise_enabled, arr_out, noise_std_abs
         )
+
+        if DL_USE_IDENTITY_CHANNEL and direction == "DL" and ue_idx == 0:
+            if self._identity_diag_cnt in (1, 5, 50, 500, 2000):
+                out_snap = arr_out[:min(len(arr_out), 2048)].copy()
+                cp.cuda.Stream.null.synchronize()
+                diff = (in_snap.astype(cp.float64) - out_snap.astype(cp.float64))
+                mae = float(cp.mean(cp.abs(diff)))
+                max_err = float(cp.max(cp.abs(diff)))
+                in_nz = int(cp.count_nonzero(in_snap))
+                out_nz = int(cp.count_nonzero(out_snap))
+                print(f"[IDENTITY CH DIAG] #{self._identity_diag_cnt} "
+                      f"ts={ts} MAE={mae:.3f} MAX_ERR={max_err:.0f} "
+                      f"in_nz={in_nz}/2048 out_nz={out_nz}/2048 "
+                      f"in[0:8]={in_snap[:8].tolist()} out[0:8]={out_snap[:8].tolist()}")
+
+        if use_tmp_out:
+            dst_ipc.circ_write(dst_ptr, ts, nsamps, dst_nbAnt, dst_cir_size, arr_out)
         if n_held > 0:
             self.channel_buffers[ue_idx].release_batch(n_held)
 
@@ -2269,30 +2417,71 @@ class Proxy:
         apply_ch = self.ch_en and self.custom_channel
         slots = 0
 
+        if apply_ch:
+            self._dl_ch_count += 1
+
         for k in range(self.num_ues):
             pos = int(start_ts)
             remaining = int(delta)
 
             while remaining >= slot_samples and apply_ch:
-                self._ipc_apply_channel_for_ue(
-                    self.ipc_gnb.gpu_dl_tx_ptr, self.ipc_ues[k].gpu_dl_rx_ptr,
-                    pos, slot_samples,
-                    self.ipc_gnb.dl_tx_nbAnt, self.ipc_gnb.dl_tx_cir_size,
-                    self.ipc_ues[k].dl_rx_nbAnt, self.ipc_ues[k].dl_rx_cir_size,
-                    self.ipc_gnb, self.ipc_ues[k], "DL", k)
+                if PURE_DL_BYPASS:
+                    self.ipc_gnb.bypass_copy(
+                        self.ipc_ues[k].gpu_dl_rx_ptr,
+                        self.ipc_gnb.gpu_dl_tx_ptr,
+                        pos, slot_samples,
+                        self.ipc_gnb.dl_tx_nbAnt, self.ipc_gnb.dl_tx_cir_size,
+                        self.ipc_ues[k].dl_rx_nbAnt, self.ipc_ues[k].dl_rx_cir_size)
+                else:
+                    self._ipc_apply_channel_for_ue(
+                        self.ipc_gnb.gpu_dl_tx_ptr, self.ipc_ues[k].gpu_dl_rx_ptr,
+                        pos, slot_samples,
+                        self.ipc_gnb.dl_tx_nbAnt, self.ipc_gnb.dl_tx_cir_size,
+                        self.ipc_ues[k].dl_rx_nbAnt, self.ipc_ues[k].dl_rx_cir_size,
+                        self.ipc_gnb, self.ipc_ues[k], "DL", k)
                 pos += slot_samples
                 remaining -= slot_samples
                 if k == 0:
                     slots += 1
 
-            if remaining > 0:
+            if remaining > 0 and not apply_ch:
                 self.ipc_gnb.bypass_copy(
                     self.ipc_ues[k].gpu_dl_rx_ptr, self.ipc_gnb.gpu_dl_tx_ptr,
                     pos, remaining,
                     self.ipc_gnb.dl_tx_nbAnt, self.ipc_gnb.dl_tx_cir_size,
                     self.ipc_ues[k].dl_rx_nbAnt, self.ipc_ues[k].dl_rx_cir_size)
 
-            self.ipc_ues[k].set_last_dl_rx_ts(int(start_ts + delta - 1))
+            actual_end = int(start_ts + delta - 1) if not apply_ch else int(pos - 1)
+            if actual_end > 0:
+                self.ipc_ues[k].set_last_dl_rx_ts(actual_end)
+
+        if not hasattr(self, '_dl_bcast_diag_count'):
+            self._dl_bcast_diag_count = 0
+        self._dl_bcast_diag_count += 1
+        if self._dl_bcast_diag_count in (1, 2, 5, 10, 50, 100) or self._dl_bcast_diag_count % 500 == 0:
+            try:
+                gnb_arr = self.ipc_gnb.circ_read(
+                    self.ipc_gnb.gpu_dl_tx_ptr, int(start_ts), min(int(delta), slot_samples),
+                    self.ipc_gnb.dl_tx_nbAnt, self.ipc_gnb.dl_tx_cir_size)
+                gnb_f = gnb_arr.astype(cp.float64)
+                gnb_rms = float(cp.sqrt(cp.mean(gnb_f**2)))
+                gnb_max = float(cp.max(cp.abs(gnb_f)))
+                gnb_nz = int(cp.count_nonzero(gnb_arr))
+                ue0_arr = self.ipc_ues[0].circ_read(
+                    self.ipc_ues[0].gpu_dl_rx_ptr, int(start_ts), min(int(delta), slot_samples),
+                    self.ipc_ues[0].dl_rx_nbAnt, self.ipc_ues[0].dl_rx_cir_size)
+                ue0_f = ue0_arr.astype(cp.float64)
+                ue0_rms = float(cp.sqrt(cp.mean(ue0_f**2)))
+                ue0_max = float(cp.max(cp.abs(ue0_f)))
+                ue0_nz = int(cp.count_nonzero(ue0_arr))
+                cp.cuda.Stream.null.synchronize()
+                print(f"[DL BCAST DIAG] call#{self._dl_bcast_diag_count} "
+                      f"ts={start_ts} delta={delta} slots={slots} apply_ch={apply_ch} "
+                      f"bypass(wrap={self._dl_bypass_wrap_count},timeout={self._dl_bypass_timeout_count}) "
+                      f"gNB_TX: rms={gnb_rms:.1f} max={gnb_max:.0f} nz={gnb_nz} "
+                      f"UE0_RX: rms={ue0_rms:.1f} max={ue0_max:.0f} nz={ue0_nz}")
+            except Exception as e:
+                print(f"[DL BCAST DIAG] call#{self._dl_bcast_diag_count} ERROR: {e}")
 
         ms = 1000 * (time.perf_counter() - t0)
         return ms, max(slots, 1)
@@ -2318,10 +2507,10 @@ class Proxy:
             time.sleep(0.001)
 
     def _ipc_ul_combine(self, start_ts, delta, active_ues=None,
-                        ue_ts_offset=0):
+                        ue_ts_offsets=None):
         """UL Combine: UE[k] ul_tx → per-UE channel → superposition → gNB ul_rx.
-        start_ts is on the gNB-grid (slot-aligned).  ue_ts_offset is added
-        when reading from UE SHM to match the UE's actual write position."""
+        start_ts is on the gNB-grid (slot-aligned).  ue_ts_offsets is a dict
+        {ue_idx: offset} — per-UE offset to read from each UE's timestamp space."""
         t0 = time.perf_counter()
         slot_samples = self.pipelines_ul[0].total_cpx
         apply_ch = self.ch_en and self.custom_channel
@@ -2333,20 +2522,21 @@ class Proxy:
             for k in ues:
                 pos_gnb = int(start_ts)
                 remaining = int(delta)
+                _k_offset = (ue_ts_offsets.get(k, 0) if ue_ts_offsets else 0)
                 while remaining > 0:
                     n = min(remaining, slot_samples)
-                    pos_ue = pos_gnb + ue_ts_offset
-                    arr_ue, wraps_ue = self.ipc_ues[k].get_gpu_array_at(
+                    pos_ue = pos_gnb + _k_offset
+                    arr_ue = self.ipc_ues[k].circ_read(
                         self.ipc_ues[k].gpu_ul_tx_ptr, pos_ue, n,
                         self.ipc_ues[k].ul_tx_nbAnt,
                         self.ipc_ues[k].ul_tx_cir_size, cp.int16)
-                    arr_gnb, wraps_gnb = self.ipc_gnb.get_gpu_array_at(
+                    if UL_GAIN_LINEAR != 1.0:
+                        arr_f = arr_ue.astype(cp.float32) * UL_GAIN_LINEAR
+                        arr_ue = cp.clip(arr_f, -32768, 32767).astype(cp.int16)
+                    self.ipc_gnb.circ_write(
                         self.ipc_gnb.gpu_ul_rx_ptr, pos_gnb, n,
                         self.ipc_gnb.ul_rx_nbAnt,
-                        self.ipc_gnb.ul_rx_cir_size, cp.int16)
-                    if not wraps_ue and not wraps_gnb:
-                        arr_gnb[:] = arr_ue[:]
-                        cp.cuda.Stream.null.synchronize()
+                        self.ipc_gnb.ul_rx_cir_size, arr_ue)
                     _slot_end_ts = int(pos_gnb + n - 1)
                     if _slot_end_ts > self._ul_rx_ts_high:
                         self._ul_rx_ts_high = _slot_end_ts
@@ -2363,7 +2553,7 @@ class Proxy:
             while remaining >= slot_samples:
                 self._ipc_ul_superposition_slot(pos, slot_samples,
                                                 active_ues=active_ues,
-                                                ue_ts_offset=ue_ts_offset)
+                                                ue_ts_offsets=ue_ts_offsets)
                 _slot_end_ts = int(pos + slot_samples - 1)
                 if _slot_end_ts > self._ul_rx_ts_high:
                     self._ul_rx_ts_high = _slot_end_ts
@@ -2372,47 +2562,26 @@ class Proxy:
                 remaining -= slot_samples
                 slots += 1
 
-            if remaining > 0:
-                pos_ue_tail = pos + ue_ts_offset
-                for k in ues:
-                    arr_ue, wraps_ue = self.ipc_ues[k].get_gpu_array_at(
-                        self.ipc_ues[k].gpu_ul_tx_ptr, pos_ue_tail,
-                        remaining,
-                        self.ipc_ues[k].ul_tx_nbAnt,
-                        self.ipc_ues[k].ul_tx_cir_size, cp.int16)
-                    arr_gnb, wraps_gnb = self.ipc_gnb.get_gpu_array_at(
-                        self.ipc_gnb.gpu_ul_rx_ptr, pos, remaining,
-                        self.ipc_gnb.ul_rx_nbAnt,
-                        self.ipc_gnb.ul_rx_cir_size, cp.int16)
-                    if not wraps_ue and not wraps_gnb:
-                        arr_gnb[:] = arr_ue[:]
-                        cp.cuda.Stream.null.synchronize()
-                _partial_end_ts = int(pos + remaining - 1)
-                if _partial_end_ts > self._ul_rx_ts_high:
-                    self._ul_rx_ts_high = _partial_end_ts
-                    self.ipc_gnb.set_last_ul_rx_ts(_partial_end_ts)
-
         ms = 1000 * (time.perf_counter() - t0)
         return ms, max(slots, 1)
 
     def _ipc_ul_superposition_slot(self, ts, nsamps, active_ues=None,
-                                    ue_ts_offset=0):
+                                    ue_ts_offsets=None):
         """Apply per-UE UL channels and sum into gNB ul_rx for one slot.
         ts: gNB-grid timestamp for writing to gNB ul_rx SHM.
-        ue_ts_offset: added to ts when reading from UE ul_tx SHM so that
-        the proxy reads from the position where the UE actually wrote."""
-        UL_BYPASS_CHANNEL = True
+        ue_ts_offsets: dict {ue_idx: offset} — per-UE offset added to ts
+        when reading from UE ul_tx SHM (each UE has its own timestamp space)."""
+        UL_BYPASS_CHANNEL = PURE_DL_BYPASS  # match DL bypass mode
         self._ul_accum[:] = 0
         ues = active_ues if active_ues is not None else range(self.num_ues)
         _ul_diag_slot = getattr(self, '_ul_diag_count', 0)
-        ts_ue = ts + ue_ts_offset
 
         for k in ues:
-            arr_in, wraps = self.ipc_ues[k].get_gpu_array_at(
+            _k_offset = (ue_ts_offsets.get(k, 0) if ue_ts_offsets else 0)
+            ts_ue = ts + _k_offset
+            arr_in = self.ipc_ues[k].circ_read(
                 self.ipc_ues[k].gpu_ul_tx_ptr, ts_ue, nsamps,
                 self.ipc_ues[k].ul_tx_nbAnt, self.ipc_ues[k].ul_tx_cir_size, cp.int16)
-            if wraps:
-                continue
 
             _check_diag = (_ul_diag_slot < 50 or _ul_diag_slot % 200 == 0)
             _check_first = not getattr(self, '_first_ue_energy_logged', False)
@@ -2446,7 +2615,11 @@ class Proxy:
                     if cached is not None:
                         channels = cached
                     else:
-                        continue
+                        channels = cp.zeros(
+                            (N_SYM, self.ue_ant, self.gnb_ant, FFT_SIZE),
+                            dtype=cp.complex128)
+                        for j in range(min(self.ue_ant, self.gnb_ant)):
+                            channels[:, j, j, :] = 1.0
                 if channels.shape[0] < N_SYM:
                     lib = cp if GPU_AVAILABLE else np
                     n_r, n_t = channels.shape[1], channels.shape[2]
@@ -2469,6 +2642,8 @@ class Proxy:
         n_rx = self.gnb_ant
         total = self.pipelines_ul[0].total_cpx
         n_elem = total * n_rx
+        if UL_GAIN_LINEAR != 1.0:
+            self._ul_accum *= UL_GAIN_LINEAR
         accum_f64 = self._ul_accum.view(cp.float64)
         if not hasattr(self, '_ul_fused_out') or self._ul_fused_out.shape[0] != n_elem * 2:
             self._ul_fused_out = cp.zeros(n_elem * 2, dtype=cp.int16)
@@ -2494,12 +2669,10 @@ class Proxy:
                           f"ts_ue={ts_ue} "
                           f"energy={_out_energy:.0f} max_abs={_out_max}")
 
-        arr_out, wraps_out = self.ipc_gnb.get_gpu_array_at(
+        self.ipc_gnb.circ_write(
             self.ipc_gnb.gpu_ul_rx_ptr, ts, nsamps,
-            self.ipc_gnb.ul_rx_nbAnt, self.ipc_gnb.ul_rx_cir_size, cp.int16)
-        if not wraps_out:
-            arr_out[:] = self._ul_fused_out
-            cp.cuda.Stream.null.synchronize()
+            self.ipc_gnb.ul_rx_nbAnt, self.ipc_gnb.ul_rx_cir_size,
+            self._ul_fused_out)
 
         self._ul_diag_count = _ul_diag_slot + 1
 
@@ -2628,6 +2801,7 @@ class Proxy:
 
         self._warmup_pipeline()
         print(f"[v4] Entering main loop ({N} UE(s), gnb_ant={self.gnb_ant}, ue_ant={self.ue_ant})...")
+        print(f"[v4] PURE_DL_BYPASS={PURE_DL_BYPASS} DL_USE_IDENTITY_CHANNEL={DL_USE_IDENTITY_CHANNEL} UL_GAIN={UL_GAIN_LINEAR}")
         dl_count = 0
         ul_count = 0
         t_start = time.time()
@@ -2641,8 +2815,8 @@ class Proxy:
 
         self._ul_rx_ts_high = 0
         self._ul_aligned_to_ue = False
-        self._ul_ue_offset = 0
-        self._ul_sync_signalled = False
+        self._ul_ue_offsets = {}
+        self._prev_ue_heads = {}
         self._ul_log_count = 0
         self._ul_diag_count = 0
         self._ka_log_count = 0
@@ -2672,22 +2846,59 @@ class Proxy:
                     gnb_dl_head = cur_dl_ts + dl_nsamps
                     if gnb_dl_head > proxy_dl_head:
                         if proxy_dl_head == 0:
-                            proxy_dl_head = gnb_dl_head
+                            if apply_ch:
+                                proxy_dl_head = (gnb_dl_head // total_cpx) * total_cpx
+                            else:
+                                proxy_dl_head = gnb_dl_head
+                            try:
+                                _chk_ts = int(cur_dl_ts)
+                                _raw_buf_sz = self.ipc_gnb.dl_tx_cir_size * GPU_IPC_V7_SAMPLE_SIZE
+                                _raw_mem = cp.cuda.UnownedMemory(
+                                    self.ipc_gnb.gpu_dl_tx_ptr, _raw_buf_sz, owner=None)
+                                _raw_arr = cp.ndarray(
+                                    _raw_buf_sz // 2, dtype=cp.int16,
+                                    memptr=cp.cuda.MemoryPointer(_raw_mem, 0))
+                                _raw_nz = int(cp.count_nonzero(_raw_arr))
+                                _raw_mx = int(cp.max(cp.abs(_raw_arr)))
+                                _test_pat = cp.array([42, -42, 100, -100], dtype=cp.int16)
+                                _raw_arr[:4] = _test_pat
+                                cp.cuda.Stream.null.synchronize()
+                                _rb = _raw_arr[:4].copy()
+                                _pat_ok = bool(cp.all(_rb == _test_pat))
+                                _raw_arr[:4] = 0
+                                cp.cuda.Stream.null.synchronize()
+                                import time as _time_mod
+                                _time_mod.sleep(0.5)
+                                _raw_arr2 = cp.ndarray(
+                                    _raw_buf_sz // 2, dtype=cp.int16,
+                                    memptr=cp.cuda.MemoryPointer(_raw_mem, 0))
+                                _post_nz = int(cp.count_nonzero(_raw_arr2))
+                                _post_mx = int(cp.max(cp.abs(_raw_arr2)))
+                                print(f"[DL IPC TEST] ptr=0x{self.ipc_gnb.gpu_dl_tx_ptr:x} "
+                                      f"last_ts={cur_dl_ts} nsamps={dl_nsamps} "
+                                      f"BEFORE: nz={_raw_nz}/{len(_raw_arr)} max={_raw_mx} | "
+                                      f"WRITE+READ_BACK: pat_ok={_pat_ok} | "
+                                      f"AFTER_500ms: nz={_post_nz}/{len(_raw_arr2)} max={_post_mx}")
+                            except Exception as _e:
+                                print(f"[DL IPC TEST] ERROR: {_e}")
                         delta = int(gnb_dl_head - proxy_dl_head)
                         max_dl_delta = total_cpx * 4
                         if delta > max_dl_delta:
                             delta = max_dl_delta
-                        dl_ms, n_slots = self._ipc_dl_broadcast(proxy_dl_head, delta)
-                        proxy_dl_head += delta
-                        dl_count += n_slots
-                        processed = True
+                        if apply_ch:
+                            delta = (delta // total_cpx) * total_cpx
+                        if delta > 0:
+                            dl_ms, n_slots = self._ipc_dl_broadcast(proxy_dl_head, delta)
+                            proxy_dl_head += delta
+                            dl_count += n_slots
+                            processed = True
 
-                        self._e2e_proxy_dl_accum_ms += dl_ms
-                        self._e2e_dl_in_frame += n_slots
-                        for _k in range(N):
-                            self._e2e_dl_per_ue[_k] += n_slots
-                        self._e2e_slot_count += n_slots
-                        self._check_e2e_frame("IPC_G1C+OAI")
+                            self._e2e_proxy_dl_accum_ms += dl_ms
+                            self._e2e_dl_in_frame += n_slots
+                            for _k in range(N):
+                                self._e2e_dl_per_ue[_k] += n_slots
+                            self._e2e_slot_count += n_slots
+                            self._check_e2e_frame("IPC_G1C+OAI")
 
                 # --- UL Processing (active_set based stall detection) ---
                 ue_heads = {}
@@ -2715,30 +2926,94 @@ class Proxy:
                         min_active_head = min(ue_heads[k] for k in active_set)
 
                         if not self._ul_aligned_to_ue:
-                            oldest_ue_ts = min(
-                                self.ipc_ues[k].get_last_ul_tx_ts()
-                                for k in active_set
-                                if self.ipc_ues[k].get_last_ul_tx_ts() > 0)
-                            ue_write_ts = oldest_ue_ts - total_cpx + 1
-                            self._ul_ue_offset = int(ue_write_ts % total_cpx)
-                            slot_start = (ue_write_ts // total_cpx) * total_cpx
-                            if proxy_ul_head_combined < slot_start:
-                                print(f"[UL ALIGN] oldest_ue_ts={oldest_ue_ts} "
-                                      f"ue_write_ts={ue_write_ts} "
-                                      f"slot_start={slot_start} "
-                                      f"ue_offset={self._ul_ue_offset} "
-                                      f"proxy_head={proxy_ul_head_combined} "
-                                      f"gap={slot_start - proxy_ul_head_combined} "
-                                      f"({(slot_start - proxy_ul_head_combined)/total_cpx:.1f} slots) "
-                                      f"— dual-ts: gNB write grid + UE read offset")
-                                proxy_ul_head_combined = slot_start
                             self._ul_aligned_to_ue = True
+                            _spf = total_cpx * 20
+                            _old_head = proxy_ul_head_combined
 
-                        if min_active_head > proxy_ul_head_combined:
+                            proxy_ul_head_combined = \
+                                ((proxy_ul_head_combined + total_cpx - 1)
+                                 // total_cpx) * total_cpx
+
+                            for k in active_set:
+                                _ue_last_ts = self.ipc_ues[k].get_last_ul_tx_ts()
+                                if _ue_last_ts > 0:
+                                    self._ul_ue_offsets[k] = int(
+                                        _ue_last_ts - proxy_ul_head_combined)
+                                else:
+                                    self._ul_ue_offsets[k] = 0
+                                self._prev_ue_heads[k] = ue_heads.get(k, 0)
+
+                            self.ipc_gnb.set_last_ul_rx_ts(
+                                int(proxy_ul_head_combined) - 1)
+                            self._ul_rx_ts_high = max(
+                                self._ul_rx_ts_high,
+                                int(proxy_ul_head_combined) - 1)
+                            self.ipc_gnb.set_ul_sync_ts(
+                                int(proxy_ul_head_combined))
+
+                            print(f"[UL ACTIVATE] UE detected — "
+                                  f"proxy_ul_head={proxy_ul_head_combined} "
+                                  f"(aligned from {_old_head}, "
+                                  f"frame={proxy_ul_head_combined//_spf}, "
+                                  f"slot={proxy_ul_head_combined//total_cpx%20}) "
+                                  f"proxy_dl_head={proxy_dl_head} "
+                                  f"(frame={int(proxy_dl_head)//_spf}) "
+                                  f"ue_offsets={self._ul_ue_offsets} "
+                                  f"ue_heads={dict(ue_heads)} "
+                                  f"last_ul_rx_high={self._ul_rx_ts_high} "
+                                  f"SET_UL_SYNC_TS={proxy_ul_head_combined}")
+
+                        if self._ul_aligned_to_ue:
+                            for k in active_set:
+                                if k not in self._ul_ue_offsets:
+                                    if k in ue_heads and ue_heads[k] > 0:
+                                        _ue_last_ts = self.ipc_ues[k].get_last_ul_tx_ts()
+                                        if _ue_last_ts > 0:
+                                            self._ul_ue_offsets[k] = int(
+                                                _ue_last_ts - proxy_ul_head_combined)
+                                        else:
+                                            self._ul_ue_offsets[k] = 0
+                                        self._prev_ue_heads[k] = ue_heads[k]
+                                        print(f"[UL OFFSET] UE[{k}] "
+                                              f"offset={self._ul_ue_offsets[k]} "
+                                              f"(ue_last_ts={_ue_last_ts} "
+                                              f"ue_head={ue_heads[k]} "
+                                              f"proxy_head={proxy_ul_head_combined})")
+
                             if proxy_ul_head_combined == 0:
-                                proxy_ul_head_combined = (int(min_active_head) // total_cpx) * total_cpx
-                            delta = int(min_active_head - proxy_ul_head_combined)
-                            delta = ((delta - self._ul_ue_offset) // total_cpx) * total_cpx
+                                _cts = self.ipc_gnb.get_ul_consumer_ts()
+                                if _cts > 0:
+                                    proxy_ul_head_combined = \
+                                        ((_cts + total_cpx) // total_cpx) \
+                                        * total_cpx
+                                else:
+                                    proxy_ul_head_combined = 0
+                                for k in active_set:
+                                    _ue_last_ts = self.ipc_ues[k].get_last_ul_tx_ts()
+                                    if _ue_last_ts > 0 and proxy_ul_head_combined > 0:
+                                        self._ul_ue_offsets[k] = int(
+                                            _ue_last_ts - proxy_ul_head_combined)
+                                    else:
+                                        self._ul_ue_offsets[k] = 0
+                                if proxy_ul_head_combined > 0:
+                                    self.ipc_gnb.set_last_ul_rx_ts(
+                                        int(proxy_ul_head_combined) - 1)
+                                    self._ul_rx_ts_high = max(
+                                        self._ul_rx_ts_high,
+                                        int(proxy_ul_head_combined) - 1)
+                                    self.ipc_gnb.set_ul_sync_ts(
+                                        int(proxy_ul_head_combined))
+                                print(f"[UL HEAD INIT] cts={_cts} "
+                                      f"proxy_ul_head={proxy_ul_head_combined} "
+                                      f"ue_offsets={self._ul_ue_offsets}")
+                            min_avail = float('inf')
+                            for k in active_set:
+                                _ko = self._ul_ue_offsets.get(k, 0)
+                                avail_k = ue_heads[k] - \
+                                    (proxy_ul_head_combined + _ko)
+                                if avail_k < min_avail:
+                                    min_avail = avail_k
+                            delta = (int(min_avail) // total_cpx) * total_cpx
                             if delta > total_cpx * 4:
                                 delta = total_cpx * 4
 
@@ -2746,16 +3021,16 @@ class Proxy:
                                 _ul_log_cnt = getattr(self, '_ul_log_count', 0)
                                 if _ul_log_cnt < 50 or _ul_log_cnt % 500 == 0:
                                     cts = self.ipc_gnb.get_ul_consumer_ts()
+                                    _spf = total_cpx * 20
                                     print(f"[UL FLOW] #{_ul_log_cnt} "
                                           f"proxy_head={proxy_ul_head_combined} "
-                                          f"({proxy_ul_head_combined/total_cpx:.1f} slots) "
-                                          f"delta={delta} ({delta/total_cpx:.1f} slots) "
-                                          f"ue_offset={self._ul_ue_offset} "
-                                          f"ue_heads={dict(ue_heads)} "
+                                          f"(frame={proxy_ul_head_combined//_spf}, "
+                                          f"slot={proxy_ul_head_combined//total_cpx%20}) "
+                                          f"delta={delta} "
+                                          f"({delta/total_cpx:.1f} slots) "
+                                          f"ue_offsets={self._ul_ue_offsets} "
                                           f"gnb_consumer={cts} "
-                                          f"({cts/total_cpx:.1f} slots) "
                                           f"last_ul_rx={self._ul_rx_ts_high} "
-                                          f"({self._ul_rx_ts_high/total_cpx:.1f} slots) "
                                           f"apply_ch={apply_ch}")
                                 self._ul_log_count = _ul_log_cnt + 1
 
@@ -2764,14 +3039,16 @@ class Proxy:
                                 ul_ms, n_slots = self._ipc_ul_combine(
                                     proxy_ul_head_combined, delta,
                                     active_ues=active_set,
-                                    ue_ts_offset=self._ul_ue_offset)
+                                    ue_ts_offsets=self._ul_ue_offsets)
                                 proxy_ul_head_combined += delta
 
-                                if not getattr(self, '_ul_sync_signalled', False):
-                                    self._ul_sync_signalled = True
-                                    print(f"[UL SYNC] DISABLED — gNB keeps natural "
-                                          f"nextRxTstamp (no frame/slot jump). "
-                                          f"proxy_head={proxy_ul_head_combined}")
+                                for k in active_set:
+                                    if k in self._prev_ue_heads:
+                                        _old_h = self._prev_ue_heads[k]
+                                        _new_h = self.ipc_ues[k].get_last_ul_tx_ts() + \
+                                                 self.ipc_ues[k].get_last_ul_tx_nsamps()
+                                        self._prev_ue_heads[k] = _new_h
+
                                 ul_count += n_slots
                                 ul_processed = True
                                 processed = True
@@ -2814,21 +3091,20 @@ class Proxy:
                                 ul_processed = True
                                 processed = True
 
-                # --- UL keepalive: zero-fill + advance last_ul_rx_ts when no UE UL ---
-                # Only zero-fill when no UE data is pending superposition.
-                # When UE data exists but < 1 slot, wait for UE to complete
-                # rather than zero-filling over positions where UE data will land.
-                _KA_MARGIN_SLOTS = 4
-                _pending_ue_data = False
-                if apply_ch and ue_heads and not ul_processed:
-                    _min_ue = min(ue_heads[k] for k in ue_heads)
-                    if _min_ue > proxy_ul_head_combined:
-                        _pending_ue_data = True
+                # --- UL keepalive: advance last_ul_rx_ts to prevent gNB blocking ---
+                # When UEs are active: advance last_ul_rx_ts but skip zero-fill
+                # to preserve positions for UL processing with real UE data.
+                # When UEs are NOT active: zero-fill and advance as before.
+                _KA_MARGIN_SLOTS = 12
+                _ue_active = apply_ch and self._ul_aligned_to_ue
 
-                if not ul_processed and proxy_dl_head > 0 and not _pending_ue_data:
+                if proxy_dl_head > 0:
                     cts = self.ipc_gnb.get_ul_consumer_ts()
-                    cts_limit = int(cts) + _KA_MARGIN_SLOTS * total_cpx
-                    keepalive_target = min(int(proxy_dl_head), cts_limit)
+                    if _ue_active:
+                        keepalive_target = int(proxy_ul_head_combined)
+                    else:
+                        cts_limit = int(cts) + _KA_MARGIN_SLOTS * total_cpx
+                        keepalive_target = min(int(proxy_dl_head), cts_limit)
                     if apply_ch:
                         keepalive_start = proxy_ul_head_combined
                     else:
@@ -2842,33 +3118,33 @@ class Proxy:
                               f"start={keepalive_start} ({keepalive_start/total_cpx:.1f} slots) "
                               f"target={keepalive_target} ({keepalive_target/total_cpx:.1f} slots) "
                               f"cts={cts} ({cts/total_cpx:.1f} slots) "
-                              f"cts_limit={cts_limit} ({cts_limit/total_cpx:.1f} slots) "
-                              f"ue_heads_empty={not ue_heads}")
+                              f"ue_active={_ue_active}")
                     self._ka_log_count = _ka_log + 1
 
                     _ka_filled_end = int(keepalive_start)
                     if keepalive_target > keepalive_start:
                         ka_delta = int(keepalive_target - keepalive_start)
-                        ka_delta = min(ka_delta, total_cpx * 8)
-                        arr_ka, wraps_ka = self.ipc_gnb.get_gpu_array_at(
-                            self.ipc_gnb.gpu_ul_rx_ptr, int(keepalive_start), ka_delta,
-                            self.ipc_gnb.ul_rx_nbAnt, self.ipc_gnb.ul_rx_cir_size, cp.int16)
-                        if not wraps_ka:
-                            arr_ka[:] = 0
-                            cp.cuda.Stream.null.synchronize()
-                            _ka_filled_end = int(keepalive_start + ka_delta)
+                        if _ue_active:
+                            ka_delta = min(ka_delta, total_cpx * _KA_MARGIN_SLOTS)
+                        else:
+                            ka_delta = min(ka_delta, total_cpx * 8)
+                            self.ipc_gnb.circ_zero(
+                                self.ipc_gnb.gpu_ul_rx_ptr, int(keepalive_start), ka_delta,
+                                self.ipc_gnb.ul_rx_nbAnt, self.ipc_gnb.ul_rx_cir_size)
+                        _ka_filled_end = int(keepalive_start + ka_delta)
                     if _ka_filled_end > 0:
                         _ka_ts = _ka_filled_end - 1
                         if _ka_ts > self._ul_rx_ts_high:
                             self._ul_rx_ts_high = _ka_ts
                             self.ipc_gnb.set_last_ul_rx_ts(_ka_ts)
-                    if apply_ch:
-                        proxy_ul_head_combined = max(
-                            proxy_ul_head_combined, _ka_filled_end)
-                    else:
-                        for k in range(N):
-                            proxy_ul_heads[k] = max(
-                                proxy_ul_heads[k], _ka_filled_end)
+                    if not _ue_active:
+                        if apply_ch:
+                            proxy_ul_head_combined = max(
+                                proxy_ul_head_combined, _ka_filled_end)
+                        else:
+                            for k in range(N):
+                                proxy_ul_heads[k] = max(
+                                    proxy_ul_heads[k], _ka_filled_end)
 
                 if not processed:
                     time.sleep(0.0001)
@@ -2974,6 +3250,8 @@ def main():
     ap.add_argument("--no-cuda-graph", dest='use_cuda_graph', action="store_false")
     ap.set_defaults(use_cuda_graph=True)
 
+    ap.add_argument("--identity-channel", action="store_true", default=False,
+                    help="Force DL identity channel H=I (diagnostic: bypass channel distortion)")
     ap.add_argument("--path-loss-dB", type=float, default=0.0)
     ap.add_argument("--snr-dB", type=float, default=None,
                     help="Relative SNR in dB (noise scales with signal power after PL)")
@@ -3044,7 +3322,10 @@ def main():
                 sys.exit(1)
             validate_rx_indices(args.p1b_npz, resolved_rx_indices)
 
-    global path_loss_dB, pathLossLinear, snr_dB, noise_enabled, noise_mode, noise_dBFS, noise_std_abs
+    global path_loss_dB, pathLossLinear, snr_dB, noise_enabled, noise_mode, noise_dBFS, noise_std_abs, DL_USE_IDENTITY_CHANNEL
+    DL_USE_IDENTITY_CHANNEL = True  # DIAG: force identity for BLER root-cause test (was: args.identity_channel)
+    if DL_USE_IDENTITY_CHANNEL:
+        print("[CONFIG] DL_USE_IDENTITY_CHANNEL=True — forcing H=I for DL (diagnostic mode)")
     path_loss_dB = args.path_loss_dB
     pathLossLinear = 10**(path_loss_dB / 20.0)
     snr_dB = args.snr_dB

@@ -1,0 +1,182 @@
+/*
+ * gpu_ipc_v4.h - CUDA IPC Circular Buffers (G1A)
+ *
+ * Timestamp-indexed circular buffer matching socket-mode semantics.
+ * Position: offset = (timestamp * nbAnt) % CirSize (sample index)
+ * Supports variable nsamps natively (no packetizer).
+ *
+ * Architecture:
+ *   Proxy (SERVER) allocates (1 + 3*N) GPU circular buffers:
+ *     dl_tx       : 1 buf  (gNB writes, Proxy reads)
+ *     dl_rx[k]    : N buf  (Proxy writes, UE_k reads)
+ *     ul_tx[k]    : N buf  (UE_k writes, Proxy reads)
+ *     ul_rx[k]    : N buf  (Proxy writes, gNB reads per-UE + sums)
+ *
+ *   Per-write metadata ring (1 + 3*N):
+ *     dl_tx_meta       : gNB pushes, Proxy pops
+ *     dl_rx_meta[k]    : Proxy pushes, UE_k pops
+ *     ul_tx_meta[k]    : UE_k pushes, Proxy pops
+ *     ul_rx_meta[k]    : Proxy pushes, gNB pops (per-UE)
+ *
+ *   gNB sums ul_rx[k] internally (socket-mode have_to_wait pattern).
+ *   Proxy only applies channel — no summation.
+ *
+ * SHM layout: 16384 bytes (16KB)
+ */
+
+#ifndef GPU_IPC_V4_H
+#define GPU_IPC_V4_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define GPU_IPC_V4_SHM_DIR          "/tmp/oai_gpu_ipc"
+#define GPU_IPC_V4_SHM_PATH         "/tmp/oai_gpu_ipc/gpu_ipc_shm"
+#define GPU_IPC_V4_MAGIC            0x47505535  /* "GPU5" */
+#define GPU_IPC_V4_VERSION          7           /* ul_rx per-UE split */
+#define GPU_IPC_V4_HANDLE_SIZE      64
+#define GPU_IPC_V4_MAX_UE           8
+#define GPU_IPC_V4_SHM_SIZE         16384
+
+#define GPU_IPC_V4_CIR_SIZE         460800
+#define GPU_IPC_V4_SAMPLE_SIZE      4   /* sizeof(c16_t) */
+#define GPU_IPC_V4_BUF_BYTES        (GPU_IPC_V4_CIR_SIZE * GPU_IPC_V4_SAMPLE_SIZE)
+
+/* Read return codes */
+#define GPU_IPC_V4_OK               1
+#define GPU_IPC_V4_EMPTY            0
+#define GPU_IPC_V4_OVERWRITTEN      (-2)
+#define GPU_IPC_V4_ERROR            (-1)
+
+/* ── Meta Ring constants ── */
+#define GPU_IPC_V4_META_RING_DEPTH  32
+#define GPU_IPC_V4_META_RING_MASK   (GPU_IPC_V4_META_RING_DEPTH - 1)
+#define GPU_IPC_V4_META_ENTRY_SIZE  16
+#define GPU_IPC_V4_META_CTRL_SIZE   8
+#define GPU_IPC_V4_META_RING_SIZE   (GPU_IPC_V4_META_CTRL_SIZE + GPU_IPC_V4_META_RING_DEPTH * GPU_IPC_V4_META_ENTRY_SIZE)  /* 520 */
+
+/*
+ * SHM layout (16384 bytes):
+ *
+ * === IPC Handle area (0-1599) ===
+ *   0      : dl_tx handle       (64B)
+ *   64     : ul_rx handles[8]   (64*8 = 512B)  — per-UE
+ *   576    : dl_rx handles[8]   (64*8 = 512B)
+ *   1088   : ul_tx handles[8]   (64*8 = 512B)
+ *
+ * === Global area (1600-1919) ===
+ *   1600   : cir_size      (uint32)
+ *   1604   : chan_offset    (uint32)
+ *   1608   : num_ues        (uint32)
+ *   1612   : magic          (uint32)
+ *   1616   : version        (uint32)
+ *   1620   : last_dl_tx_ts  (uint64)  [legacy compat]
+ *   1628   : last_dl_tx_nsamps (uint32) [legacy]
+ *   1632   : last_dl_tx_nbAnt  (uint32) [legacy]
+ *   1636   : last_dl_rx_ts[8]  (uint64*8)
+ *   1700   : last_ul_tx_ts[8]  (uint64*8)
+ *   1764   : last_ul_rx_ts[8]  (uint64*8)  — per-UE
+ *   1828   : dl_rx_consumer_ts[8] (uint64*8)
+ *   1892   : ul_rx_consumer_ts[8] (uint64*8)  — per-UE
+ *   1956-1983: reserved
+ *
+ * === Meta Ring area (1984 - ~14983) ===
+ *   25 rings x 520 bytes = 13000 bytes
+ *
+ *   1984 + 0*520  : dl_tx_meta          (gNB → Proxy)
+ *   1984 + 1*520  : dl_rx_meta[0..7]    (Proxy → UE_k)
+ *   1984 + 9*520  : ul_tx_meta[0..7]    (UE_k → Proxy)
+ *   1984 + 17*520 : ul_rx_meta[0..7]    (Proxy → gNB per-UE)
+ */
+
+/* ── IPC Handle offsets ── */
+#define _V4_OFF_DL_TX_HANDLE     0
+#define _V4_OFF_UL_RX_HANDLES    64      /* + k*64, per-UE */
+#define _V4_OFF_DL_RX_HANDLES    576     /* + k*64 */
+#define _V4_OFF_UL_TX_HANDLES    1088    /* + k*64 */
+
+/* ── Global area offsets ── */
+#define _V4_OFF_GLOBAL           1600
+#define _V4_OFF_CIR_SIZE         (_V4_OFF_GLOBAL)
+#define _V4_OFF_CHAN_OFFSET      (_V4_OFF_GLOBAL + 4)
+#define _V4_OFF_NUM_UES          (_V4_OFF_GLOBAL + 8)
+#define _V4_OFF_MAGIC            (_V4_OFF_GLOBAL + 12)
+#define _V4_OFF_VERSION          (_V4_OFF_GLOBAL + 16)
+#define _V4_OFF_LAST_DL_TX_TS    (_V4_OFF_GLOBAL + 20)
+#define _V4_OFF_LAST_DL_TX_NSAMPS (_V4_OFF_GLOBAL + 28)
+#define _V4_OFF_LAST_DL_TX_NBANT (_V4_OFF_GLOBAL + 32)
+#define _V4_OFF_LAST_DL_RX_TS    (_V4_OFF_GLOBAL + 36)    /* + k*8 */
+#define _V4_OFF_LAST_UL_TX_TS    (_V4_OFF_GLOBAL + 100)   /* + k*8 */
+#define _V4_OFF_LAST_UL_RX_TS    (_V4_OFF_GLOBAL + 164)   /* + k*8, per-UE */
+#define _V4_OFF_DL_RX_CONSUMER_TS (_V4_OFF_GLOBAL + 228)  /* + k*8 */
+#define _V4_OFF_UL_RX_CONSUMER_TS (_V4_OFF_GLOBAL + 292)  /* + k*8, per-UE */
+
+/* ── Meta Ring offsets ── */
+#define _V4_OFF_META_RINGS       1984
+#define _V4_OFF_DL_TX_META       (_V4_OFF_META_RINGS + 0 * GPU_IPC_V4_META_RING_SIZE)
+#define _V4_OFF_DL_RX_META(k)    (_V4_OFF_META_RINGS + (1 + (k)) * GPU_IPC_V4_META_RING_SIZE)
+#define _V4_OFF_UL_TX_META(k)    (_V4_OFF_META_RINGS + (9 + (k)) * GPU_IPC_V4_META_RING_SIZE)
+#define _V4_OFF_UL_RX_META(k)    (_V4_OFF_META_RINGS + (17 + (k)) * GPU_IPC_V4_META_RING_SIZE)
+
+/* ── Meta Ring entry layout ── */
+#define _V4_META_OFF_WRITE_IDX   0
+#define _V4_META_OFF_READ_IDX    4
+#define _V4_META_OFF_ENTRIES     8
+#define _V4_META_ENTRY_OFF_TS    0
+#define _V4_META_ENTRY_OFF_NSAMPS 8
+#define _V4_META_ENTRY_OFF_NBANT 12
+
+typedef enum {
+    GPU_IPC_V4_ROLE_GNB = 0,
+    GPU_IPC_V4_ROLE_UE  = 1
+} gpu_ipc_v4_role_t;
+
+typedef struct {
+    char    *shm_raw;
+    void    *gpu_dl_tx;
+    void    *gpu_ul_rx[GPU_IPC_V4_MAX_UE];  /* gNB: per-UE ul_rx buffers */
+    void    *gpu_dl_rx;                      /* UE: own dl_rx */
+    void    *gpu_ul_tx;                      /* UE: own ul_tx */
+    gpu_ipc_v4_role_t role;
+    int     ue_idx;
+    int     num_ues;
+    int     shm_fd;
+    void    *cuda_lib;
+    uint32_t cir_size;
+    uint32_t chan_offset;
+    int     initialized;
+    int     ul_ts_synced;
+    uint64_t lastReceivedTS[GPU_IPC_V4_MAX_UE]; /* per-UE gap zero-fill tracking */
+} gpu_ipc_v4_ctx_t;
+
+/* ── Initialization / Cleanup ── */
+int  gpu_ipc_v4_init(gpu_ipc_v4_ctx_t *ctx, gpu_ipc_v4_role_t role, int ue_idx);
+void gpu_ipc_v4_cleanup(gpu_ipc_v4_ctx_t *ctx);
+
+/* ── gNB DL write (auto-pushes dl_tx_meta) ── */
+int  gpu_ipc_v4_dl_write(gpu_ipc_v4_ctx_t *ctx, const void *samples,
+                         int nsamps, int nbAnt, uint64_t timestamp);
+
+/* ── UE DL read ── */
+int  gpu_ipc_v4_dl_read(gpu_ipc_v4_ctx_t *ctx, void *samples,
+                        int nsamps, int nbAnt, uint64_t target_ts);
+
+/* ── UE UL write (auto-pushes ul_tx_meta[ue_idx]) ── */
+int  gpu_ipc_v4_ul_write(gpu_ipc_v4_ctx_t *ctx, const void *samples,
+                         int nsamps, int nbAnt, uint64_t timestamp);
+
+/* ── gNB UL read: single UE's ul_rx[ue_idx] ── */
+int  gpu_ipc_v4_ul_read_single(gpu_ipc_v4_ctx_t *ctx, int ue_idx, void *samples,
+                               int nsamps, int nbAnt, uint64_t target_ts);
+
+/* ── Convenience ── */
+uint64_t gpu_ipc_v4_dl_latest_ts(gpu_ipc_v4_ctx_t *ctx);
+uint64_t gpu_ipc_v4_ul_latest_ts_ue(gpu_ipc_v4_ctx_t *ctx, int ue_idx);
+
+/* ── Meta Ring API ── */
+int  v4_meta_push(char *shm, int ring_off, uint64_t ts, uint32_t nsamps, uint32_t nbAnt);
+int  v4_meta_pop(char *shm, int ring_off, uint64_t *ts, uint32_t *nsamps, uint32_t *nbAnt);
+int  v4_meta_available(char *shm, int ring_off);
+int  v4_meta_drain_and_zerofill(gpu_ipc_v4_ctx_t *ctx, void *gpu_base, int meta_ring_off, int ue_idx);
+
+#endif /* GPU_IPC_V4_H */

@@ -1,0 +1,169 @@
+/*
+ * gpu_ipc_v3.h - Timestamp-Indexed CUDA IPC Ring Buffers (G1A)
+ *
+ * Replaces V2's FIFO (head/tail) ring with timestamp-indexed slot addressing.
+ * Each slot is addressed by:
+ *   slot_idx = (timestamp / SAMPLES_PER_SLOT) % RING_DEPTH
+ *   epoch    = (timestamp / SAMPLES_PER_SLOT) / RING_DEPTH + 1   (1-based)
+ *
+ * Epoch=0 means "never written" (SHM zero-init safe).
+ * This eliminates permanent desynchronization caused by zero-fills in V2.
+ *
+ * Architecture (same ring topology as V2):
+ *   Proxy (SERVER) allocates (2 + 2*N) GPU ring buffers:
+ *     dl_tx_ring    : 1 ring   (gNB writes broadcast DL, Proxy reads)
+ *     ul_rx_ring    : 1 ring   (Proxy writes summed UL, gNB reads)
+ *     dl_rx_ring[k] : N rings  (Proxy writes per-UE DL, UE_k reads)
+ *     ul_tx_ring[k] : N rings  (UE_k writes UL, Proxy reads)
+ *
+ *   Each ring = RING_DEPTH contiguous GPU slots under a single IPC handle.
+ *   Slot N accessed at: gpu_base + slot_idx * slot_size
+ *
+ * SHM layout: 20480 bytes (see offset constants below)
+ */
+
+#ifndef GPU_IPC_V3_H
+#define GPU_IPC_V3_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+#define GPU_IPC_V3_SHM_DIR          "/tmp/oai_gpu_ipc"
+#define GPU_IPC_V3_SHM_PATH         "/tmp/oai_gpu_ipc/gpu_ipc_shm"
+#define GPU_IPC_V3_MAGIC            0x47505534  /* "GPU4" */
+#define GPU_IPC_V3_VERSION          4
+#define GPU_IPC_V3_HANDLE_SIZE      64
+#define GPU_IPC_V3_MAX_UE           8
+#define GPU_IPC_V3_SHM_SIZE         20480
+#define GPU_IPC_V3_MAX_DATA_SIZE    (61440 * 4) /* 240KB per slot */
+
+#define GPU_IPC_V3_RING_DEPTH       32          /* must be power of 2 */
+#define GPU_IPC_V3_RING_MASK        (GPU_IPC_V3_RING_DEPTH - 1)
+#define GPU_IPC_V3_SAMPLES_PER_SLOT 30720
+
+/* Read return codes */
+#define GPU_IPC_V3_OK               1   /* data read successfully */
+#define GPU_IPC_V3_EMPTY            0   /* slot not yet written (epoch==0 or epoch < expected) */
+#define GPU_IPC_V3_OVERWRITTEN      (-2)/* slot already overwritten (epoch > expected) */
+#define GPU_IPC_V3_ERROR            (-1)/* general error */
+
+/*
+ * SHM layout (20480 bytes):
+ *
+ * === IPC Handle area (0-1151) ===
+ *   0      : dl_tx handle (64B)
+ *   64     : ul_rx handle (64B)
+ *   128    : dl_rx handles[MAX_UE] (64*8 = 512B)
+ *   640    : ul_tx handles[MAX_UE] (64*8 = 512B)
+ *
+ * === Ring control area (1152-19871) ===
+ *   Per-ring control block = 1040 bytes:
+ *     latest_write_ts(8) + reserved(8) + slots[RING_DEPTH] * 32B
+ *
+ *   Per-slot metadata (32B):
+ *     ts(8) + epoch(4) + nsamps(4) + nbAnt(4) + data_size(4) + reserved(8)
+ *
+ *   1152  : dl_tx_ring      (1040B)
+ *   2192  : ul_rx_ring      (1040B)
+ *   3232  : dl_rx_ring[8]   (8320B)
+ *   11552 : ul_tx_ring[8]   (8320B)
+ *
+ * === Global area (19872-19895) ===
+ *   19872 : ring_depth        (uint32)
+ *   19876 : num_ues           (uint32)
+ *   19880 : magic             (uint32)
+ *   19884 : version           (uint32)
+ *   19888 : buf_size          (uint32)
+ *   19892 : samples_per_slot  (uint32)
+ */
+
+/* IPC handle offsets */
+#define _V3_OFF_DL_TX_HANDLE     0
+#define _V3_OFF_UL_RX_HANDLE     64
+#define _V3_OFF_DL_RX_HANDLES    128   /* + k*64 */
+#define _V3_OFF_UL_TX_HANDLES    640   /* + k*64 */
+
+/* Per-slot metadata (32B) */
+#define _V3_SLOT_META_SIZE       32
+#define _V3_SLOT_OFF_TS          0     /* uint64_t */
+#define _V3_SLOT_OFF_EPOCH       8     /* uint32_t, 1-based, 0=never written */
+#define _V3_SLOT_OFF_NSAMPS      12    /* int32_t */
+#define _V3_SLOT_OFF_NBANT       16    /* int32_t */
+#define _V3_SLOT_OFF_DSIZE       20    /* int32_t */
+/* 24-31: reserved */
+
+/* Ring control block (1040B) */
+#define _V3_RING_CTRL_SIZE       (16 + GPU_IPC_V3_RING_DEPTH * _V3_SLOT_META_SIZE)
+#define _V3_RING_OFF_LATEST_TS   0     /* uint64_t */
+#define _V3_RING_OFF_RESERVED    8     /* 8B padding */
+#define _V3_RING_OFF_SLOTS       16    /* + slot_idx * _V3_SLOT_META_SIZE */
+
+/* Ring control base offsets */
+#define _V3_OFF_RING_BASE        1152
+#define _V3_OFF_DL_TX_RING       (_V3_OFF_RING_BASE)
+#define _V3_OFF_UL_RX_RING       (_V3_OFF_DL_TX_RING  + _V3_RING_CTRL_SIZE)
+#define _V3_OFF_DL_RX_RINGS      (_V3_OFF_UL_RX_RING  + _V3_RING_CTRL_SIZE)
+#define _V3_OFF_UL_TX_RINGS      (_V3_OFF_DL_RX_RINGS + GPU_IPC_V3_MAX_UE * _V3_RING_CTRL_SIZE)
+
+/* Global area */
+#define _V3_OFF_GLOBAL           (_V3_OFF_UL_TX_RINGS + GPU_IPC_V3_MAX_UE * _V3_RING_CTRL_SIZE)
+#define _V3_OFF_RING_DEPTH       (_V3_OFF_GLOBAL)
+#define _V3_OFF_NUM_UES          (_V3_OFF_GLOBAL + 4)
+#define _V3_OFF_MAGIC            (_V3_OFF_GLOBAL + 8)
+#define _V3_OFF_VERSION          (_V3_OFF_GLOBAL + 12)
+#define _V3_OFF_BUF_SIZE         (_V3_OFF_GLOBAL + 16)
+#define _V3_OFF_SPP              (_V3_OFF_GLOBAL + 20)
+
+typedef enum {
+    GPU_IPC_V3_ROLE_GNB = 0,
+    GPU_IPC_V3_ROLE_UE  = 1
+} gpu_ipc_v3_role_t;
+
+typedef struct {
+    char    *shm_raw;
+    void    *gpu_dl_tx;        /* gNB: dl_tx ring GPU base */
+    void    *gpu_ul_rx;        /* gNB: ul_rx ring GPU base */
+    void    *gpu_dl_rx;        /* UE:  dl_rx[ue_idx] GPU base */
+    void    *gpu_ul_tx;        /* UE:  ul_tx[ue_idx] GPU base */
+    gpu_ipc_v3_role_t role;
+    int     ue_idx;
+    int     num_ues;
+    int     shm_fd;
+    void    *cuda_lib;
+    size_t  buf_size;          /* per-slot byte size */
+    int     ring_depth;
+    int     samples_per_slot;
+    int     initialized;
+    int     ul_ts_synced;      /* gNB: Phase 1→2 flag */
+} gpu_ipc_v3_ctx_t;
+
+/* ── Initialization / Cleanup ── */
+
+int  gpu_ipc_v3_init(gpu_ipc_v3_ctx_t *ctx, gpu_ipc_v3_role_t role, int ue_idx);
+void gpu_ipc_v3_cleanup(gpu_ipc_v3_ctx_t *ctx);
+
+/* ── gNB DL write: timestamp-indexed write to dl_tx ring ── */
+int  gpu_ipc_v3_dl_write(gpu_ipc_v3_ctx_t *ctx, const void *samples,
+                         int nsamps, int nbAnt, uint64_t timestamp);
+
+/* ── UE DL read: timestamp-indexed read from dl_rx[ue_idx] ring ──
+ *   Returns: V3_OK, V3_EMPTY, V3_OVERWRITTEN, or V3_ERROR */
+int  gpu_ipc_v3_dl_read(gpu_ipc_v3_ctx_t *ctx, void *samples,
+                        int nsamps, int nbAnt, uint64_t target_ts);
+
+/* ── UE UL write: timestamp-indexed write to ul_tx[ue_idx] ring ── */
+int  gpu_ipc_v3_ul_write(gpu_ipc_v3_ctx_t *ctx, const void *samples,
+                         int nsamps, int nbAnt, uint64_t timestamp);
+
+/* ── gNB UL read: timestamp-indexed read from ul_rx ring ──
+ *   Returns: V3_OK, V3_EMPTY, V3_OVERWRITTEN, or V3_ERROR */
+int  gpu_ipc_v3_ul_read(gpu_ipc_v3_ctx_t *ctx, void *samples,
+                        int nsamps, int nbAnt, uint64_t target_ts);
+
+/* ── Convenience: latest_write_ts for the caller's DL ring ── */
+uint64_t gpu_ipc_v3_dl_latest_ts(gpu_ipc_v3_ctx_t *ctx);
+
+/* ── Convenience: latest_write_ts for the caller's UL ring ── */
+uint64_t gpu_ipc_v3_ul_latest_ts(gpu_ipc_v3_ctx_t *ctx);
+
+#endif /* GPU_IPC_V3_H */

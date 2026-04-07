@@ -1,0 +1,427 @@
+/*
+ * gpu_ipc_v4.c - CUDA IPC Circular Buffers (G1A)
+ *
+ * Timestamp-indexed circular buffer: offset = (ts * nbAnt) % CirSize
+ * Variable nsamps supported. Wrap-around: two cudaMemcpy when needed.
+ * Per-write meta ring for {ts, nsamps, nbAnt} delivery.
+ * UL: per-UE ul_rx[k] buffers — gNB sums internally.
+ */
+
+#include "gpu_ipc_v4.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/* ── CUDA types & function pointers ── */
+
+typedef int cudaError_t;
+#define cudaSuccess 0
+#define cudaMemcpyHostToDevice   1
+#define cudaMemcpyDeviceToHost   2
+#define cudaIpcMemLazyEnablePeerAccess 1
+
+typedef struct { char reserved[GPU_IPC_V4_HANDLE_SIZE]; } cudaIpcMemHandle_t;
+
+typedef cudaError_t (*fn_cudaMemcpy)(void *, const void *, size_t, int);
+typedef cudaError_t (*fn_cudaMemset)(void *, int, size_t);
+typedef cudaError_t (*fn_cudaIpcOpenMemHandle)(void **, cudaIpcMemHandle_t, unsigned int);
+typedef cudaError_t (*fn_cudaIpcCloseMemHandle)(void *);
+typedef cudaError_t (*fn_cudaSetDevice)(int);
+typedef const char* (*fn_cudaGetErrorString)(cudaError_t);
+
+static fn_cudaMemcpy            p_cudaMemcpy;
+static fn_cudaMemset            p_cudaMemset;
+static fn_cudaIpcOpenMemHandle  p_cudaIpcOpenMemHandle;
+static fn_cudaIpcCloseMemHandle p_cudaIpcCloseMemHandle;
+static fn_cudaSetDevice         p_cudaSetDevice;
+static fn_cudaGetErrorString    p_cudaGetErrorString;
+
+#define LOG_V4(fmt, ...) fprintf(stderr, "[GPU_IPC_V4] " fmt "\n", ##__VA_ARGS__)
+
+/* ── SHM helpers ── */
+
+static inline volatile uint32_t *shm_u32(char *b, int off) {
+    return (volatile uint32_t *)(b + off);
+}
+static inline volatile uint64_t *shm_u64(char *b, int off) {
+    return (volatile uint64_t *)(b + off);
+}
+
+static inline uint32_t circ_offset(uint64_t ts, int nbAnt, uint32_t cir_size) {
+    return (uint32_t)((ts * (uint64_t)nbAnt) % (uint64_t)cir_size);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Meta Ring
+ * ══════════════════════════════════════════════════════════════════ */
+
+int v4_meta_push(char *shm, int ring_off, uint64_t ts, uint32_t nsamps, uint32_t nbAnt)
+{
+    volatile uint32_t *wr = shm_u32(shm, ring_off + _V4_META_OFF_WRITE_IDX);
+    volatile uint32_t *rd = shm_u32(shm, ring_off + _V4_META_OFF_READ_IDX);
+    uint32_t w = *wr, r = *rd;
+    if (w - r >= GPU_IPC_V4_META_RING_DEPTH) return -1;
+    int slot = w & GPU_IPC_V4_META_RING_MASK;
+    int eoff = ring_off + _V4_META_OFF_ENTRIES + slot * GPU_IPC_V4_META_ENTRY_SIZE;
+    *shm_u64(shm, eoff + _V4_META_ENTRY_OFF_TS) = ts;
+    *shm_u32(shm, eoff + _V4_META_ENTRY_OFF_NSAMPS) = nsamps;
+    *shm_u32(shm, eoff + _V4_META_ENTRY_OFF_NBANT) = nbAnt;
+    __sync_synchronize();
+    *wr = w + 1;
+    return 0;
+}
+
+int v4_meta_pop(char *shm, int ring_off, uint64_t *ts, uint32_t *nsamps, uint32_t *nbAnt)
+{
+    volatile uint32_t *wr = shm_u32(shm, ring_off + _V4_META_OFF_WRITE_IDX);
+    volatile uint32_t *rd = shm_u32(shm, ring_off + _V4_META_OFF_READ_IDX);
+    uint32_t w = *wr, r = *rd;
+    if (w <= r) return -1;
+    __sync_synchronize();
+    int slot = r & GPU_IPC_V4_META_RING_MASK;
+    int eoff = ring_off + _V4_META_OFF_ENTRIES + slot * GPU_IPC_V4_META_ENTRY_SIZE;
+    *ts     = *shm_u64(shm, eoff + _V4_META_ENTRY_OFF_TS);
+    *nsamps = *shm_u32(shm, eoff + _V4_META_ENTRY_OFF_NSAMPS);
+    *nbAnt  = *shm_u32(shm, eoff + _V4_META_ENTRY_OFF_NBANT);
+    __sync_synchronize();
+    *rd = r + 1;
+    return 0;
+}
+
+int v4_meta_available(char *shm, int ring_off)
+{
+    volatile uint32_t *wr = shm_u32(shm, ring_off + _V4_META_OFF_WRITE_IDX);
+    volatile uint32_t *rd = shm_u32(shm, ring_off + _V4_META_OFF_READ_IDX);
+    return (*wr > *rd) ? 1 : 0;
+}
+
+int v4_meta_drain_and_zerofill(gpu_ipc_v4_ctx_t *ctx, void *gpu_base, int meta_ring_off, int ue_idx)
+{
+    if (!ctx->initialized) return 0;
+    int count = 0;
+    uint64_t ts;
+    uint32_t nsamps, nbAnt;
+    uint32_t cir = ctx->cir_size;
+    int idx = (ue_idx >= 0 && ue_idx < GPU_IPC_V4_MAX_UE) ? ue_idx : 0;
+
+    while (v4_meta_pop(ctx->shm_raw, meta_ring_off, &ts, &nsamps, &nbAnt) == 0) {
+        if (ctx->lastReceivedTS[idx] > 0 && ctx->lastReceivedTS[idx] < ts) {
+            uint64_t gap_start = ctx->lastReceivedTS[idx];
+            uint64_t gap_len = ts - gap_start;
+            if (gap_len < (uint64_t)cir && p_cudaMemset) {
+                uint32_t off = circ_offset(gap_start, nbAnt, cir);
+                size_t gap_samples = (size_t)gap_len * nbAnt;
+                size_t gap_bytes = gap_samples * GPU_IPC_V4_SAMPLE_SIZE;
+                if (off + gap_samples <= cir) {
+                    p_cudaMemset((char *)gpu_base + (size_t)off * GPU_IPC_V4_SAMPLE_SIZE, 0, gap_bytes);
+                } else {
+                    size_t tail = (cir - off) * GPU_IPC_V4_SAMPLE_SIZE;
+                    p_cudaMemset((char *)gpu_base + (size_t)off * GPU_IPC_V4_SAMPLE_SIZE, 0, tail);
+                    p_cudaMemset(gpu_base, 0, gap_bytes - tail);
+                }
+            }
+        }
+        ctx->lastReceivedTS[idx] = ts + (uint64_t)nsamps;
+        count++;
+    }
+    return count;
+}
+
+/* ── CUDA runtime loading ── */
+
+static int load_cuda_runtime_v4(gpu_ipc_v4_ctx_t *ctx)
+{
+    const char *libs[] = { "libcudart.so", "libcudart.so.12", "libcudart.so.11", NULL };
+    for (int i = 0; libs[i]; i++) {
+        ctx->cuda_lib = dlopen(libs[i], RTLD_LAZY);
+        if (ctx->cuda_lib) { LOG_V4("Loaded %s", libs[i]); break; }
+    }
+    if (!ctx->cuda_lib) { LOG_V4("Failed to load libcudart: %s", dlerror()); return -1; }
+
+#define LOAD(name) do { \
+    p_##name = (fn_##name)dlsym(ctx->cuda_lib, #name); \
+    if (!p_##name) { LOG_V4("dlsym(%s) failed", #name); dlclose(ctx->cuda_lib); ctx->cuda_lib = NULL; return -1; } \
+} while(0)
+    LOAD(cudaMemcpy);
+    LOAD(cudaIpcOpenMemHandle);
+    LOAD(cudaIpcCloseMemHandle);
+    LOAD(cudaSetDevice);
+    LOAD(cudaGetErrorString);
+    p_cudaMemset = (fn_cudaMemset)dlsym(ctx->cuda_lib, "cudaMemset");
+#undef LOAD
+
+    cudaError_t err = p_cudaSetDevice(0);
+    if (err != cudaSuccess) {
+        LOG_V4("cudaSetDevice(0) failed: %s", p_cudaGetErrorString(err));
+        dlclose(ctx->cuda_lib); ctx->cuda_lib = NULL; return -1;
+    }
+    return 0;
+}
+
+static void *open_handle_at(gpu_ipc_v4_ctx_t *ctx, int offset, const char *name)
+{
+    cudaIpcMemHandle_t handle;
+    memcpy(handle.reserved, ctx->shm_raw + offset, GPU_IPC_V4_HANDLE_SIZE);
+    void *ptr = NULL;
+    cudaError_t err = p_cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess);
+    if (err != cudaSuccess) {
+        LOG_V4("cudaIpcOpenMemHandle(%s) failed: %s", name, p_cudaGetErrorString(err));
+        return NULL;
+    }
+    LOG_V4("CLIENT: opened %s (ptr=%p)", name, ptr);
+    return ptr;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Initialization
+ * ══════════════════════════════════════════════════════════════════ */
+
+int gpu_ipc_v4_init(gpu_ipc_v4_ctx_t *ctx, gpu_ipc_v4_role_t role, int ue_idx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->role   = role;
+    ctx->ue_idx = ue_idx;
+    ctx->shm_fd = -1;
+
+    if (load_cuda_runtime_v4(ctx) != 0) return -1;
+
+    struct stat st;
+    if (stat(GPU_IPC_V4_SHM_DIR, &st) != 0)
+        if (mkdir(GPU_IPC_V4_SHM_DIR, 0777) != 0 && errno != EEXIST)
+            { LOG_V4("mkdir failed: %s", strerror(errno)); return -1; }
+
+    int wait = 0;
+    while (access(GPU_IPC_V4_SHM_PATH, F_OK) != 0) {
+        usleep(10000);
+        if (++wait > 3000) { LOG_V4("timeout waiting for shm (30s)"); return -1; }
+    }
+
+    ctx->shm_fd = open(GPU_IPC_V4_SHM_PATH, O_RDWR, 0666);
+    if (ctx->shm_fd < 0)
+        { LOG_V4("open failed: %s", strerror(errno)); return -1; }
+
+    if (ftruncate(ctx->shm_fd, GPU_IPC_V4_SHM_SIZE) != 0)
+        { LOG_V4("ftruncate failed: %s", strerror(errno)); close(ctx->shm_fd); return -1; }
+
+    ctx->shm_raw = (char *)mmap(NULL, GPU_IPC_V4_SHM_SIZE,
+                                PROT_READ | PROT_WRITE, MAP_SHARED,
+                                ctx->shm_fd, 0);
+    if (ctx->shm_raw == MAP_FAILED)
+        { LOG_V4("mmap failed: %s", strerror(errno)); close(ctx->shm_fd); return -1; }
+
+    LOG_V4("CLIENT(%s idx=%d): waiting for server...",
+           role == GPU_IPC_V4_ROLE_GNB ? "gNB" : "UE", ue_idx);
+    wait = 0;
+    while (*shm_u32(ctx->shm_raw, _V4_OFF_MAGIC) != GPU_IPC_V4_MAGIC) {
+        usleep(10000);
+        if (++wait > 3000) { LOG_V4("timeout waiting for magic (30s)"); return -1; }
+    }
+
+    uint32_t ver = *shm_u32(ctx->shm_raw, _V4_OFF_VERSION);
+    if (ver != GPU_IPC_V4_VERSION) {
+        LOG_V4("version mismatch (got %u, expected %u)", ver, GPU_IPC_V4_VERSION);
+        return -1;
+    }
+
+    ctx->cir_size    = *shm_u32(ctx->shm_raw, _V4_OFF_CIR_SIZE);
+    ctx->chan_offset = *shm_u32(ctx->shm_raw, _V4_OFF_CHAN_OFFSET);
+    ctx->num_ues     = *shm_u32(ctx->shm_raw, _V4_OFF_NUM_UES);
+
+    LOG_V4("CLIENT: server ready (ues=%d, cir_size=%u, chan_offset=%u)",
+           ctx->num_ues, ctx->cir_size, ctx->chan_offset);
+
+    if (role == GPU_IPC_V4_ROLE_GNB) {
+        ctx->gpu_dl_tx = open_handle_at(ctx, _V4_OFF_DL_TX_HANDLE, "dl_tx");
+        if (!ctx->gpu_dl_tx) return -1;
+        for (int k = 0; k < (int)ctx->num_ues; k++) {
+            char label[32];
+            snprintf(label, sizeof(label), "ul_rx[%d]", k);
+            ctx->gpu_ul_rx[k] = open_handle_at(ctx,
+                _V4_OFF_UL_RX_HANDLES + k * GPU_IPC_V4_HANDLE_SIZE, label);
+            if (!ctx->gpu_ul_rx[k]) return -1;
+        }
+    } else {
+        if (ue_idx < 0 || ue_idx >= (int)ctx->num_ues) {
+            LOG_V4("ue_idx=%d out of range (num_ues=%d)", ue_idx, ctx->num_ues);
+            return -1;
+        }
+        char label[32];
+        snprintf(label, sizeof(label), "dl_rx[%d]", ue_idx);
+        ctx->gpu_dl_rx = open_handle_at(ctx,
+            _V4_OFF_DL_RX_HANDLES + ue_idx * GPU_IPC_V4_HANDLE_SIZE, label);
+        snprintf(label, sizeof(label), "ul_tx[%d]", ue_idx);
+        ctx->gpu_ul_tx = open_handle_at(ctx,
+            _V4_OFF_UL_TX_HANDLES + ue_idx * GPU_IPC_V4_HANDLE_SIZE, label);
+        if (!ctx->gpu_dl_rx || !ctx->gpu_ul_tx) return -1;
+    }
+
+    ctx->initialized = 1;
+    LOG_V4("CLIENT(%s idx=%d): init complete",
+           role == GPU_IPC_V4_ROLE_GNB ? "gNB" : "UE", ue_idx);
+    return 0;
+}
+
+void gpu_ipc_v4_cleanup(gpu_ipc_v4_ctx_t *ctx)
+{
+    if (!ctx->initialized) return;
+    if (ctx->gpu_dl_tx) p_cudaIpcCloseMemHandle(ctx->gpu_dl_tx);
+    for (int k = 0; k < GPU_IPC_V4_MAX_UE; k++)
+        if (ctx->gpu_ul_rx[k]) p_cudaIpcCloseMemHandle(ctx->gpu_ul_rx[k]);
+    if (ctx->gpu_dl_rx) p_cudaIpcCloseMemHandle(ctx->gpu_dl_rx);
+    if (ctx->gpu_ul_tx) p_cudaIpcCloseMemHandle(ctx->gpu_ul_tx);
+    if (ctx->shm_raw && ctx->shm_raw != MAP_FAILED)
+        munmap(ctx->shm_raw, GPU_IPC_V4_SHM_SIZE);
+    if (ctx->shm_fd >= 0) close(ctx->shm_fd);
+    if (ctx->cuda_lib) dlclose(ctx->cuda_lib);
+    ctx->initialized = 0;
+    LOG_V4("CLIENT(%s idx=%d): cleanup done",
+           ctx->role == GPU_IPC_V4_ROLE_GNB ? "gNB" : "UE", ctx->ue_idx);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Internal: circular buffer write (H2D) with wrap
+ * ══════════════════════════════════════════════════════════════════ */
+
+static int v4_write(gpu_ipc_v4_ctx_t *ctx, void *gpu_base,
+                    const void *samples, int nsamps, int nbAnt, uint64_t timestamp,
+                    int last_ts_off)
+{
+    uint32_t cir = ctx->cir_size;
+    uint32_t off = circ_offset(timestamp, nbAnt, cir);
+    size_t total_samples = (size_t)nsamps * nbAnt;
+    size_t data_size = total_samples * GPU_IPC_V4_SAMPLE_SIZE;
+
+    if (off + total_samples <= cir) {
+        void *dst = (char *)gpu_base + (size_t)off * GPU_IPC_V4_SAMPLE_SIZE;
+        cudaError_t err = p_cudaMemcpy(dst, samples, data_size, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            LOG_V4("write H2D failed: %s", p_cudaGetErrorString(err));
+            return GPU_IPC_V4_ERROR;
+        }
+    } else {
+        uint32_t tail = cir - off;
+        size_t tail_bytes = (size_t)tail * GPU_IPC_V4_SAMPLE_SIZE;
+        size_t head_bytes = (total_samples - tail) * GPU_IPC_V4_SAMPLE_SIZE;
+        void *dst_tail = (char *)gpu_base + (size_t)off * GPU_IPC_V4_SAMPLE_SIZE;
+        cudaError_t err = p_cudaMemcpy(dst_tail, samples, tail_bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) return GPU_IPC_V4_ERROR;
+        err = p_cudaMemcpy(gpu_base, (const char *)samples + tail_bytes, head_bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) return GPU_IPC_V4_ERROR;
+    }
+
+    if (last_ts_off >= 0) {
+        *shm_u64(ctx->shm_raw, last_ts_off) = timestamp;
+        if (last_ts_off == _V4_OFF_LAST_DL_TX_TS) {
+            *shm_u32(ctx->shm_raw, _V4_OFF_LAST_DL_TX_NSAMPS) = (uint32_t)nsamps;
+            *shm_u32(ctx->shm_raw, _V4_OFF_LAST_DL_TX_NBANT)  = (uint32_t)nbAnt;
+        }
+    }
+    return nsamps;
+}
+
+/* ── Internal: circular buffer read (D2H) with wrap ── */
+
+static int v4_read(gpu_ipc_v4_ctx_t *ctx, void *gpu_base,
+                   void *samples, int nsamps, int nbAnt, uint64_t target_ts,
+                   int last_ts_off, int consumer_ts_off)
+{
+    uint64_t last = last_ts_off >= 0 ? *shm_u64(ctx->shm_raw, last_ts_off) : UINT64_MAX;
+    if (last < target_ts) return GPU_IPC_V4_EMPTY;
+
+    uint32_t cir = ctx->cir_size;
+    uint32_t off = circ_offset(target_ts, nbAnt, cir);
+    size_t total_samples = (size_t)nsamps * nbAnt;
+    size_t data_size = total_samples * GPU_IPC_V4_SAMPLE_SIZE;
+
+    if (off + total_samples <= cir) {
+        void *src = (char *)gpu_base + (size_t)off * GPU_IPC_V4_SAMPLE_SIZE;
+        cudaError_t err = p_cudaMemcpy(samples, src, data_size, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) return GPU_IPC_V4_ERROR;
+    } else {
+        uint32_t tail = cir - off;
+        size_t tail_bytes = (size_t)tail * GPU_IPC_V4_SAMPLE_SIZE;
+        size_t head_bytes = (total_samples - tail) * GPU_IPC_V4_SAMPLE_SIZE;
+        void *src_tail = (char *)gpu_base + (size_t)off * GPU_IPC_V4_SAMPLE_SIZE;
+        cudaError_t err = p_cudaMemcpy(samples, src_tail, tail_bytes, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) return GPU_IPC_V4_ERROR;
+        err = p_cudaMemcpy((char *)samples + tail_bytes, gpu_base, head_bytes, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) return GPU_IPC_V4_ERROR;
+    }
+
+    if (consumer_ts_off >= 0)
+        *shm_u64(ctx->shm_raw, consumer_ts_off) = target_ts + (uint64_t)nsamps - 1;
+    return nsamps;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Public API
+ * ══════════════════════════════════════════════════════════════════ */
+
+int gpu_ipc_v4_dl_write(gpu_ipc_v4_ctx_t *ctx, const void *samples,
+                        int nsamps, int nbAnt, uint64_t timestamp)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V4_ROLE_GNB) return GPU_IPC_V4_ERROR;
+    int ret = v4_write(ctx, ctx->gpu_dl_tx, samples, nsamps, nbAnt, timestamp, _V4_OFF_LAST_DL_TX_TS);
+    if (ret > 0)
+        v4_meta_push(ctx->shm_raw, _V4_OFF_DL_TX_META, timestamp, (uint32_t)nsamps, (uint32_t)nbAnt);
+    return ret;
+}
+
+int gpu_ipc_v4_dl_read(gpu_ipc_v4_ctx_t *ctx, void *samples,
+                       int nsamps, int nbAnt, uint64_t target_ts)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V4_ROLE_UE) return GPU_IPC_V4_ERROR;
+    int last_off = _V4_OFF_LAST_DL_RX_TS + ctx->ue_idx * 8;
+    int cons_off = _V4_OFF_DL_RX_CONSUMER_TS + ctx->ue_idx * 8;
+    return v4_read(ctx, ctx->gpu_dl_rx, samples, nsamps, nbAnt, target_ts, last_off, cons_off);
+}
+
+int gpu_ipc_v4_ul_write(gpu_ipc_v4_ctx_t *ctx, const void *samples,
+                        int nsamps, int nbAnt, uint64_t timestamp)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V4_ROLE_UE) return GPU_IPC_V4_ERROR;
+    int last_off = _V4_OFF_LAST_UL_TX_TS + ctx->ue_idx * 8;
+    int ret = v4_write(ctx, ctx->gpu_ul_tx, samples, nsamps, nbAnt, timestamp, last_off);
+    if (ret > 0)
+        v4_meta_push(ctx->shm_raw, _V4_OFF_UL_TX_META(ctx->ue_idx), timestamp, (uint32_t)nsamps, (uint32_t)nbAnt);
+    return ret;
+}
+
+int gpu_ipc_v4_ul_read_single(gpu_ipc_v4_ctx_t *ctx, int ue_idx, void *samples,
+                              int nsamps, int nbAnt, uint64_t target_ts)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V4_ROLE_GNB) return GPU_IPC_V4_ERROR;
+    if (ue_idx < 0 || ue_idx >= (int)ctx->num_ues) return GPU_IPC_V4_ERROR;
+    if (!ctx->gpu_ul_rx[ue_idx]) return GPU_IPC_V4_EMPTY;
+    int last_off = _V4_OFF_LAST_UL_RX_TS + ue_idx * 8;
+    int cons_off = _V4_OFF_UL_RX_CONSUMER_TS + ue_idx * 8;
+    uint64_t read_ts = target_ts;
+    if (ctx->chan_offset > 0 && target_ts >= (uint64_t)ctx->chan_offset)
+        read_ts = target_ts - (uint64_t)ctx->chan_offset;
+    return v4_read(ctx, ctx->gpu_ul_rx[ue_idx], samples, nsamps, nbAnt, read_ts, last_off, cons_off);
+}
+
+uint64_t gpu_ipc_v4_dl_latest_ts(gpu_ipc_v4_ctx_t *ctx)
+{
+    if (!ctx->initialized) return 0;
+    if (ctx->role == GPU_IPC_V4_ROLE_GNB)
+        return *shm_u64(ctx->shm_raw, _V4_OFF_LAST_DL_TX_TS);
+    return *shm_u64(ctx->shm_raw, _V4_OFF_LAST_DL_RX_TS + ctx->ue_idx * 8);
+}
+
+uint64_t gpu_ipc_v4_ul_latest_ts_ue(gpu_ipc_v4_ctx_t *ctx, int ue_idx)
+{
+    if (!ctx->initialized) return 0;
+    if (ue_idx < 0 || ue_idx >= GPU_IPC_V4_MAX_UE) return 0;
+    if (ctx->role == GPU_IPC_V4_ROLE_GNB)
+        return *shm_u64(ctx->shm_raw, _V4_OFF_LAST_UL_RX_TS + ue_idx * 8);
+    return *shm_u64(ctx->shm_raw, _V4_OFF_LAST_UL_TX_TS + ctx->ue_idx * 8);
+}

@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""
+OAI rfsimulator mock channel proxy - C mock_channel.c와 완전히 동일한 기능
+새로 작성된 버전 (기존 mock_python과 완전히 분리)
+"""
+
+import socket
+import threading
+import time
+import sys
+import signal
+import logging
+import os
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO, format='[MOCK_PYTHON2] %(levelname)s: %(message)s')
+log = logging.info
+
+# 상수 (C mock_channel.c와 동일)
+MOCK_CHANNEL_PORT_GNB = 6017
+MOCK_CHANNEL_PORT_UE = 6018
+MAX_BUFFER_SIZE = 8192
+MAX_CLIENTS = 10
+
+class MockChannelState:
+    """C mock_channel.c의 mock_channel_state_t와 동일한 구조"""
+    def __init__(self):
+        self.gnb_socket = -1
+        self.ue_socket = -1
+        self.gnb_client_socket = -1
+        self.ue_client_socket = -1
+        self.gnb_thread = None
+        self.ue_thread = None
+        self.running = True
+
+class MockChannel:
+    """C mock_channel.c와 완전히 동일한 기능을 하는 Python 버전"""
+    
+    def __init__(self):
+        self.state = MockChannelState()
+        
+    def setup_server_socket(self, port):
+        """C의 setup_server_socket과 동일"""
+        try:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind(('127.0.0.1', port))
+            server_socket.listen(MAX_CLIENTS)
+            log(f"Server socket setup on port {port}")
+            return server_socket
+        except Exception as e:
+            log(f"Failed to setup server socket on port {port}: {e}")
+            return -1
+    
+    def connect_to_gnb_server(self):
+        """C의 connect_to_gnb_server와 동일"""
+        try:
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.connect(('127.0.0.1', MOCK_CHANNEL_PORT_GNB))
+            log(f"Connected to gNB server on port {MOCK_CHANNEL_PORT_GNB}")
+            return client_socket
+        except Exception as e:
+            log(f"Failed to connect to gNB server: {e}")
+            return -1
+    
+    def accept_client_connection(self, server_socket):
+        """C의 accept_client_connection과 동일 (타임아웃 포함)"""
+        try:
+            # Non-blocking 모드로 설정
+            server_socket.setblocking(False)
+            
+            # 10초 타임아웃으로 accept 시도
+            for i in range(100):  # 100 * 100ms = 10초
+                try:
+                    client_socket, addr = server_socket.accept()
+                    client_socket.setblocking(True)  # 다시 blocking 모드로
+                    log(f"Client connected from {addr}")
+                    return client_socket
+                except BlockingIOError:
+                    if not self.state.running:
+                        return -1
+                    time.sleep(0.1)  # 100ms 대기
+                except Exception as e:
+                    log(f"Accept error: {e}")
+                    return -1
+            
+            # 타임아웃
+            return -1
+            
+        except Exception as e:
+            log(f"Failed to accept client connection: {e}")
+            return -1
+    
+    def cleanup_sockets(self):
+        """C의 cleanup_sockets와 동일"""
+        sockets = [
+            self.state.gnb_client_socket,
+            self.state.ue_client_socket,
+            self.state.gnb_socket,
+            self.state.ue_socket
+        ]
+        
+        for sock in sockets:
+            if sock != -1:
+                try:
+                    sock.close()
+                except:
+                    pass
+        
+        # 초기화
+        self.state.gnb_client_socket = -1
+        self.state.ue_client_socket = -1
+        self.state.gnb_socket = -1
+        self.state.ue_socket = -1
+    
+    def gnb_handler_thread(self):
+        """C의 gnb_handler_thread와 동일"""
+        log("gNB handler thread started")
+        
+        while self.state.running:
+            # gNB 서버에 클라이언트로 연결
+            self.state.gnb_client_socket = self.connect_to_gnb_server()
+            if self.state.gnb_client_socket == -1:
+                if self.state.running:
+                    log("Failed to connect to gNB server")
+                time.sleep(1)  # 재시도 전 대기
+                continue
+            
+            log("gNB connected")
+            
+            # UE 연결 대기
+            while self.state.running and self.state.ue_client_socket == -1:
+                time.sleep(0.1)  # 100ms
+            
+            if not self.state.running:
+                self.state.gnb_client_socket.close()
+                break
+            
+            # gNB에서 UE로 데이터 전달 (C mock_channel.c와 동일)
+            while self.state.running:
+                try:
+                    data = self.state.gnb_client_socket.recv(MAX_BUFFER_SIZE)
+                    if not data:  # 빈 데이터 체크
+                        break
+                    
+                    log(f"Forwarding {len(data)} bytes from gNB to UE")
+                    
+                    bytes_sent = self.state.ue_client_socket.send(data)
+                    if bytes_sent != len(data):
+                        log("Failed to forward data to UE")
+                        break
+                        
+                except Exception as e:
+                    log(f"gNB->UE forwarding error: {e}")
+                    break
+            
+            log("gNB disconnected")
+            self.state.gnb_client_socket.close()
+            self.state.gnb_client_socket = -1
+        
+        log("gNB handler thread stopped")
+    
+    def ue_handler_thread(self):
+        """C의 ue_handler_thread와 동일"""
+        log("UE handler thread started")
+        
+        while self.state.running:
+            # UE 연결 수락
+            self.state.ue_client_socket = self.accept_client_connection(self.state.ue_socket)
+            if self.state.ue_client_socket == -1:
+                if self.state.running:
+                    log("Failed to accept UE connection")
+                continue
+            
+            log("UE connected")
+            
+            # gNB 연결 대기
+            while self.state.running and self.state.gnb_client_socket == -1:
+                time.sleep(0.1)  # 100ms
+            
+            if not self.state.running:
+                self.state.ue_client_socket.close()
+                break
+            
+            # UE에서 gNB로 데이터 전달 (C mock_channel.c와 동일)
+            while self.state.running:
+                try:
+                    data = self.state.ue_client_socket.recv(MAX_BUFFER_SIZE)
+                    if not data:  # 빈 데이터 체크
+                        break
+                    
+                    log(f"Forwarding {len(data)} bytes from UE to gNB")
+                    
+                    bytes_sent = self.state.gnb_client_socket.send(data)
+                    if bytes_sent != len(data):
+                        log("Failed to forward data to gNB")
+                        break
+                        
+                except Exception as e:
+                    log(f"UE->gNB forwarding error: {e}")
+                    break
+            
+            log("UE disconnected")
+            self.state.ue_client_socket.close()
+            self.state.ue_client_socket = -1
+        
+        log("UE handler thread stopped")
+    
+    def mock_channel_init(self):
+        """C의 mock_channel_init과 동일"""
+        log("Initializing mock channel...")
+        
+        # UE 서버 소켓 설정 (UE가 우리에게 연결)
+        self.state.ue_socket = self.setup_server_socket(MOCK_CHANNEL_PORT_UE)
+        if self.state.ue_socket == -1:
+            log("Failed to setup UE server socket")
+            return -1
+        
+        # gNB 소켓은 -1로 초기화 (클라이언트로 연결할 예정)
+        self.state.gnb_socket = -1
+        
+        self.state.running = True
+        
+        log("Mock channel initialized successfully")
+        log(f"Will connect to gNB server on port {MOCK_CHANNEL_PORT_GNB}")
+        log(f"UE server listening on port {MOCK_CHANNEL_PORT_UE}")
+        
+        return 0
+    
+    def mock_channel_start(self):
+        """C의 mock_channel_start와 동일"""
+        log("Starting mock channel threads...")
+        
+        # gNB 핸들러 스레드 시작
+        self.state.gnb_thread = threading.Thread(target=self.gnb_handler_thread, daemon=True)
+        self.state.gnb_thread.start()
+        
+        # UE 핸들러 스레드 시작
+        self.state.ue_thread = threading.Thread(target=self.ue_handler_thread, daemon=True)
+        self.state.ue_thread.start()
+        
+        log("Mock channel threads started successfully")
+        return 0
+    
+    def mock_channel_stop(self):
+        """C의 mock_channel_stop과 동일"""
+        log("Stopping mock channel...")
+        
+        self.state.running = False
+        
+        # 스레드 종료 대기
+        if self.state.gnb_thread:
+            self.state.gnb_thread.join(timeout=2)
+        if self.state.ue_thread:
+            self.state.ue_thread.join(timeout=2)
+        
+        self.cleanup_sockets()
+        
+        log("Mock channel stopped")
+
+def signal_handler(signum, frame):
+    """시그널 핸들러"""
+    log("Received signal, shutting down...")
+    if hasattr(signal_handler, 'mock_channel'):
+        signal_handler.mock_channel.mock_channel_stop()
+
+def main():
+    """메인 함수 - C의 main과 동일"""
+    log("Starting mock channel in standalone mode")
+    
+    # 시그널 핸들러 설정
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Mock channel 생성 및 초기화
+    mock_channel = MockChannel()
+    signal_handler.mock_channel = mock_channel
+    
+    if mock_channel.mock_channel_init() != 0:
+        log("Failed to initialize mock channel")
+        return -1
+    
+    if mock_channel.mock_channel_start() != 0:
+        log("Failed to start mock channel")
+        return -1
+    
+    log("Mock channel running. Press Ctrl+C to stop.")
+    
+    # 종료 신호 대기
+    try:
+        while mock_channel.state.running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    
+    mock_channel.mock_channel_stop()
+    log("Mock channel shutdown complete")
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main()) 

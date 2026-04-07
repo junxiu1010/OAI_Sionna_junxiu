@@ -7,8 +7,8 @@ system:
   mode: gpu-ipc            # gpu-ipc | socket
   channel_mode: static     # dynamic | static
   batch_size: 4            # UE startup batch size
-  mu_mimo: true            # Enable MU-MIMO scheduling
-  force_mu_dl_traffic: true # Inject dummy DL bytes for MU-MIMO testing
+  mu_mimo: false            # Enable MU-MIMO scheduling
+  force_mu_dl_traffic: false # Inject dummy DL bytes for MU-MIMO testing
 
 antenna:
   gnb:

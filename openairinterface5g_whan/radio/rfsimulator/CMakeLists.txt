@@ -1,0 +1,25 @@
+add_library(rfsimulator MODULE
+            simulator.c
+            apply_channelmod.c
+            gpu_ipc.c
+            gpu_ipc_v2.c
+            gpu_ipc_v3.c
+            gpu_ipc_v4.c
+            gpu_ipc_v5.c
+            gpu_ipc_v6.c
+            gpu_ipc_v7.c
+            ../../openair1/PHY/TOOLS/signal_energy.c
+)
+target_compile_definitions(rfsimulator PRIVATE USE_GPU_IPC USE_GPU_IPC_V2 USE_GPU_IPC_V6 USE_GPU_IPC_V7)
+target_link_libraries(rfsimulator PRIVATE SIMU dl)
+set_target_properties(rfsimulator PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
+add_executable(replay_node stored_node.c)
+target_link_libraries (replay_node minimal_lib)
+
+################
+# Mock channel standalone executable
+add_executable(mock_channel_standalone mock_channel.c)
+target_compile_definitions(mock_channel_standalone PRIVATE MOCK_CHANNEL_STANDALONE)
+target_link_libraries(mock_channel_standalone pthread)
+set_target_properties(mock_channel_standalone PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})

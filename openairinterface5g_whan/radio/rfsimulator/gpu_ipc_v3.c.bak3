@@ -1,0 +1,407 @@
+/*
+ * gpu_ipc_v3.c - Timestamp-Indexed CUDA IPC Ring Buffers (G1A)
+ *
+ * Slot addressing:  slot_idx = (ts / SPP) % DEPTH
+ * Epoch validity:   epoch    = (ts / SPP) / DEPTH + 1   (1-based, 0=empty)
+ *
+ * Write order: cudaMemcpy H2D → metadata → atomic_store(epoch, RELEASE) → latest_write_ts
+ * Read order:  atomic_load(epoch, ACQUIRE) → validate → cudaMemcpy D2H → epoch re-check
+ */
+
+#include "gpu_ipc_v3.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sched.h>
+
+/* ── CUDA types & function pointers (dlopen, no build-time dep) ── */
+
+typedef int cudaError_t;
+#define cudaSuccess 0
+#define cudaMemcpyHostToDevice   1
+#define cudaMemcpyDeviceToHost   2
+#define cudaIpcMemLazyEnablePeerAccess 1
+
+typedef struct { char reserved[GPU_IPC_V3_HANDLE_SIZE]; } cudaIpcMemHandle_t;
+
+typedef cudaError_t (*fn_cudaMemcpy)(void *, const void *, size_t, int);
+typedef cudaError_t (*fn_cudaIpcOpenMemHandle)(void **, cudaIpcMemHandle_t, unsigned int);
+typedef cudaError_t (*fn_cudaIpcCloseMemHandle)(void *);
+typedef cudaError_t (*fn_cudaSetDevice)(int);
+typedef const char* (*fn_cudaGetErrorString)(cudaError_t);
+
+static fn_cudaMemcpy            p_cudaMemcpy;
+static fn_cudaIpcOpenMemHandle  p_cudaIpcOpenMemHandle;
+static fn_cudaIpcCloseMemHandle p_cudaIpcCloseMemHandle;
+static fn_cudaSetDevice         p_cudaSetDevice;
+static fn_cudaGetErrorString    p_cudaGetErrorString;
+
+#define LOG_V3(fmt, ...) fprintf(stderr, "[GPU_IPC_V3] " fmt "\n", ##__VA_ARGS__)
+
+/* ── SHM pointer helpers ── */
+
+static inline volatile int32_t  *shm_i32(char *b, int off) { return (volatile int32_t  *)(b + off); }
+static inline volatile uint32_t *shm_u32(char *b, int off) { return (volatile uint32_t *)(b + off); }
+static inline volatile uint64_t *shm_u64(char *b, int off) { return (volatile uint64_t *)(b + off); }
+
+/* ── Slot helpers ── */
+
+static inline int slot_meta_off(int ring_base, int slot_idx) {
+    return ring_base + _V3_RING_OFF_SLOTS + slot_idx * _V3_SLOT_META_SIZE;
+}
+
+static inline uint32_t ts_to_slot_idx(uint64_t ts, int spp) {
+    return (uint32_t)(ts / spp) & GPU_IPC_V3_RING_MASK;
+}
+
+static inline uint32_t ts_to_epoch(uint64_t ts, int spp) {
+    return (uint32_t)((ts / spp) / GPU_IPC_V3_RING_DEPTH) + 1;
+}
+
+/* ── CUDA runtime loading ── */
+
+static int load_cuda_runtime_v3(gpu_ipc_v3_ctx_t *ctx)
+{
+    const char *libs[] = { "libcudart.so", "libcudart.so.12", "libcudart.so.11", NULL };
+    for (int i = 0; libs[i]; i++) {
+        ctx->cuda_lib = dlopen(libs[i], RTLD_LAZY);
+        if (ctx->cuda_lib) { LOG_V3("Loaded %s", libs[i]); break; }
+    }
+    if (!ctx->cuda_lib) { LOG_V3("Failed to load libcudart: %s", dlerror()); return -1; }
+
+#define LOAD(name) do { \
+    p_##name = (fn_##name)dlsym(ctx->cuda_lib, #name); \
+    if (!p_##name) { LOG_V3("dlsym(%s) failed", #name); dlclose(ctx->cuda_lib); ctx->cuda_lib = NULL; return -1; } \
+} while(0)
+    LOAD(cudaMemcpy);
+    LOAD(cudaIpcOpenMemHandle);
+    LOAD(cudaIpcCloseMemHandle);
+    LOAD(cudaSetDevice);
+    LOAD(cudaGetErrorString);
+#undef LOAD
+
+    cudaError_t err = p_cudaSetDevice(0);
+    if (err != cudaSuccess) {
+        LOG_V3("cudaSetDevice(0) failed: %s", p_cudaGetErrorString(err));
+        dlclose(ctx->cuda_lib); ctx->cuda_lib = NULL; return -1;
+    }
+    return 0;
+}
+
+static void *open_handle_at(gpu_ipc_v3_ctx_t *ctx, int offset, const char *name)
+{
+    cudaIpcMemHandle_t handle;
+    memcpy(handle.reserved, ctx->shm_raw + offset, GPU_IPC_V3_HANDLE_SIZE);
+    void *ptr = NULL;
+    cudaError_t err = p_cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess);
+    if (err != cudaSuccess) {
+        LOG_V3("cudaIpcOpenMemHandle(%s) failed: %s", name, p_cudaGetErrorString(err));
+        return NULL;
+    }
+    LOG_V3("CLIENT: opened %s (ptr=%p)", name, ptr);
+    return ptr;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Initialization
+ * ══════════════════════════════════════════════════════════════════ */
+
+int gpu_ipc_v3_init(gpu_ipc_v3_ctx_t *ctx, gpu_ipc_v3_role_t role, int ue_idx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->role   = role;
+    ctx->ue_idx = ue_idx;
+    ctx->shm_fd = -1;
+
+    if (load_cuda_runtime_v3(ctx) != 0) return -1;
+
+    struct stat st;
+    if (stat(GPU_IPC_V3_SHM_DIR, &st) != 0)
+        if (mkdir(GPU_IPC_V3_SHM_DIR, 0777) != 0 && errno != EEXIST)
+            { LOG_V3("mkdir failed: %s", strerror(errno)); return -1; }
+
+    int wait = 0;
+    while (access(GPU_IPC_V3_SHM_PATH, F_OK) != 0) {
+        usleep(10000);
+        if (++wait > 3000) { LOG_V3("timeout waiting for shm (30s)"); return -1; }
+    }
+
+    ctx->shm_fd = open(GPU_IPC_V3_SHM_PATH, O_RDWR, 0666);
+    if (ctx->shm_fd < 0)
+        { LOG_V3("open failed: %s", strerror(errno)); return -1; }
+
+    if (ftruncate(ctx->shm_fd, GPU_IPC_V3_SHM_SIZE) != 0)
+        { LOG_V3("ftruncate failed: %s", strerror(errno)); close(ctx->shm_fd); return -1; }
+
+    ctx->shm_raw = (char *)mmap(NULL, GPU_IPC_V3_SHM_SIZE,
+                                PROT_READ | PROT_WRITE, MAP_SHARED,
+                                ctx->shm_fd, 0);
+    if (ctx->shm_raw == MAP_FAILED)
+        { LOG_V3("mmap failed: %s", strerror(errno)); close(ctx->shm_fd); return -1; }
+
+    LOG_V3("CLIENT(%s idx=%d): waiting for server...",
+           role == GPU_IPC_V3_ROLE_GNB ? "gNB" : "UE", ue_idx);
+    wait = 0;
+    while (*shm_u32(ctx->shm_raw, _V3_OFF_MAGIC) != GPU_IPC_V3_MAGIC) {
+        usleep(10000);
+        if (++wait > 3000) { LOG_V3("timeout waiting for magic (30s)"); return -1; }
+    }
+
+    uint32_t ver = *shm_u32(ctx->shm_raw, _V3_OFF_VERSION);
+    if (ver != GPU_IPC_V3_VERSION) {
+        LOG_V3("version mismatch (got %u, expected %u)", ver, GPU_IPC_V3_VERSION);
+        return -1;
+    }
+
+    ctx->buf_size         = *shm_u32(ctx->shm_raw, _V3_OFF_BUF_SIZE);
+    ctx->num_ues          = *shm_u32(ctx->shm_raw, _V3_OFF_NUM_UES);
+    ctx->ring_depth       = *shm_u32(ctx->shm_raw, _V3_OFF_RING_DEPTH);
+    ctx->samples_per_slot = *shm_u32(ctx->shm_raw, _V3_OFF_SPP);
+
+    if (ctx->ring_depth != GPU_IPC_V3_RING_DEPTH) {
+        LOG_V3("ring_depth mismatch (shm=%d, compiled=%d)",
+               ctx->ring_depth, GPU_IPC_V3_RING_DEPTH);
+        return -1;
+    }
+
+    LOG_V3("CLIENT: server ready (ues=%d, buf=%zu, depth=%d, spp=%d)",
+           ctx->num_ues, ctx->buf_size, ctx->ring_depth, ctx->samples_per_slot);
+
+    if (role == GPU_IPC_V3_ROLE_GNB) {
+        ctx->gpu_dl_tx = open_handle_at(ctx, _V3_OFF_DL_TX_HANDLE, "dl_tx");
+        ctx->gpu_ul_rx = open_handle_at(ctx, _V3_OFF_UL_RX_HANDLE, "ul_rx");
+        if (!ctx->gpu_dl_tx || !ctx->gpu_ul_rx) return -1;
+    } else {
+        if (ue_idx < 0 || ue_idx >= (int)ctx->num_ues) {
+            LOG_V3("ue_idx=%d out of range (num_ues=%d)", ue_idx, ctx->num_ues);
+            return -1;
+        }
+        char label[32];
+        snprintf(label, sizeof(label), "dl_rx[%d]", ue_idx);
+        ctx->gpu_dl_rx = open_handle_at(ctx,
+            _V3_OFF_DL_RX_HANDLES + ue_idx * GPU_IPC_V3_HANDLE_SIZE, label);
+        snprintf(label, sizeof(label), "ul_tx[%d]", ue_idx);
+        ctx->gpu_ul_tx = open_handle_at(ctx,
+            _V3_OFF_UL_TX_HANDLES + ue_idx * GPU_IPC_V3_HANDLE_SIZE, label);
+        if (!ctx->gpu_dl_rx || !ctx->gpu_ul_tx) return -1;
+    }
+
+    ctx->initialized = 1;
+    LOG_V3("CLIENT(%s idx=%d): init complete",
+           role == GPU_IPC_V3_ROLE_GNB ? "gNB" : "UE", ue_idx);
+    return 0;
+}
+
+void gpu_ipc_v3_cleanup(gpu_ipc_v3_ctx_t *ctx)
+{
+    if (!ctx->initialized) return;
+    if (ctx->gpu_dl_tx) p_cudaIpcCloseMemHandle(ctx->gpu_dl_tx);
+    if (ctx->gpu_ul_rx) p_cudaIpcCloseMemHandle(ctx->gpu_ul_rx);
+    if (ctx->gpu_dl_rx) p_cudaIpcCloseMemHandle(ctx->gpu_dl_rx);
+    if (ctx->gpu_ul_tx) p_cudaIpcCloseMemHandle(ctx->gpu_ul_tx);
+    if (ctx->shm_raw && ctx->shm_raw != MAP_FAILED)
+        munmap(ctx->shm_raw, GPU_IPC_V3_SHM_SIZE);
+    if (ctx->shm_fd >= 0) close(ctx->shm_fd);
+    if (ctx->cuda_lib) dlclose(ctx->cuda_lib);
+    ctx->initialized = 0;
+    LOG_V3("CLIENT(%s idx=%d): cleanup done",
+           ctx->role == GPU_IPC_V3_ROLE_GNB ? "gNB" : "UE", ctx->ue_idx);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Internal: timestamp-indexed write
+ * ══════════════════════════════════════════════════════════════════ */
+
+static int v3_write(gpu_ipc_v3_ctx_t *ctx, int ring_off, void *gpu_base,
+                    const void *samples, int nsamps, int nbAnt, uint64_t timestamp)
+{
+    size_t data_size = (size_t)nsamps * nbAnt * 4;
+    if (data_size > ctx->buf_size) {
+        LOG_V3("write: data_size %zu > slot_size %zu", data_size, ctx->buf_size);
+        return GPU_IPC_V3_ERROR;
+    }
+
+    int spp = ctx->samples_per_slot;
+    uint32_t slot_idx = ts_to_slot_idx(timestamp, spp);
+    uint32_t epoch    = ts_to_epoch(timestamp, spp);
+
+    void *dst = (char *)gpu_base + (size_t)slot_idx * ctx->buf_size;
+
+    cudaError_t err = p_cudaMemcpy(dst, samples, data_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        LOG_V3("write H2D failed: %s", p_cudaGetErrorString(err));
+        return GPU_IPC_V3_ERROR;
+    }
+
+    int meta = slot_meta_off(ring_off, slot_idx);
+    *shm_u64(ctx->shm_raw, meta + _V3_SLOT_OFF_TS)     = timestamp;
+    *shm_i32(ctx->shm_raw, meta + _V3_SLOT_OFF_NSAMPS)  = nsamps;
+    *shm_i32(ctx->shm_raw, meta + _V3_SLOT_OFF_NBANT)   = nbAnt;
+    *shm_i32(ctx->shm_raw, meta + _V3_SLOT_OFF_DSIZE)   = (int32_t)data_size;
+
+    __atomic_store_n(shm_u32(ctx->shm_raw, meta + _V3_SLOT_OFF_EPOCH),
+                     epoch, __ATOMIC_RELEASE);
+
+    *shm_u64(ctx->shm_raw, ring_off + _V3_RING_OFF_LATEST_TS) = timestamp;
+
+    return nsamps;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Internal: timestamp-indexed read (with seqlock double-check)
+ * ══════════════════════════════════════════════════════════════════ */
+
+static int v3_read(gpu_ipc_v3_ctx_t *ctx, int ring_off, void *gpu_base,
+                   void *samples, int nsamps, int nbAnt, uint64_t target_ts)
+{
+    int spp = ctx->samples_per_slot;
+    uint32_t slot_idx       = ts_to_slot_idx(target_ts, spp);
+    uint32_t expected_epoch  = ts_to_epoch(target_ts, spp);
+
+    int meta = slot_meta_off(ring_off, slot_idx);
+
+    uint32_t epoch = __atomic_load_n(shm_u32(ctx->shm_raw, meta + _V3_SLOT_OFF_EPOCH),
+                                     __ATOMIC_ACQUIRE);
+
+    if (epoch == 0 || epoch < expected_epoch)
+        return GPU_IPC_V3_EMPTY;
+
+    if (epoch > expected_epoch)
+        return GPU_IPC_V3_OVERWRITTEN;
+
+    size_t want  = (size_t)nsamps * nbAnt * 4;
+    int32_t avail = *shm_i32(ctx->shm_raw, meta + _V3_SLOT_OFF_DSIZE);
+    size_t copy  = (size_t)avail < want ? (size_t)avail : want;
+
+    if (copy < want)
+        memset(samples, 0, want);
+
+    void *src = (char *)gpu_base + (size_t)slot_idx * ctx->buf_size;
+
+    cudaError_t err = p_cudaMemcpy(samples, src, copy, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        LOG_V3("read D2H failed: %s", p_cudaGetErrorString(err));
+        return GPU_IPC_V3_ERROR;
+    }
+
+    uint32_t epoch_after = __atomic_load_n(
+        shm_u32(ctx->shm_raw, meta + _V3_SLOT_OFF_EPOCH), __ATOMIC_ACQUIRE);
+    if (epoch_after != expected_epoch)
+        return GPU_IPC_V3_OVERWRITTEN;
+
+    *shm_u64(ctx->shm_raw, ring_off + _V3_RING_OFF_CONSUMER_TS) = target_ts;
+
+    return nsamps;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Public API: gNB DL write
+ * ══════════════════════════════════════════════════════════════════ */
+
+int gpu_ipc_v3_dl_write(gpu_ipc_v3_ctx_t *ctx, const void *samples,
+                        int nsamps, int nbAnt, uint64_t timestamp)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V3_ROLE_GNB)
+        return GPU_IPC_V3_ERROR;
+    return v3_write(ctx, _V3_OFF_DL_TX_RING, ctx->gpu_dl_tx,
+                    samples, nsamps, nbAnt, timestamp);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Public API: UE DL read
+ * ══════════════════════════════════════════════════════════════════ */
+
+int gpu_ipc_v3_dl_read(gpu_ipc_v3_ctx_t *ctx, void *samples,
+                       int nsamps, int nbAnt, uint64_t target_ts)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V3_ROLE_UE)
+        return GPU_IPC_V3_ERROR;
+    int roff = _V3_OFF_DL_RX_RINGS + ctx->ue_idx * _V3_RING_CTRL_SIZE;
+    return v3_read(ctx, roff, ctx->gpu_dl_rx, samples, nsamps, nbAnt, target_ts);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Public API: UE UL write
+ * ══════════════════════════════════════════════════════════════════ */
+
+int gpu_ipc_v3_ul_write(gpu_ipc_v3_ctx_t *ctx, const void *samples,
+                        int nsamps, int nbAnt, uint64_t timestamp)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V3_ROLE_UE)
+        return GPU_IPC_V3_ERROR;
+    int roff = _V3_OFF_UL_TX_RINGS + ctx->ue_idx * _V3_RING_CTRL_SIZE;
+    return v3_write(ctx, roff, ctx->gpu_ul_tx, samples, nsamps, nbAnt, timestamp);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Public API: gNB UL read
+ * ══════════════════════════════════════════════════════════════════ */
+
+int gpu_ipc_v3_ul_read(gpu_ipc_v3_ctx_t *ctx, void *samples,
+                       int nsamps, int nbAnt, uint64_t target_ts)
+{
+    if (!ctx->initialized || ctx->role != GPU_IPC_V3_ROLE_GNB)
+        return GPU_IPC_V3_ERROR;
+    return v3_read(ctx, _V3_OFF_UL_RX_RING, ctx->gpu_ul_rx,
+                   samples, nsamps, nbAnt, target_ts);
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Convenience: latest_write_ts queries
+ * ══════════════════════════════════════════════════════════════════ */
+
+uint64_t gpu_ipc_v3_dl_latest_ts(gpu_ipc_v3_ctx_t *ctx)
+{
+    if (!ctx->initialized) return 0;
+    if (ctx->role == GPU_IPC_V3_ROLE_GNB) {
+        return *shm_u64(ctx->shm_raw, _V3_OFF_DL_TX_RING + _V3_RING_OFF_LATEST_TS);
+    } else {
+        int roff = _V3_OFF_DL_RX_RINGS + ctx->ue_idx * _V3_RING_CTRL_SIZE;
+        return *shm_u64(ctx->shm_raw, roff + _V3_RING_OFF_LATEST_TS);
+    }
+}
+
+uint64_t gpu_ipc_v3_ul_latest_ts(gpu_ipc_v3_ctx_t *ctx)
+{
+    if (!ctx->initialized) return 0;
+    if (ctx->role == GPU_IPC_V3_ROLE_GNB) {
+        return *shm_u64(ctx->shm_raw, _V3_OFF_UL_RX_RING + _V3_RING_OFF_LATEST_TS);
+    } else {
+        int roff = _V3_OFF_UL_TX_RINGS + ctx->ue_idx * _V3_RING_CTRL_SIZE;
+        return *shm_u64(ctx->shm_raw, roff + _V3_RING_OFF_LATEST_TS);
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Convenience: consumer_ts queries
+ * ══════════════════════════════════════════════════════════════════ */
+
+uint64_t gpu_ipc_v3_dl_consumer_ts(gpu_ipc_v3_ctx_t *ctx)
+{
+    if (!ctx->initialized) return 0;
+    if (ctx->role == GPU_IPC_V3_ROLE_GNB) {
+        return *shm_u64(ctx->shm_raw, _V3_OFF_DL_TX_RING + _V3_RING_OFF_CONSUMER_TS);
+    } else {
+        int roff = _V3_OFF_DL_RX_RINGS + ctx->ue_idx * _V3_RING_CTRL_SIZE;
+        return *shm_u64(ctx->shm_raw, roff + _V3_RING_OFF_CONSUMER_TS);
+    }
+}
+
+uint64_t gpu_ipc_v3_ul_consumer_ts(gpu_ipc_v3_ctx_t *ctx)
+{
+    if (!ctx->initialized) return 0;
+    if (ctx->role == GPU_IPC_V3_ROLE_GNB) {
+        return *shm_u64(ctx->shm_raw, _V3_OFF_UL_RX_RING + _V3_RING_OFF_CONSUMER_TS);
+    } else {
+        int roff = _V3_OFF_UL_TX_RINGS + ctx->ue_idx * _V3_RING_CTRL_SIZE;
+        return *shm_u64(ctx->shm_raw, roff + _V3_RING_OFF_CONSUMER_TS);
+    }
+}

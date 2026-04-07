@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""
+Sionna_channel_mockup.py  –  gNB ↔ UE IQ 바이패스 프록시
+========================================================
+- gNB : TCP 6017  (client‑mode 연결)
+- UE  : TCP 6018  (listener, 다중 UE)
+
+핸드셰이크 블록은 gNB 가 보내는 size=1 블록을 그대로 캐시‑중계하며,
+프록시가 임의 timestamp 를 만들지 **않습니다**.
+"""
+
+from __future__ import annotations
+import argparse, selectors, socket, struct, time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+###############################################################################
+# Header / IQ helpers (OAI rfsimulator 호환)
+###############################################################################
+HDR_FMT_LE = "<I I Q I I"          # (size, nbAnt, ts, opt_val, opt_flag)
+HDR_FMT_BE = ">I I Q I I"
+HDR_LEN = struct.calcsize(HDR_FMT_LE)
+
+def unpack_header(b: bytes, *, be=False) -> Tuple[int, int, int]:
+    size, nb_ant, ts, *_ = struct.unpack(HDR_FMT_BE if be else HDR_FMT_LE, b)
+    return size, nb_ant, ts
+
+###############################################################################
+# 로깅
+###############################################################################
+LVL = {"error":0, "warn":1, "info":2, "debug":3}
+_cur = 2
+def log(l:str, msg:str):
+    if LVL[l] <= _cur:
+        print(f"[{l.upper()}] {msg}")
+
+###############################################################################
+# 디버그 덤프 ---------------------------------------------------------------
+###############################################################################
+SHOW = 30720   # IQ 샘플 몇 개까지 보여줄지
+
+def _dump(tag:str, hdr:Tuple[int,int,int], payload:bytes, *, be=False):
+    size, nb, ts = hdr
+    lines = [f"[{tag}] size={size} nbAnt={nb} ts={ts}"]
+    fmt = ">hh" if be else "<hh"
+    sample_cnt = min(size*nb, SHOW)
+    for k in range(sample_cnt):
+        r, i = struct.unpack_from(fmt, payload, k*4)
+        lines.append(f"  s{k:02d}: {r:+6d} {i:+6d}")
+    print("\n".join(lines))
+
+###############################################################################
+# Endpoint
+###############################################################################
+@dataclass
+class Endpoint:
+    sock:  socket.socket
+    role:  str                     # "gNB" | "UE"
+    be:    bool
+    rx:    bytearray = field(default_factory=bytearray)
+
+    stage:      str = "hdr"        # 진행 단계
+    pay_len:    int = 0
+    hdr_raw:    bytes = b""
+    hdr_vals:   Tuple[int,int,int] | None = None
+    closed:     bool = False
+
+    def fileno(self): return self.sock.fileno()
+
+    def close(self):
+        if self.closed: return
+        self.closed = True
+        try: self.sock.close()
+        finally: log("info", f"{self.role} closed")
+
+    # ------------------------------------------------------------------
+    def read_blocks(self) -> List[Tuple[bytes, Tuple[int,int,int], bytes]]:
+        blocks = []
+        try:
+            chunk = self.sock.recv(65536)
+        except BlockingIOError:
+            return blocks
+        except OSError:
+            self.close(); return blocks
+
+        if not chunk:               # clean close
+            self.close(); return blocks
+        self.rx.extend(chunk)
+
+        while True:
+            # ── header 단계 ─────────────────────────────────────────
+            if self.stage == "hdr":
+                if len(self.rx) < HDR_LEN: break
+                self.hdr_raw = bytes(self.rx[:HDR_LEN]); del self.rx[:HDR_LEN]
+                size, nb, ts = unpack_header(self.hdr_raw, be=self.be)
+                self.hdr_vals = (size, nb, ts)
+                self.pay_len  = size * nb * 4
+                self.stage    = "pay"
+            # ── payload 단계 ───────────────────────────────────────
+            if self.stage == "pay":
+                if len(self.rx) < self.pay_len: break
+                payload = bytes(self.rx[:self.pay_len]); del self.rx[:self.pay_len]
+                blocks.append((self.hdr_raw, self.hdr_vals, payload))
+                # next block 초기화
+                self.stage   = "hdr"
+                self.hdr_raw = b""
+                self.hdr_vals = None
+                self.pay_len = 0
+        return blocks
+
+    # ------------------------------------------------------------------
+    def send(self, hdr:bytes, payload:bytes):
+        try: self.sock.sendall(hdr + payload)
+        except OSError: self.close()
+
+###############################################################################
+# Proxy
+###############################################################################
+class Proxy:
+    def __init__(self, ue_port:int, gnb_host:str, gnb_port:int, log_level:str):
+        global _cur; _cur = LVL.get(log_level, 2)
+
+        self.sel = selectors.DefaultSelector()
+
+        # UE listener
+        self.lis = socket.socket()
+        self.lis.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.lis.bind(("0.0.0.0", ue_port))
+        self.lis.listen()
+        self.lis.setblocking(False)
+        self.sel.register(self.lis, selectors.EVENT_READ, data="UE_LIS")
+        log("info", f"UE listen 0.0.0.0:{ue_port}")
+
+        # gNB
+        self.gnb_host, self.gnb_port = gnb_host, gnb_port
+        self.gnb_ep: Optional[Endpoint] = None
+
+        # UE set
+        self.ues: Dict[int, Endpoint] = {}
+
+        # cached handshake (hdr, payload)
+        self.gnb_hshake: Optional[Tuple[bytes,bytes]] = None
+
+    # ------------------------------------------------------------------
+    def connect_gnb(self):
+        try:
+            s = socket.create_connection((self.gnb_host, self.gnb_port), timeout=5)
+            s.setblocking(False)
+            self.gnb_ep = Endpoint(s, "gNB", False)
+            self.sel.register(s, selectors.EVENT_READ, data=self.gnb_ep)
+            log("info", f"gNB connected {self.gnb_host}:{self.gnb_port}")
+        except OSError as e:
+            log("warn", f"gNB connect fail: {e}")
+
+    # ------------------------------------------------------------------
+    def _reconnect_gnb_if_needed(self):
+        if self.gnb_ep and not self.gnb_ep.closed:
+            return
+        # 정리
+        if self.gnb_ep:
+            try: self.sel.unregister(self.gnb_ep.sock)
+            except: pass
+            self.gnb_ep = None
+        self.connect_gnb()
+
+    # ------------------------------------------------------------------
+    def _accept_ue(self):
+        try:
+            c, addr = self.lis.accept(); c.setblocking(False)
+        except OSError:
+            return
+        ue = Endpoint(c, "UE", False)
+        self.ues[ue.fileno()] = ue
+        self.sel.register(c, selectors.EVENT_READ, data=ue)
+        log("info", f"UE joined {addr}")
+        # 이미 캐시된 handshake 있으면 즉시 전달
+        if self.gnb_hshake:
+            h, p = self.gnb_hshake
+            ue.send(h, p)
+            _dump("TX gNB→UE (cached‑HS)", unpack_header(h), p)
+
+    # ------------------------------------------------------------------
+    def _handle_ep(self, ep:Endpoint):
+        for hdr_raw, hdr_vals, payload in ep.read_blocks():
+            direction = "gNB" if ep.role == "gNB" else "UE"
+            _dump(f"RX {direction}", hdr_vals, payload)
+
+            if ep.role == "gNB":             # ───── gNB → UE들
+                size, *_ = hdr_vals
+                if size == 1:                # handshake
+                    self.gnb_hshake = (hdr_raw, payload)
+                    log("info", f"cache handshake ts={hdr_vals[2]}")
+                # fan‑out
+                for u in list(self.ues.values()):
+                    if u.closed: continue
+                    u.send(hdr_raw, payload)
+                    _dump("TX gNB→UE", hdr_vals, payload)
+            else:                            # ───── UE → gNB
+                if self.gnb_ep and not self.gnb_ep.closed:
+                    self.gnb_ep.send(hdr_raw, payload)
+                    _dump("TX UE→gNB", hdr_vals, payload)
+
+    # ------------------------------------------------------------------
+    def run(self):
+        self.connect_gnb()
+        try:
+            while True:
+                for key, _ in self.sel.select(0.5):
+                    if key.data == "UE_LIS":
+                        self._accept_ue()
+                    else:
+                        self._handle_ep(key.data)
+                self._reconnect_gnb_if_needed()
+        except KeyboardInterrupt:
+            log("info", "terminated by Ctrl‑C")
+
+###############################################################################
+# CLI
+###############################################################################
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ue-port",  type=int, default=6018)
+    ap.add_argument("--gnb-host", default="127.0.0.1")
+    ap.add_argument("--gnb-port", type=int, default=6017)
+    ap.add_argument("--log", choices=["error","warn","info","debug"], default="info")
+    args = ap.parse_args()
+
+    Proxy(args.ue_port, args.gnb_host, args.gnb_port, args.log).run()
+
+if __name__ == "__main__":
+    main()

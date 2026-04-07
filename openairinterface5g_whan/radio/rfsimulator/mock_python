@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""Sionna_channel_mockup.py
+=====================================================================
+OAI ↔ Sionna 다이렉트 IQ 프록시 (mock_channel.c 완전 대체판)
+
+이 스크립트는 OAI rfsimulator 의 소켓 프로토콜(`samplesBlockHeader_t`)
+과 호환되는 **바이패스 채널 브리지**입니다. gNB 포트(기본 6017)와
+UE 포트(기본 6018)를 동시에 listen 하여 각 측이 접속하면 자동으로
+세션을 매칭하고, I/Q 블록을 그대로 전달합니다. 다중 UE(최대 250)
+를 지원하며, 연결 끊김 후 재접속도 처리합니다.
+
+👉 **업데이트 (bidirectional 보장 & gNB/UE 접속 순서 무관)**
+- gNB/UE 어느 쪽이 먼저 접속해도 자동 페어링.
+- gNB 재접속 시 모든 기존 UE 재매칭 + 핸드셰이크 재전송.
+- 두 포트(6017/6018) 모두 송신·수신(full‑duplex) 가능한지 검사하는
+  자체 loopback self‑test 옵션 추가(`--self-test`).
+- 종료 시 소켓 정리 확실.
+
+본 버전은 사용자 요청으로 **입력 파라미터를 명령행에서 지정**할 수
+있도록 했습니다. 환경변수도 fallback 으로 지원합니다.
+
+---------------------------------------------------------------------
+주요 특징
+---------------------------------------------------------------------
+* OAI `samplesBlockHeader_t` (size=샘플수, nbAnt, timestamp)와 호환.
+* Little‑endian 기본. `--big-endian` 지정 시 big‑endian 해석.
+* 다중 UE 지원 (1:gNB ↔ N:UE). gNB는 단일 인스턴스로 가정.
+* 비‑블로킹 소켓 + `selectors` 기반 이벤트 루프.
+* 자동 핸드셰이크 (1 샘플, 1 안테나 BLK) + 옵션으로 비활성화.
+* 재접속/세션 재매칭. 끊긴 UE는 자동 제거, 새 UE 접속 허용.
+* 선택적 지연/패킷 드롭/샘플 드롭 삽입 (테스트용) 옵션.
+* 상세 로그 레벨 제어.
+* **Self‑test 모드**: 프록시 혼자 실행한 뒤 로컬 루프백 연결을 만들어
+  6017↔6018 모두 송수신 검증.
+
+---------------------------------------------------------------------
+사용 예시
+---------------------------------------------------------------------
+# 기본 (localhost, 포트 6017/6018, 자동 핸드셰이크, 로그 info)
+python3 Sionna_channel_mockup.py
+
+# 다른 호스트 포트, 디버그, 핸드셰이크 비활성, 인위적 3ms 지연
+python3 Sionna_channel_mockup.py \
+    --ue-host 0.0.0.0 --ue-port 7000 \
+    --gnb-host 0.0.0.0 --gnb-port 7001 \
+    --no-handshake --delay-ms 3 --log debug
+
+# 환경변수로도 설정 가능 (CLI 우선)
+export SIONNA_CH_UE_HOST=0.0.0.0
+export SIONNA_CH_UE_PORT=6018
+python3 Sionna_channel_mockup.py
+
+---------------------------------------------------------------------
+주의
+---------------------------------------------------------------------
+* "완벽한" 호환성을 위해서는 OAI 측의 struct 정렬이 "리틀엔디언 +
+  2바이트 패딩"이라는 가정이 맞아야 합니다. 필요 시
+  `--strict-oai`로 정확한 패딩을 강제하고, 그렇지 않으면 유연 파싱.
+* gNB 다중 인스턴스를 지원하지 않습니다(보통 하나). 여러 gNB가 동일
+  포트로 접속하면 첫 연결만 사용.
+
+---------------------------------------------------------------------
+라이선스: 연구용 예제. 필요 시 프로젝트 라이선스 조정.
+"""
+
+from __future__ import annotations
+import argparse
+import os
+import selectors
+import socket
+import struct
+import sys
+import threading
+import time
+import traceback
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional, Tuple
+
+###############################################################################
+# OAI samplesBlockHeader_t 호환 유틸
+###############################################################################
+# OAI C 코드상
+#   typedef struct {
+#       uint32_t size;      // number of samples
+#       uint16_t nbAnt;     // number of antennas
+#       /* padding 2 bytes (ABI) */
+#       uint64_t timestamp; // openair0_timestamp
+#   } samplesBlockHeader_t;  // likely 16 bytes on LP64
+# 네트워크 전송은 이 struct 메모리 그대로 write()됨.
+#
+# 아래는 little‑endian 기준 직렬화. padding=0x0000.
+###############################################################################
+
+HDR_FMT_LE = "<I I Q I I"   # 4 + 4 + 8 + 4 + 4 = 24 B
+HDR_FMT_BE = ">I I Q I I"
+HDR_LEN = struct.calcsize(HDR_FMT_LE)  # 24
+
+
+def pack_header(size_samps: int, nb_ant: int, ts: int, *, big_endian: bool = False) -> bytes:
+    fmt = HDR_FMT_BE if big_endian else HDR_FMT_LE
+    return struct.pack(fmt, size_samps, nb_ant, ts, 0, 0)  # option_value=0, option_flag=0
+
+
+def unpack_header(b: bytes, *, big_endian: bool = False) -> Tuple[int, int, int]:
+    if len(b) != HDR_LEN:
+        raise ValueError(f"header length {len(b)} != {HDR_LEN}")
+    fmt = HDR_FMT_BE if big_endian else HDR_FMT_LE
+    size_samps, nb_ant, ts, _opt_val, _opt_flag = struct.unpack(fmt, b)
+    return size_samps, nb_ant, ts
+
+###############################################################################
+# IQ 샘플 직렬화 (int16 complex)  = c16_t in OAI
+###############################################################################
+# OAI `c16_t` = struct { int16_t r; int16_t i; } (2*16bit)
+# 네트워크 전송 시 안테나 인덱스가 가장 안쪽 차원 (sample-major, ant-major?)
+# rfsimulator_write() 에서 멀티안테나의 경우 tmpSamples[s][a] 순서로 직렬화.
+# 즉, [s0_ant0, s0_ant1, ..., s1_ant0, s1_ant1, ...]
+###############################################################################
+
+IQ_FMT_LE = "<h"  # we will build dynamically; struct per value is slower → use memoryview
+
+
+def pack_iq(iq_list: List[Tuple[int, int]], *, big_endian: bool = False) -> bytes:
+    fmt = ">hh" if big_endian else "<hh"
+    out = bytearray(len(iq_list) * 4)
+    off = 0
+    for r, im in iq_list:
+        struct.pack_into(fmt, out, off, int(r), int(im))
+        off += 4
+    return bytes(out)
+
+
+def unpack_iq(payload: bytes, *, big_endian: bool = False) -> List[Tuple[int, int]]:
+    fmt = ">hh" if big_endian else "<hh"
+    rec_sz = 4
+    nrec = len(payload) // rec_sz
+    out: List[Tuple[int, int]] = []
+    off = 0
+    for _ in range(nrec):
+        r, im = struct.unpack_from(fmt, payload, off)
+        out.append((r, im))
+        off += rec_sz
+    return out
+
+###############################################################################
+# 로깅
+###############################################################################
+LOG_LEVELS = {"error": 0, "warn": 1, "info": 2, "debug": 3, "trace": 4}
+_current_log_level = LOG_LEVELS["info"]
+
+
+def set_log_level(name: str):
+    global _current_log_level
+    _current_log_level = LOG_LEVELS.get(name.lower(), 2)
+
+
+def log(level: str, msg: str):
+    if LOG_LEVELS[level] <= _current_log_level:
+        print(f"[{level.upper()}] {msg}")
+
+
+def hexdump(b: bytes, n=64) -> str:
+    return b[:n].hex(" ") + (" ..." if len(b) > n else "")
+
+###############################################################################
+# Endpoint / Session 자료구조
+###############################################################################
+
+ROLE_UE = "UE"
+ROLE_GNB = "gNB"
+
+
+def _sock_repr(sock: socket.socket) -> str:
+    try:
+        l = sock.getsockname()
+        r = sock.getpeername()
+        return f"{l}->{r}"
+    except Exception:
+        return f"fd={sock.fileno()}"
+
+
+@dataclass
+class Endpoint:
+    sock: socket.socket
+    role: str                        # ROLE_UE or ROLE_GNB
+    addr: Tuple[str, int]
+    big_endian: bool
+    rxbuf: bytearray = field(default_factory=bytearray)
+    expect: int = HDR_LEN            # bytes still to read for current stage
+    stage: str = "hdr"               # 'hdr' or 'pay'
+    cur_hdr: Optional[Tuple[int, int, int]] = None  # (size, nb_ant, ts)
+    pay_len: int = 0
+    last_ts: Optional[int] = None
+    closed: bool = False
+    # 타임스탬프 동기화를 위한 추가 필드
+    base_ts: Optional[int] = None    # 기준 타임스탬프
+    ts_offset: int = 0               # 타임스탬프 오프셋
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            log("info", f"{self.role} endpoint closed")
+
+    # 비‑블로킹 읽기. 데이터 일부만 올 수 있음. 완료된 블록이 있을 경우 리스트 반환.
+    def read_blocks(self) -> List[Tuple[bytes, Tuple[int, int, int], bytes]]:
+        blocks: List[Tuple[bytes, Tuple[int, int, int], bytes]] = []
+        if self.closed:
+            return blocks
+        try:
+            data = self.sock.recv(65536)
+        except BlockingIOError:
+            return blocks
+        except ConnectionResetError:
+            self.close(); return blocks
+        except OSError as e:
+            log("warn", f"{self.role} recv error: {e}"); self.close(); return blocks
+
+        if not data:
+            # peer clean close
+            self.close();
+            return blocks
+
+        self.rxbuf.extend(data)
+        # 파싱 루프
+        while True:
+            if self.stage == "hdr":
+                if len(self.rxbuf) < HDR_LEN:
+                    break
+                hdr_bytes = self.rxbuf[:HDR_LEN]
+                del self.rxbuf[:HDR_LEN]
+                self.cur_hdr = unpack_header(hdr_bytes, big_endian=self.big_endian)
+                size_samps, nb_ant, ts = self.cur_hdr
+                self.pay_len = size_samps * nb_ant * 4  # 4 bytes per c16_t sample
+                self.stage = "pay"
+                self._hdr_cache_bytes = hdr_bytes
+            if self.stage == "pay":
+                if len(self.rxbuf) < self.pay_len:
+                    break
+                pay_bytes = self.rxbuf[:self.pay_len]
+                del self.rxbuf[:self.pay_len]
+                hdr = self.cur_hdr
+                hdr_bytes = self._hdr_cache_bytes
+                blocks.append((hdr_bytes, hdr, pay_bytes))
+                self.stage = "hdr"
+                self.expect = HDR_LEN
+                self.cur_hdr = None
+        return blocks
+
+    def send_block(self, hdr_bytes: bytes, pay_bytes: bytes):
+        if self.closed:
+            return
+        try:
+            self.sock.sendall(hdr_bytes + pay_bytes)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            log("warn", f"{self.role} send error: {e}")
+            self.close()
+
+
+@dataclass
+class Session:
+    gnb: Endpoint
+    ue: Endpoint
+    handshake_done: bool = False
+
+###############################################################################
+# Proxy 서버 본체
+###############################################################################
+
+class ProxyServer:
+    def __init__(self,
+                 ue_host: str = "0.0.0.0",
+                 ue_port: int = 6018,
+                 gnb_host: str = "0.0.0.0",
+                 gnb_port: int = 6017,
+                 max_ues: int = 250,
+                 big_endian: bool = False,
+                 do_handshake: bool = True,
+                 handshake_ts: Optional[int] = None,
+                 delay_ms: float = 0.0,
+                 drop_pct: float = 0.0,
+                 log_level: str = "info",
+                 strict_oai: bool = False):
+        set_log_level(log_level)
+        self.ue_host = ue_host
+        self.ue_port = ue_port
+        self.gnb_host = gnb_host
+        self.gnb_port = gnb_port
+        self.max_ues = max_ues
+        self.big_endian = big_endian
+        self.do_handshake = do_handshake
+        self.handshake_ts = handshake_ts
+        self.delay_ms = delay_ms
+        self.drop_pct = drop_pct
+        self.strict_oai = strict_oai  # placeholder (미사용; 향후 struct verif)
+
+        self.sel = selectors.DefaultSelector()
+        self.listen_ue = self._make_listener(self.ue_host, self.ue_port)
+        self.sel.register(self.listen_ue, selectors.EVENT_READ, data=ROLE_UE)
+
+        self.gnb_ep: Optional[Endpoint] = None
+        self.ue_eps: Dict[int, Endpoint] = {}  # key=fileno
+        self.sessions: Dict[int, Session] = {}  # key=UE fileno
+
+    # ------------------------------------------------------------------
+    # Listener helper
+    # ------------------------------------------------------------------
+    def _make_listener(self, host: str, port: int) -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.listen()
+        s.setblocking(False)
+        log("info", f"Listening {host}:{port}")
+        return s
+
+    # ------------------------------------------------------------------
+    # Accept new connection
+    # ------------------------------------------------------------------
+    def _accept(self, listener: socket.socket, role: str):
+        try:
+            conn, addr = listener.accept()
+            conn.setblocking(False)
+        except Exception as e:
+            log("warn", f"accept error ({role}): {e}")
+            return
+        ep = Endpoint(conn, role, addr, self.big_endian)
+        self.sel.register(conn, selectors.EVENT_READ, data=ep)
+        if role == ROLE_UE:
+            if len(self.ue_eps) >= self.max_ues:
+                log("warn", f"UE limit {self.max_ues} reached; closing new UE {addr}")
+                ep.close()
+                return
+            self.ue_eps[ep.fileno()] = ep
+            log("info", f"UE connected from {addr} (total UE={len(self.ue_eps)})")
+        else:  # ROLE_GNB
+            self.gnb_ep = ep
+            log("info", f"gNB connected from {addr}")
+
+
+
+    # ------------------------------------------------------------------
+    # gNB 서버에 클라이언트로 연결
+    # ------------------------------------------------------------------
+    def _connect_to_gnb(self):
+        try:
+            gnb_sock = socket.create_connection((self.gnb_host, self.gnb_port), timeout=5)
+            gnb_sock.setblocking(False)
+            gnb_ep = Endpoint(gnb_sock, ROLE_GNB, (self.gnb_host, self.gnb_port), self.big_endian)
+            self.sel.register(gnb_sock, selectors.EVENT_READ, data=gnb_ep)
+            self.gnb_ep = gnb_ep
+            log("info", f"Connected to gNB server at {self.gnb_host}:{self.gnb_port}")
+            
+            # gNB 핸드셰이크는 이벤트 루프에서 처리 (gNB가 보낼 때까지 기다림)
+            return True
+        except Exception as e:
+            log("warn", f"Failed to connect to gNB at {self.gnb_host}:{self.gnb_port}: {e}")
+            return False
+
+
+
+    # ------------------------------------------------------------------
+    # Event loop
+    # ------------------------------------------------------------------
+    def run(self):
+        log("info", "Proxy event loop start")
+        # gNB 서버에 연결 시도
+        if not self._connect_to_gnb():
+            log("warn", "gNB not available, waiting for connection...")
+        try:
+            while True:
+                events = self.sel.select(timeout=0.5)
+                for key, mask in events:
+                    data = key.data
+                    if data == ROLE_UE:
+                        self._accept(self.listen_ue, ROLE_UE)
+                    else:
+                        ep: Endpoint = data
+                        self._on_endpoint_readable(ep)
+                # gNB 연결이 끊어졌으면 재연결 시도
+                if self.gnb_ep is None or self.gnb_ep.closed:
+                    if not self._connect_to_gnb():
+                        time.sleep(1)  # 재연결 실패시 1초 대기
+                self._gc_closed()
+        except KeyboardInterrupt:
+            log("info", "Proxy interrupted; shutting down")
+        finally:
+            self.close()
+
+    # ------------------------------------------------------------------
+    # Handle readable endpoint
+    # ------------------------------------------------------------------
+    def _on_endpoint_readable(self, ep: Endpoint):
+        # C mock_channel.c처럼 단순하게 raw 바이트 전달
+        try:
+            # 최대 8192 바이트씩 읽기 (C 버전과 동일)
+            data = ep.sock.recv(8192)
+        except BlockingIOError:
+            return
+        except ConnectionResetError:
+            ep.close()
+            return
+        except OSError as e:
+            log("warn", f"{ep.role} recv error: {e}")
+            ep.close()
+            return
+
+        if not data:
+            ep.close()
+            return
+            
+        # deliver blocks to peer(s) - C mock_channel.c처럼 단순하게 바이트 전달
+        if ep.role == ROLE_GNB:
+            # gNB로부터 받은 데이터를 모든 UE에게 그대로 전달
+            for ue_ep in list(self.ue_eps.values()):
+                if ue_ep.closed:
+                    continue
+                if self._maybe_drop():
+                    continue
+                self._maybe_delay()
+                try:
+                    ue_ep.sock.sendall(data)  # raw 바이트 그대로 전달
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    log("warn", f"UE send error: {e}")
+                    ue_ep.close()
+        else:  # from a UE
+            # UE로부터 받은 데이터를 gNB에게 그대로 전달
+            if self.gnb_ep and not self.gnb_ep.closed:
+                if self._maybe_drop():
+                    return
+                self._maybe_delay()
+                try:
+                    self.gnb_ep.sock.sendall(data)  # raw 바이트 그대로 전달
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    log("warn", f"gNB send error: {e}")
+                    self.gnb_ep.close()
+
+    # ------------------------------------------------------------------
+    # Delay / drop helpers (test channel impairments)
+    # ------------------------------------------------------------------
+    def _maybe_delay(self):
+        if self.delay_ms > 0.0:
+            time.sleep(self.delay_ms / 1000.0)
+
+    def _maybe_drop(self) -> bool:
+        if self.drop_pct <= 0.0:
+            return False
+        import random
+        return random.random() < (self.drop_pct / 100.0)
+
+    # ------------------------------------------------------------------
+    # Garbage collect closed endpoints & sessions
+    # ------------------------------------------------------------------
+    def _gc_closed(self):
+        # remove closed UE endpoints
+        for fd, ep in list(self.ue_eps.items()):
+            if ep.closed:
+                self._remove_endpoint(ep)
+        # remove closed gNB endpoint
+        if self.gnb_ep and self.gnb_ep.closed:
+            self._remove_endpoint(self.gnb_ep)
+            self.gnb_ep = None
+
+    def _remove_endpoint(self, ep: Endpoint):
+        try:
+            self.sel.unregister(ep.sock)
+        except Exception:
+            pass
+        ep.close()
+        if ep.role == ROLE_UE:
+            self.ue_eps.pop(ep.fileno(), None)
+            self.sessions.pop(ep.fileno(), None)
+        else:
+            if self.gnb_ep is ep:
+                self.gnb_ep = None
+            # clear all sessions referencing old gNB
+            for fd, sess in list(self.sessions.items()):
+                if sess.gnb is ep:
+                    self.sessions.pop(fd, None)
+
+    # ------------------------------------------------------------------
+    # Close everything
+    # ------------------------------------------------------------------
+    def close(self):
+        log("info", "Proxy shutting down")
+        try:
+            self.sel.unregister(self.listen_ue)
+        except Exception:
+            pass
+        try:
+            self.listen_ue.close()
+        except Exception:
+            pass
+        if self.gnb_ep:
+            self._remove_endpoint(self.gnb_ep)
+        for ep in list(self.ue_eps.values()):
+            self._remove_endpoint(ep)
+
+###############################################################################
+# Self‑test: 프록시 내부 루프백으로 6017↔6018 송수신 검증
+###############################################################################
+
+def _self_test(ue_host: str, ue_port: int, gnb_host: str, gnb_port: int, *, big_endian=False):
+    """프록시를 백그라운드 스레드로 띄우고 소켓 2개(UE, gNB)로 연결한 뒤
+    핸드셰이크 + 샘플 8개 송수신이 왕복되는지 확인한다."""
+    import threading
+
+    srv = ProxyServer(ue_host=ue_host, ue_port=ue_port,
+                      gnb_host=gnb_host, gnb_port=gnb_port,
+                      log_level="debug", big_endian=big_endian)
+
+    th = threading.Thread(target=srv.run, daemon=True)
+    th.start()
+    time.sleep(0.2)  # listener up
+
+    # connect UE client
+    ue = socket.create_connection((ue_host, ue_port), timeout=2)
+    # connect gNB client
+    gnb = socket.create_connection((gnb_host, gnb_port), timeout=2)
+
+    # read handshake from each
+    def _rx(sock, name):
+        hdr = sock.recv(HDR_LEN)
+        if len(hdr) != HDR_LEN:
+            raise RuntimeError(f"{name} handshake header short")
+        size_samps, nb_ant, ts = unpack_header(hdr, big_endian=big_endian)
+        pay = sock.recv(size_samps * nb_ant * 4)
+        return (size_samps, nb_ant, ts, pay)
+
+    ue_hs = _rx(ue, "UE")
+    gnb_hs = _rx(gnb, "gNB")
+    log("debug", f"Self‑test handshake UE={ue_hs} gNB={gnb_hs}")
+
+    # send a test blk UE→gNB
+    test_ts = int(time.time() * 1e6)
+    hdr = pack_header(8, 1, test_ts, big_endian=big_endian)
+    pay = pack_iq([(i, -i) for i in range(8)], big_endian=big_endian)
+    ue.sendall(hdr + pay)
+    # expect at gNB
+    rh = gnb.recv(HDR_LEN)
+    rs, rn, rts = unpack_header(rh, big_endian=big_endian)
+    rpay = gnb.recv(rs * rn * 4)
+    assert rs == 8 and rn == 1 and rts == test_ts, "UE→gNB path fail"
+
+    # send a blk gNB→UE
+    test_ts2 = test_ts + 100
+    hdr2 = pack_header(4, 1, test_ts2, big_endian=big_endian)
+    pay2 = pack_iq([(0, 0)] * 4, big_endian=big_endian)
+    gnb.sendall(hdr2 + pay2)
+    rh2 = ue.recv(HDR_LEN)
+    rs2, rn2, rts2 = unpack_header(rh2, big_endian=big_endian)
+    rpay2 = ue.recv(rs2 * rn2 * 4)
+    assert rs2 == 4 and rn2 == 1 and rts2 == test_ts2, "gNB→UE path fail"
+
+    log("info", "Self‑test PASSED (bidirectional OK)")
+    srv.close()
+    th.join(timeout=1)
+
+###############################################################################
+# 인자 파서
+###############################################################################
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="OAI ↔ Sionna bi‑directional IQ proxy")
+    p.add_argument("--ue-host", default=os.getenv("SIONNA_CH_UE_HOST", "0.0.0.0"))
+    p.add_argument("--ue-port", type=int, default=_env_int("SIONNA_CH_UE_PORT", 6018))
+    p.add_argument("--gnb-host", default=os.getenv("SIONNA_CH_GNB_HOST", "0.0.0.0"))
+    p.add_argument("--gnb-port", type=int, default=_env_int("SIONNA_CH_GNB_PORT", 6017))
+    p.add_argument("--max-ues", type=int, default=_env_int("SIONNA_CH_MAX_UES", 250))
+    p.add_argument("--big-endian", action="store_true", help="interpret headers big‑endian")
+    p.add_argument("--no-handshake", action="store_true")
+    p.add_argument("--handshake-ts", type=int, default=_env_int("SIONNA_CH_HANDSHAKE_TS", 0),
+                   help="explicit handshake timestamp (0=auto)")
+    p.add_argument("--delay-ms", type=float, default=float(os.getenv("SIONNA_CH_DELAY_MS", 0.0)))
+    p.add_argument("--drop-pct", type=float, default=float(os.getenv("SIONNA_CH_DROP_PCT", 0.0)))
+    p.add_argument("--log", choices=LOG_LEVELS.keys(), default=os.getenv("SIONNA_CH_LOG", "info"))
+    p.add_argument("--strict-oai", action="store_true", help="error on malformed header")
+    p.add_argument("--self-test", action="store_true", help="내부 루프백으로 6017/6018 송수신 검증 후 종료")
+    args = p.parse_args(argv)
+    if args.handshake_ts == 0:
+        args.handshake_ts = None
+    return args
+
+###############################################################################
+# 메인
+###############################################################################
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.self_test:
+        _self_test(args.ue_host, args.ue_port, args.gnb_host, args.gnb_port, big_endian=args.big_endian)
+        return
+    srv = ProxyServer(
+        ue_host=args.ue_host,
+        ue_port=args.ue_port,
+        gnb_host=args.gnb_host,
+        gnb_port=args.gnb_port,
+        max_ues=args.max_ues,
+        big_endian=args.big_endian,
+        do_handshake=not args.no_handshake,
+        handshake_ts=args.handshake_ts,
+        delay_ms=args.delay_ms,
+        drop_pct=args.drop_pct,
+        log_level=args.log,
+        strict_oai=args.strict_oai,
+    )
+    srv.run()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
