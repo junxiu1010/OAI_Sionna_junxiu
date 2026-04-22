@@ -1,0 +1,1 @@
+frame,slot,rnti,pm_index,pmi_x1,pmi_x2,is_type2,mcs,rb_start,rb_size,n_layers,cqi,ri,is_mu_mimo,paired_rnti,is_secondary,is_retx,harq_round,tb_size

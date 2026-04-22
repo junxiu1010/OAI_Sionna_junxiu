@@ -126,14 +126,33 @@ static const uint16_t cqi_table3[16][2] = {{0, 0},
 static void determine_aggregation_level_search_order(int agg_level_search_order[NUM_PDCCH_AGG_LEVELS],
                                                      float pdcch_cl_adjust);
 
-uint8_t get_dl_nrOfLayers(const NR_UE_sched_ctrl_t *sched_ctrl, const nr_dci_format_t dci_format)
+uint8_t get_dl_nrOfLayers(NR_UE_sched_ctrl_t *sched_ctrl, const nr_dci_format_t dci_format)
 {
-  // TODO check this but it should be enough for now
-  // if there is not csi report activated RI is 0 from initialization
-  if(dci_format == NR_DL_DCI_FORMAT_1_0)
+  if (dci_format == NR_DL_DCI_FORMAT_1_0)
     return 1;
-  else
-    return sched_ctrl->CSI_report.cri_ri_li_pmi_cqi_report.ri + 1;
+
+  uint8_t ri = sched_ctrl->CSI_report.cri_ri_li_pmi_cqi_report.ri + 1;
+
+  /* BLER-based rank adaptation with hysteresis:
+   *   Enter 1-layer mode when filtered DL BLER > 0.30  (high threshold)
+   *   Stay  1-layer mode until filtered DL BLER < 0.10 (low threshold)
+   * This avoids ping-pong between 1-layer and 2-layer. */
+  if (ri > 1) {
+    float bler = sched_ctrl->dl_bler_stats.bler;
+    if (!sched_ctrl->dl_rank_forced_1 && bler > 0.30f) {
+      sched_ctrl->dl_rank_forced_1 = 1;
+      LOG_W(NR_MAC, "[RANK-ADAPT] DL BLER %.3f > 0.30 → force layers %d → 1\n",
+            bler, ri);
+    } else if (sched_ctrl->dl_rank_forced_1 && bler < 0.10f) {
+      sched_ctrl->dl_rank_forced_1 = 0;
+      LOG_W(NR_MAC, "[RANK-ADAPT] DL BLER %.3f < 0.10 → release rank lock (RI=%d)\n",
+            bler, ri);
+    }
+    if (sched_ctrl->dl_rank_forced_1)
+      return 1;
+  }
+
+  return ri;
 }
 
 int get_ul_nrOfLayers(const NR_UE_sched_ctrl_t *sched_ctrl, const nr_dci_format_t dci_format)
@@ -285,40 +304,102 @@ void reconstruct_type2_precoding_matrix(const struct CRI_RI_LI_PMI_CQI *rpt,
   if (total_coeffs > 2 * d) total_coeffs = 2 * d;
 
   for (int lay = 0; lay < num_layers && lay < TYPE2_MAX_LAYERS; lay++) {
-    // Reconstruct per-antenna weights: W[lay][ant] = sum over coefficients
     for (int c = 0; c < total_coeffs; c++) {
       int port_local = c % d;
-      int pol = c / d;  // 0 = first polarization, 1 = second
+      int pol = c / d;
       int ant_idx = sel_start + port_local + pol * (num_ant_ports / 2);
       if (ant_idx >= num_ant_ports) continue;
 
-      // Dequantize WB amplitude
       int amp_idx = rpt->wideband_amplitude[c][lay];
       if (amp_idx > 7) amp_idx = 7;
       double amp = type2_wb_amp_table[amp_idx];
 
-      double phase = 0.0;
-      if (rpt->num_subbands > 0) {
-        int phase_idx = rpt->subband_phase[0][c][lay];
-        if (N_phase == 8 && rpt->num_subbands > 1)
-          phase = type2_8psk_phase[phase_idx & 0x7];
-        else
-          phase = type2_qpsk_phase[phase_idx & 0x3];
-      }
+      int phase_idx = rpt->subband_phase[0][c][lay];
+      double phase;
+      if (N_phase == 8)
+        phase = type2_8psk_phase[phase_idx & 0x7];
+      else
+        phase = type2_qpsk_phase[phase_idx & 0x3];
 
       double w_re = amp * cos(phase) / sqrt((double)num_layers);
       double w_im = amp * sin(phase) / sqrt((double)num_layers);
 
-      // Q15 conversion
       int16_t wr = (int16_t)(w_re * 32767.0);
       int16_t wi = (int16_t)(w_im * 32767.0);
 
-      // Accumulate (for port selection, each coefficient maps to one antenna)
       pm_out->weights[lay][ant_idx].precoder_weight_Re += wr;
       pm_out->weights[lay][ant_idx].precoder_weight_Im += wi;
     }
   }
 
+  /* Rank-2+: ensure inter-layer orthogonality.
+   * When the UE reports identical or near-identical PMI for multiple layers
+   * (common with identity/near-identity channels, or when no subband phase
+   * is reported), the columns of W become collinear, making layer separation
+   * impossible at the receiver.  Detect and replace with a DFT-based
+   * orthogonal matrix. */
+  if (num_layers >= 2 && num_ant_ports >= 2) {
+    double col_ip_re = 0, col_ip_im = 0, n0 = 0, n1 = 0;
+    for (int a = 0; a < num_ant_ports; a++) {
+      double r0 = pm_out->weights[0][a].precoder_weight_Re;
+      double i0 = pm_out->weights[0][a].precoder_weight_Im;
+      double r1 = pm_out->weights[1][a].precoder_weight_Re;
+      double i1 = pm_out->weights[1][a].precoder_weight_Im;
+      col_ip_re += r0 * r1 + i0 * i1;
+      col_ip_im += i0 * r1 - r0 * i1;
+      n0 += r0 * r0 + i0 * i0;
+      n1 += r1 * r1 + i1 * i1;
+    }
+    double norm_prod = sqrt(n0) * sqrt(n1);
+    double collinearity = norm_prod > 0
+        ? sqrt(col_ip_re * col_ip_re + col_ip_im * col_ip_im) / norm_prod
+        : 0.0;
+
+    int need_ortho = (collinearity > 0.85);
+    if (!need_ortho && rpt->num_subbands == 0 && num_layers >= 2)
+      need_ortho = 1;
+
+    if (need_ortho) {
+      LOG_W(NR_MAC, "[Type-II] Collinear layers (%.3f, has_sb=%d), "
+            "applying DFT orthogonalization (layers=%d, ports=%d)\n",
+            collinearity, rpt->num_subbands, num_layers, num_ant_ports);
+
+      int half = num_ant_ports / 2;
+      if (half < 1) half = 1;
+      double norm_factor = 1.0 / sqrt((double)num_ant_ports);
+      memset(pm_out->weights, 0,
+             num_layers * num_ant_ports * sizeof(pm_out->weights[0][0]));
+
+      for (int lay = 0; lay < num_layers && lay < TYPE2_MAX_LAYERS; lay++) {
+        for (int a = 0; a < num_ant_ports; a++) {
+          int pol = (a < half) ? 0 : 1;
+          int port_in_pol = a - pol * half;
+          double theta = 2.0 * M_PI * lay * port_in_pol / (double)half
+                       + pol * M_PI * lay / (double)num_layers;
+          int16_t wr = (int16_t)(norm_factor * cos(theta) * 32767.0);
+          int16_t wi = (int16_t)(norm_factor * sin(theta) * 32767.0);
+          pm_out->weights[lay][a].precoder_weight_Re = wr;
+          pm_out->weights[lay][a].precoder_weight_Im = wi;
+        }
+      }
+    } else if (collinearity > 0.50) {
+      LOG_I(NR_MAC, "[Type-II] Semi-orthogonal layers (%.3f, has_sb=%d), "
+            "keeping UE-reported PMI (layers=%d, ports=%d)\n",
+            collinearity, rpt->num_subbands, num_layers, num_ant_ports);
+    }
+  }
+
+  if (num_layers == 1 && num_ant_ports <= 4) {
+    LOG_I(NR_MAC, "[Type-II] 1L W=[%d+j%d, %d+j%d, %d+j%d, %d+j%d] sel=%d ph=[%d,%d,%d,%d] N_ph=%d\n",
+          pm_out->weights[0][0].precoder_weight_Re, pm_out->weights[0][0].precoder_weight_Im,
+          pm_out->weights[0][1].precoder_weight_Re, pm_out->weights[0][1].precoder_weight_Im,
+          pm_out->weights[0][2].precoder_weight_Re, pm_out->weights[0][2].precoder_weight_Im,
+          pm_out->weights[0][3].precoder_weight_Re, pm_out->weights[0][3].precoder_weight_Im,
+          sel_start,
+          rpt->subband_phase[0][0][0], rpt->subband_phase[0][1][0],
+          rpt->subband_phase[0][2][0], rpt->subband_phase[0][3][0],
+          N_phase);
+  }
   LOG_D(NR_MAC, "[Type-II] Reconstructed precoding matrix: layers=%d, ports=%d, sel_start=%d\n",
         num_layers, num_ant_ports, sel_start);
 }
@@ -604,6 +685,9 @@ NR_ControlResourceSet_t *get_coreset(gNB_MAC_INST *nrmac,
 			     "search space\n");
     return coreset;
   } else {
+    if (coreset_id == 0) {
+      return nrmac->sched_ctrlCommon->coreset;
+    }
     const int n = ((NR_BWP_DownlinkDedicated_t*)bwp)->pdcch_Config->choice.setup->controlResourceSetToAddModList->list.count;
     for (int i = 0; i < n; i++) {
       NR_ControlResourceSet_t *coreset =
@@ -982,42 +1066,47 @@ NR_pusch_dmrs_t get_ul_dmrs_params(const NR_ServingCellConfigCommon_t *scc,
   return dmrs;
 }
 
-#define BLER_UPDATE_FRAME 10
-#define BLER_FILTER 0.9f
 int get_mcs_from_bler(const NR_bler_options_t *bler_options,
                       const NR_mac_dir_stats_t *stats,
                       NR_bler_stats_t *bler_stats,
                       int max_mcs,
                       frame_t frame)
 {
+  const float filt = bler_options->filter_coeff;
+  const int upd_frames = bler_options->update_frames;
+
   int diff = frame - bler_stats->last_frame;
   if (diff < 0) // wrap around
     diff += 1024;
 
   max_mcs = min(max_mcs, bler_options->max_mcs);
   const uint8_t old_mcs = min(bler_stats->mcs, max_mcs);
-  if (diff < BLER_UPDATE_FRAME)
+  if (diff < upd_frames)
     return old_mcs; // no update
 
   // last update is longer than x frames ago
   const int num_dl_sched = (int)(stats->rounds[0] - bler_stats->rounds[0]);
   const int num_dl_retx = (int)(stats->rounds[1] - bler_stats->rounds[1]);
   const float bler_window = num_dl_sched > 0 ? (float) num_dl_retx / num_dl_sched : bler_stats->bler;
-  bler_stats->bler = BLER_FILTER * bler_stats->bler + (1 - BLER_FILTER) * bler_window;
+  bler_stats->bler = filt * bler_stats->bler + (1.0f - filt) * bler_window;
 
   int new_mcs = old_mcs;
-  if (bler_stats->bler < bler_options->lower && old_mcs < max_mcs && num_dl_sched > 3)
-    new_mcs += 1;
-  else if (bler_stats->bler > bler_options->upper || num_dl_sched <= 3) // above threshold or no activity
-    new_mcs -= 1;
-  // else we are within threshold boundaries
+  if (bler_stats->bler > bler_options->upper) {
+    new_mcs -= (bler_stats->bler > 0.5f) ? 2 : 1;
+  } else if (num_dl_sched >= 2 && bler_stats->bler < bler_options->lower && old_mcs < max_mcs) {
+    int step = 1;
+    if (bler_stats->bler < bler_options->lower * 0.5f)
+      step = 2;
+    new_mcs = min(old_mcs + step, max_mcs);
+  }
 
   new_mcs = max(new_mcs, bler_options->min_mcs);
   bler_stats->last_frame = frame;
   bler_stats->mcs = new_mcs;
   memcpy(bler_stats->rounds, stats->rounds, sizeof(stats->rounds));
-  LOG_D(MAC, "frame %4d MCS %d -> %d (num_dl_sched %d, num_dl_retx %d, BLER wnd %.3f avg %.6f)\n",
-        frame, old_mcs, new_mcs, num_dl_sched, num_dl_retx, bler_window, bler_stats->bler);
+  LOG_I(MAC, "frame %4d MCS %d -> %d (sched %d retx %d BLER wnd %.3f avg %.3f step %d)\n",
+        frame, old_mcs, new_mcs, num_dl_sched, num_dl_retx, bler_window, bler_stats->bler,
+        new_mcs - old_mcs);
   return new_mcs;
 }
 
@@ -2892,7 +2981,7 @@ static void init_bler_stats(const NR_bler_options_t *bler_options, NR_bler_stats
 {
   bler_stats->last_frame = frame;
   bler_stats->mcs = bler_options->min_mcs;
-  bler_stats->bler = (float)(bler_options->lower + bler_options->upper) / 2.0f;
+  bler_stats->bler = (float)(bler_options->lower) * 0.5f;
 }
 
 /* @brief returns a new UE allocated instance.
@@ -2992,9 +3081,11 @@ bool add_connected_nr_ue(gNB_MAC_INST *nr_mac, NR_UE_info_t *UE)
   sched_ctrl->pdcch_cl_adjust = 0;
   reset_srs_stats(UE);
 
-  // Initialize bler_stats
+  // Initialize bler_stats: DL uses optimistic init (lower*0.5) for fast ramp-up;
+  // UL uses conservative init (upper) to prevent MCS runaway on weaker UL channel.
   init_bler_stats(&nr_mac->dl_bler, &sched_ctrl->dl_bler_stats, nr_mac->frame);
   init_bler_stats(&nr_mac->ul_bler, &sched_ctrl->ul_bler_stats, nr_mac->frame);
+  sched_ctrl->ul_bler_stats.bler = (float)(nr_mac->ul_bler.upper);
 
   NR_SCHED_UNLOCK(&UE_info->mutex);
   dump_nr_list(UE_info->connected_ue_list);
@@ -3678,6 +3769,7 @@ bool prepare_initial_ul_rrc_message(gNB_MAC_INST *mac, NR_UE_info_t *UE)
   const NR_RLC_BearerConfig_t *bearer = cellGroupConfig->rlc_BearerToAddModList->list.array[0];
   DevAssert(bearer->servedRadioBearer->choice.srb_Identity == srb_id);
   nr_rlc_add_srb(UE->rnti, bearer->servedRadioBearer->choice.srb_Identity, bearer);
+  nr_rlc_set_rlf_handler(UE->rnti, gnb_rlc_rlf_handler);
   int priority = bearer->mac_LogicalChannelConfig->ul_SpecificParameters->priority;
   nr_lc_config_t c = {.lcid = bearer->logicalChannelIdentity, .priority = priority};
   nr_mac_add_lcid(&UE->UE_sched_ctrl, &c);
@@ -3717,6 +3809,23 @@ void nr_mac_reset_ul_failure(NR_UE_sched_ctrl_t *sched_ctrl)
   sched_ctrl->ul_failure = false;
   sched_ctrl->ul_failure_timer = 0;
   sched_ctrl->pusch_consecutive_dtx_cnt = 0;
+}
+
+void gnb_rlc_rlf_handler(int rnti)
+{
+  gNB_MAC_INST *mac = RC.nrmac[0];
+  if (!mac)
+    return;
+
+  LOG_W(NR_MAC, "UE %04x: RLF detected by RLC (max retx), marking for release\n", rnti);
+
+  nr_mac_request_release_ue(mac, rnti);
+
+  NR_UE_info_t *UE = find_nr_UE(&mac->UE_info, rnti);
+  if (UE && !UE->UE_sched_ctrl.ul_failure) {
+    UE->UE_sched_ctrl.ul_failure = true;
+    UE->UE_sched_ctrl.ul_failure_timer = 0;
+  }
 }
 
 /* \brief trigger a release request towards the CU.

@@ -123,41 +123,47 @@ static void tx_func(processingData_L1tx_t *info)
 
     PHY_VARS_gNB *gNB = info->gNB;
 
-    /* === DL TX DATA DIAGNOSTIC === */
+    /* === DL TX DATA DIAGNOSTIC — scan ALL symbols in the slot === */
     {
       static uint64_t _tx_diag_cnt = 0;
+      static uint64_t _nz_F_cnt = 0;
       _tx_diag_cnt++;
-      if (_tx_diag_cnt == 1 || _tx_diag_cnt == 50 || _tx_diag_cnt == 500) {
-        RU_t *ru = gNB->RU_list[0];
-        NR_DL_FRAME_PARMS *fp = ru->nr_frame_parms;
-        int txdataF_offset = slot_tx * fp->samples_per_slot_wCP;
-        int slot_offset = fp->get_samples_slot_timestamp(slot_tx, fp, 0);
-        int nz_F0=0, nz_F1=0, nz_td0=0, nz_td1=0;
-        int chk_F = fp->samples_per_slot_wCP < 2048 ? fp->samples_per_slot_wCP : 2048;
-        int chk_td = fp->get_samples_per_slot(slot_tx, fp);
-        if (chk_td > 2048) chk_td = 2048;
-        int32_t *fdata0 = (int32_t *)gNB->common_vars.txdataF[0][0];
-        for (int i = 0; i < chk_F; i++)
-          if (fdata0[txdataF_offset + i] != 0) nz_F0++;
-        if (gNB->frame_parms.nb_antennas_tx > 1) {
-          int32_t *fdata1 = (int32_t *)gNB->common_vars.txdataF[0][1];
-          for (int i = 0; i < chk_F; i++)
-            if (fdata1[txdataF_offset + i] != 0) nz_F1++;
+      RU_t *ru = gNB->RU_list[0];
+      NR_DL_FRAME_PARMS *fp = ru->nr_frame_parms;
+      int sym_sz = fp->ofdm_symbol_size;
+      int n_sym = fp->symbols_per_slot;
+      int slot_base = slot_tx * fp->samples_per_slot_wCP;
+      int nb_tx = gNB->frame_parms.nb_antennas_tx;
+
+      int nz_full[4] = {0,0,0,0};
+      int nz_sym0[4] = {0,0,0,0};
+      int total_re = sym_sz * n_sym;
+      int has_data = 0;
+
+      for (int a = 0; a < nb_tx && a < 4; a++) {
+        int32_t *fd = (int32_t *)gNB->common_vars.txdataF[0][a];
+        for (int s = 0; s < n_sym; s++) {
+          int off = slot_base + s * sym_sz;
+          for (int i = 0; i < sym_sz; i++) {
+            if (fd[off + i] != 0) {
+              nz_full[a]++;
+              if (s == 0) nz_sym0[a]++;
+            }
+          }
         }
-        int32_t *tdata0 = (int32_t *)ru->common.txdata[0];
-        if (tdata0) for (int i = 0; i < chk_td; i++)
-          if (tdata0[slot_offset + i] != 0) nz_td0++;
-        if (ru->nb_tx > 1) {
-          int32_t *tdata1 = (int32_t *)ru->common.txdata[1];
-          if (tdata1) for (int i = 0; i < chk_td; i++)
-            if (tdata1[slot_offset + i] != 0) nz_td1++;
-        }
-        LOG_I(PHY, "[DL_TX_DIAG] #%lu PRE-RU %d.%d: txdataF[0] nz=%d/%d txdataF[1] nz=%d/%d | "
-              "txdata[0] nz=%d/%d txdata[1] nz=%d/%d | nb_tx=%d beams=%d\n",
-              (unsigned long)_tx_diag_cnt, frame_tx, slot_tx,
-              nz_F0, chk_F, nz_F1, chk_F,
-              nz_td0, chk_td, nz_td1, chk_td,
-              ru->nb_tx, ru->num_beams_period);
+        if (nz_full[a] > 0) has_data = 1;
+      }
+      if (has_data) _nz_F_cnt++;
+
+      if (_tx_diag_cnt <= 5 || (_tx_diag_cnt <= 500 && has_data) || _tx_diag_cnt % 1000 == 0) {
+        LOG_I(PHY, "[DL_TX_DIAG] #%lu %s %d.%d: ant_nz=[%d,%d,%d,%d]/%d "
+              "sym0=[%d,%d,%d,%d]/%d nz_total=%lu/%lu(%.1f%%) nb_tx=%d\n",
+              (unsigned long)_tx_diag_cnt, has_data?"DATA":"EMPTY", frame_tx, slot_tx,
+              nz_full[0], nz_full[1], nz_full[2], nz_full[3], total_re,
+              nz_sym0[0], nz_sym0[1], nz_sym0[2], nz_sym0[3], sym_sz,
+              (unsigned long)_nz_F_cnt, (unsigned long)_tx_diag_cnt,
+              _tx_diag_cnt > 0 ? 100.0*(double)_nz_F_cnt/(double)_tx_diag_cnt : 0.0,
+              nb_tx);
       }
     }
 
@@ -169,27 +175,32 @@ static void tx_func(processingData_L1tx_t *info)
     LOG_D(PHY, "gNB: %d.%d : calling RU TX function\n", syncMsgRU.frame_tx, syncMsgRU.slot_tx);
     ru_tx_func((void *)&syncMsgRU);
 
-    /* === POST-RU TX DATA DIAGNOSTIC === */
+    /* === POST-RU TX DATA DIAGNOSTIC — scan all time-domain samples === */
     {
       static uint64_t _post_cnt = 0;
+      static uint64_t _post_nz = 0;
       _post_cnt++;
-      if (_post_cnt == 1 || _post_cnt == 50 || _post_cnt == 500) {
-        RU_t *ru = gNB->RU_list[0];
-        NR_DL_FRAME_PARMS *fp = ru->nr_frame_parms;
-        int slot_offset = fp->get_samples_slot_timestamp(slot_tx, fp, 0);
-        int chk = fp->get_samples_per_slot(slot_tx, fp);
-        if (chk > 2048) chk = 2048;
-        int nz0=0, nz1=0;
-        int32_t *td0 = (int32_t *)ru->common.txdata[0];
-        if (td0) for (int i=0;i<chk;i++)
-          if (td0[slot_offset+i]!=0) nz0++;
-        if (ru->nb_tx > 1) {
-          int32_t *td1 = (int32_t *)ru->common.txdata[1];
-          if (td1) for (int i=0;i<chk;i++)
-            if (td1[slot_offset+i]!=0) nz1++;
-        }
-        LOG_I(PHY, "[DL_TX_DIAG] #%lu POST-RU %d.%d: txdata[0] nz=%d/%d txdata[1] nz=%d/%d\n",
-              (unsigned long)_post_cnt, frame_tx, slot_tx, nz0, chk, nz1, chk);
+      RU_t *_ru = gNB->RU_list[0];
+      NR_DL_FRAME_PARMS *_fp = _ru->nr_frame_parms;
+      int _slot_off = _fp->get_samples_slot_timestamp(slot_tx, _fp, 0);
+      int _chk = _fp->get_samples_per_slot(slot_tx, _fp);
+      int _nz[4] = {0,0,0,0};
+      int _has = 0;
+      for (int a = 0; a < (int)_ru->nb_tx && a < 4; a++) {
+        int32_t *_td = (int32_t *)_ru->common.txdata[a];
+        if (!_td) continue;
+        for (int i = 0; i < _chk; i++)
+          if (_td[_slot_off + i] != 0) _nz[a]++;
+        if (_nz[a] > 0) _has = 1;
+      }
+      if (_has) _post_nz++;
+      if (_post_cnt <= 5 || (_post_cnt <= 500 && _has) || _post_cnt % 1000 == 0) {
+        LOG_I(PHY, "[DL_TX_DIAG] #%lu POST-RU %s %d.%d: td_nz=[%d,%d,%d,%d]/%d | "
+              "nz_total=%lu/%lu(%.1f%%)\n",
+              (unsigned long)_post_cnt, _has?"DATA":"EMPTY", frame_tx, slot_tx,
+              _nz[0], _nz[1], _nz[2], _nz[3], _chk,
+              (unsigned long)_post_nz, (unsigned long)_post_cnt,
+              _post_cnt > 0 ? 100.0*(double)_post_nz/(double)_post_cnt : 0.0);
       }
     }
 

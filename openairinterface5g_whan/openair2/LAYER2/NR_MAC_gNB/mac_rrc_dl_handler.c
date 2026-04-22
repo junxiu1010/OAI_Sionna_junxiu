@@ -247,6 +247,7 @@ static int handle_ue_context_srbs_setup(NR_UE_info_t *UE,
     const f1ap_srb_to_setup_t *srb = &req_srbs[i];
     NR_RLC_BearerConfig_t *rlc_BearerConfig = get_bearerconfig_from_srb(srb, rlc_config);
     nr_rlc_add_srb(UE->rnti, srb->id, rlc_BearerConfig);
+    nr_rlc_set_rlf_handler(UE->rnti, gnb_rlc_rlf_handler);
 
     int priority = rlc_BearerConfig->mac_LogicalChannelConfig->ul_SpecificParameters->priority;
     nr_lc_config_t c = {.lcid = rlc_BearerConfig->logicalChannelIdentity, .priority = priority};

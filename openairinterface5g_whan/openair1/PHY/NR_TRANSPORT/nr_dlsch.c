@@ -804,6 +804,29 @@ static int do_one_dlsch(unsigned char *input_ptr, PHY_VARS_gNB *gNB, NR_gNB_DLSC
       const size_t txdataF_offset_per_symbol = l_symbol * symbol_sz + txdataF_offset;
       do_txdataF(txdataF, symbol_sz, txdataF_precoding, gNB, rel15, ant, start_sc, txdataF_offset_per_symbol);
     }
+
+    /* PDSCH precoding diagnostic: log pmi, layers, and per-antenna energy for first PDSCH symbol */
+    if (l_symbol == rel15->StartSymbolIndex) {
+      static int _pdsch_prec_log = 0;
+      if (_pdsch_prec_log < 50 || (_pdsch_prec_log % 2000 == 0)) {
+        nfapi_nr_tx_precoding_and_beamforming_t *pb = &rel15->precodingAndBeamforming;
+        int _pmi_val = (pb->prg_size > 0) ? pb->prgs_list[0].pm_idx : 0;
+        int _nz_per_ant[4] = {0,0,0,0};
+        for (int a = 0; a < frame_parms->nb_antennas_tx && a < 4; a++) {
+          size_t off = l_symbol * symbol_sz + txdataF_offset;
+          for (int sc = 0; sc < rel15->rbSize * 12 && sc < symbol_sz; sc++) {
+            int idx = off + ((start_sc + sc) % symbol_sz);
+            if (txdataF[a][idx].r != 0 || txdataF[a][idx].i != 0) _nz_per_ant[a]++;
+          }
+        }
+        LOG_I(PHY, "[PDSCH_PREC] rnti=%04x sym=%d layers=%d pmi=%d prg_sz=%d "
+              "ant_nz=[%d,%d,%d,%d] rbSize=%d nb_tx=%d\n",
+              rel15->rnti, l_symbol, rel15->nrOfLayers, _pmi_val, pb->prg_size,
+              _nz_per_ant[0], _nz_per_ant[1], _nz_per_ant[2], _nz_per_ant[3],
+              rel15->rbSize, frame_parms->nb_antennas_tx);
+      }
+      _pdsch_prec_log++;
+    }
   }
 
   stop_meas(&gNB->dlsch_precoding_stats);

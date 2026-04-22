@@ -32,7 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
+#include <math.h>
 
 #include "executables/nr-softmodem-common.h"
 #include "nr_transport_proto_ue.h"
@@ -46,6 +46,16 @@
 
 //#define NR_CSIRS_DEBUG
 //#define NR_CSIIM_DEBUG
+
+/* ── Complex-double helpers for 4x4 rank / PMI estimation ──
+ * cd_t is already defined in PHY/TOOLS/tools_defs.h (struct complexd).
+ * We only add the helpers not provided there.
+ */
+static inline cd_t cd_mul(cd_t a, cd_t b) { return (cd_t){a.r*b.r - a.i*b.i, a.r*b.i + a.i*b.r}; }
+static inline cd_t cd_sub(cd_t a, cd_t b) { return (cd_t){a.r - b.r, a.i - b.i}; }
+static inline cd_t cd_add(cd_t a, cd_t b) { return (cd_t){a.r + b.r, a.i + b.i}; }
+static inline double cd_mag2(cd_t a)       { return a.r*a.r + a.i*a.i; }
+static inline cd_t cd_from_c16(c16_t v)    { return (cd_t){(double)v.r, (double)v.i}; }
 
 void nr_det_A_MF_2x2(int32_t *a_mf_00,
                      int32_t *a_mf_01,
@@ -436,6 +446,143 @@ static int nr_csi_rs_channel_estimation(
   return 0;
 }
 
+/* ── 4x4 Rank Indicator estimation (progressive sub-matrix condition number) ── */
+static int nr_csi_rs_ri_estimation_4x4(const PHY_VARS_NR_UE *ue,
+                                        const fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_config_pdu,
+                                        const nr_csi_info_t *nr_csi_info,
+                                        const uint8_t N_ports,
+                                        uint8_t mem_offset,
+                                        c16_t csi_rs_estimated_channel_freq[][N_ports][ue->frame_parms.ofdm_symbol_size + FILTER_MARGIN],
+                                        const int16_t log2_maxh,
+                                        uint8_t *rank_indicator)
+{
+  const NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
+  const double cond_threshold = 5.0;
+  int count2 = 0, count3 = 0, count4 = 0;
+  *rank_indicator = 0;
+
+  const int N = (N_ports < 4) ? N_ports : 4;
+
+  int32_t A_MF[N][N][fp->ofdm_symbol_size + FILTER_MARGIN] __attribute__((aligned(32)));
+  c16_t   conjch_tmp[fp->ofdm_symbol_size + FILTER_MARGIN] __attribute__((aligned(32)));
+  memset(A_MF, 0, sizeof(int32_t) * N * N * (fp->ofdm_symbol_size + FILTER_MARGIN));
+
+  for (int rb = csirs_config_pdu->start_rb;
+       rb < csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs; rb++) {
+
+    if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+      continue;
+
+    uint16_t k  = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
+    uint16_t ko = k + mem_offset;
+
+    /* H^H * H  (generic N-port loop, identical structure to 2x2 path) */
+    for (int rxc = 0; rxc < fp->nb_antennas_rx; rxc++)
+      for (int pc = 0; pc < N; pc++)
+        for (int rxh = 0; rxh < fp->nb_antennas_rx; rxh++)
+          for (int ph = 0; ph < N; ph++) {
+            nr_conjch0_mult_ch1(&csi_rs_estimated_channel_freq[rxc][pc][ko],
+                                &csi_rs_estimated_channel_freq[rxh][ph][ko],
+                                &conjch_tmp[ko], 1, log2_maxh);
+            if (rxc == rxh)
+              nr_a_sum_b((c16_t *)&A_MF[pc][ph][ko], (c16_t *)&conjch_tmp[ko], 1);
+          }
+
+    /* Per-subcarrier progressive rank test (double precision)
+     * Test ALL port combinations to handle cross-polarized arrays
+     * where Sionna orders ports as [V0,V1,H0,H1] — adjacent ports
+     * may be same-pol and thus highly correlated. */
+    for (int sc = 0; sc < NR_NB_SC_PER_RB; sc++) {
+      cd_t a[4][4] = {{{0,0}}};
+      for (int i = 0; i < N; i++)
+        for (int j = 0; j < N; j++)
+          a[i][j] = cd_from_c16(((c16_t *)&A_MF[i][j][ko])[sc]);
+
+      /* ── rank >= 2 : best 2x2 sub-matrix over C(N,2) pairs ── */
+      {
+        double best_cond2 = 100.0;
+        for (int p0 = 0; p0 < N - 1; p0++) {
+          for (int p1 = p0 + 1; p1 < N; p1++) {
+            cd_t det = cd_sub(cd_mul(a[p0][p0], a[p1][p1]),
+                              cd_mul(a[p0][p1], a[p1][p0]));
+            double da = sqrt(cd_mag2(det));
+            double nu = cd_mag2(a[p0][p0]) + cd_mag2(a[p0][p1])
+                      + cd_mag2(a[p1][p0]) + cd_mag2(a[p1][p1]);
+            double c = (da > 1e-10) ? 10.0*log10(nu/2.0) - 10.0*log10(da) : 100.0;
+            if (c < best_cond2) best_cond2 = c;
+          }
+        }
+        if (best_cond2 < cond_threshold) count2++; else count2--;
+      }
+
+      /* ── rank >= 3 : best 3x3 sub-matrix over C(N,3) triples ── */
+      if (N >= 3) {
+        double best_cond3 = 100.0;
+        for (int skip = 0; skip < N; skip++) {
+          int idx[3], c = 0;
+          for (int i = 0; i < N; i++) { if (i != skip) idx[c++] = i; }
+          cd_t s[3][3];
+          for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+              s[i][j] = a[idx[i]][idx[j]];
+          cd_t m0 = cd_sub(cd_mul(s[1][1], s[2][2]), cd_mul(s[1][2], s[2][1]));
+          cd_t m1 = cd_sub(cd_mul(s[1][0], s[2][2]), cd_mul(s[1][2], s[2][0]));
+          cd_t m2 = cd_sub(cd_mul(s[1][0], s[2][1]), cd_mul(s[1][1], s[2][0]));
+          cd_t d3 = cd_add(cd_sub(cd_mul(s[0][0], m0), cd_mul(s[0][1], m1)),
+                           cd_mul(s[0][2], m2));
+          double da3 = sqrt(cd_mag2(d3));
+          double nu3 = 0;
+          for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++) nu3 += cd_mag2(s[i][j]);
+          double cn3 = (da3 > 1e-10)
+            ? 10.0*log10(nu3/3.0) - (2.0/3.0)*10.0*log10(da3) : 100.0;
+          if (cn3 < best_cond3) best_cond3 = cn3;
+        }
+        if (best_cond3 < cond_threshold) count3++; else count3--;
+      }
+
+      /* ── rank == 4 : full 4x4 matrix ── */
+      if (N >= 4) {
+        cd_t det4 = {0, 0};
+        for (int j4 = 0; j4 < 4; j4++) {
+          cd_t sm[3][3];
+          for (int mi = 0; mi < 3; mi++) {
+            int col = 0;
+            for (int mj = 0; mj < 4; mj++) {
+              if (mj == j4) continue;
+              sm[mi][col++] = a[mi+1][mj];
+            }
+          }
+          cd_t s0 = cd_sub(cd_mul(sm[1][1], sm[2][2]), cd_mul(sm[1][2], sm[2][1]));
+          cd_t s1 = cd_sub(cd_mul(sm[1][0], sm[2][2]), cd_mul(sm[1][2], sm[2][0]));
+          cd_t s2 = cd_sub(cd_mul(sm[1][0], sm[2][1]), cd_mul(sm[1][1], sm[2][0]));
+          cd_t minor = cd_add(cd_sub(cd_mul(sm[0][0], s0), cd_mul(sm[0][1], s1)),
+                              cd_mul(sm[0][2], s2));
+          cd_t cof   = cd_mul(a[0][j4], minor);
+          if (j4 % 2 == 0) det4 = cd_add(det4, cof);
+          else              det4 = cd_sub(det4, cof);
+        }
+        double da4 = sqrt(cd_mag2(det4));
+        double nu4 = 0;
+        for (int i = 0; i < 4; i++)
+          for (int j = 0; j < 4; j++) nu4 += cd_mag2(a[i][j]);
+        double cond4 = (da4 > 1e-10)
+          ? 10.0*log10(nu4/4.0) - 0.5*10.0*log10(da4) : 100.0;
+        if (cond4 < cond_threshold) count4++; else count4--;
+      }
+    }
+  }
+
+  *rank_indicator = 0;
+  if (count2 > 0) *rank_indicator = 1;
+  if (count3 > 0 && *rank_indicator >= 1) *rank_indicator = 2;
+  if (count4 > 0 && *rank_indicator >= 2) *rank_indicator = 3;
+
+  LOG_I(NR_PHY, "4x4 RI: count2=%d count3=%d count4=%d → rank=%d (all-pairs)\n",
+        count2, count3, count4, (*rank_indicator) + 1);
+  return 0;
+}
+
 int nr_csi_rs_ri_estimation(const PHY_VARS_NR_UE *ue,
                             const fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_config_pdu,
                             const nr_csi_info_t *nr_csi_info,
@@ -452,60 +599,10 @@ int nr_csi_rs_ri_estimation(const PHY_VARS_NR_UE *ue,
 
   if (ue->frame_parms.nb_antennas_rx == 1 || N_ports == 1) {
     return 0;
-  } else if (N_ports > 2) {
-    // For N_ports > 2: estimate RI based on total received power across ports.
-    // Compute per-port power and check if rank-2 is beneficial using
-    // a simplified condition-number proxy on the strongest 2 ports.
-    int64_t port_power[N_ports];
-    memset(port_power, 0, sizeof(port_power));
-    for (int rb = csirs_config_pdu->start_rb; rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
-      if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
-        continue;
-      uint16_t k = (frame_parms->first_carrier_offset + rb * NR_NB_SC_PER_RB) % frame_parms->ofdm_symbol_size;
-      uint16_t k_off = k + mem_offset;
-      for (int p = 0; p < N_ports; p++) {
-        for (int ar = 0; ar < frame_parms->nb_antennas_rx; ar++) {
-          const c16_t h = csi_rs_estimated_channel_freq[ar][p][k_off];
-          port_power[p] += (int64_t)h.r * h.r + (int64_t)h.i * h.i;
-        }
-      }
-    }
-    // Find two strongest ports
-    int p0 = 0, p1 = 1;
-    if (port_power[p1] > port_power[p0]) { int t = p0; p0 = p1; p1 = t; }
-    for (int p = 2; p < N_ports; p++) {
-      if (port_power[p] > port_power[p0]) { p1 = p0; p0 = p; }
-      else if (port_power[p] > port_power[p1]) { p1 = p; }
-    }
-    // Cross-correlation between strongest two ports
-    int64_t cross_re = 0, cross_im = 0;
-    int rb_cnt = 0;
-    for (int rb = csirs_config_pdu->start_rb; rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
-      if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
-        continue;
-      rb_cnt++;
-      uint16_t k = (frame_parms->first_carrier_offset + rb * NR_NB_SC_PER_RB) % frame_parms->ofdm_symbol_size;
-      uint16_t k_off = k + mem_offset;
-      for (int ar = 0; ar < frame_parms->nb_antennas_rx; ar++) {
-        const c16_t h0 = csi_rs_estimated_channel_freq[ar][p0][k_off];
-        const c16_t h1 = csi_rs_estimated_channel_freq[ar][p1][k_off];
-        cross_re += (int64_t)h0.r * h1.r + (int64_t)h0.i * h1.i;
-        cross_im += (int64_t)h0.i * h1.r - (int64_t)h0.r * h1.i;
-      }
-    }
-    int64_t cross_power = cross_re / (rb_cnt > 0 ? rb_cnt : 1);
-    cross_power = cross_power * cross_re / (rb_cnt > 0 ? rb_cnt : 1)
-                + (cross_im / (rb_cnt > 0 ? rb_cnt : 1)) * (cross_im / (rb_cnt > 0 ? rb_cnt : 1));
-    int64_t auto_power = (port_power[p0] / (rb_cnt > 0 ? rb_cnt : 1))
-                       * (port_power[p1] / (rb_cnt > 0 ? rb_cnt : 1));
-    // If cross-correlation is low relative to auto power, rank 2 is feasible
-    if (auto_power > 0 && (cross_power * 4 < auto_power))
-      *rank_indicator = 1;
-    else
-      *rank_indicator = 0;
-    LOG_D(NR_PHY, "RI estimation (N_ports=%d): cross_power=%lld, auto_power=%lld, RI=%d\n",
-          N_ports, (long long)cross_power, (long long)auto_power, *rank_indicator + 1);
-    return 0;
+  } else if (ue->frame_parms.nb_antennas_rx >= 4 && N_ports >= 4) {
+    return nr_csi_rs_ri_estimation_4x4(ue, csirs_config_pdu, nr_csi_info, N_ports,
+                                        mem_offset, csi_rs_estimated_channel_freq,
+                                        log2_maxh, rank_indicator);
   } else if( !(ue->frame_parms.nb_antennas_rx == 2 && N_ports == 2) ) {
     LOG_W(NR_PHY, "Rank indicator computation is not implemented for %i x %i system\n",
           ue->frame_parms.nb_antennas_rx, N_ports);
@@ -623,6 +720,275 @@ int nr_csi_rs_ri_estimation(const PHY_VARS_NR_UE *ue,
   return 0;
 }
 
+/* ── 4-port PMI estimation (Type I SinglePanel, N1=2, N2=1) ── */
+static int nr_csi_rs_pmi_estimation_4port(
+    const PHY_VARS_NR_UE *ue,
+    const fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_config_pdu,
+    const uint8_t N_ports, uint8_t mem_offset,
+    const c16_t csi_rs_estimated_channel_freq[][N_ports][ue->frame_parms.ofdm_symbol_size + FILTER_MARGIN],
+    const uint32_t noise_power, const uint8_t rank_indicator,
+    uint8_t *i1, uint8_t *i2, uint32_t *precoded_sinr_dB)
+{
+  const NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
+  const int N1 = 2, O1 = 4;
+  const int n_beams = N1 * O1;                    /* 8 oversampled DFT beams  */
+  const int NP = (N_ports < 4) ? N_ports : 4;
+
+  uint32_t eff_noise = noise_power ? noise_power : 1000;
+  i1[0] = i1[1] = i1[2] = 0;
+  i2[0] = 0;
+
+  /* Pre-compute DFT beam vectors  v_l = [1, e^{j 2 pi l / 8}] */
+  cd_t v_tab[8][2];
+  for (int l = 0; l < n_beams; l++) {
+    double theta = 2.0 * M_PI * l / (double)n_beams;
+    v_tab[l][0] = (cd_t){1.0, 0.0};
+    v_tab[l][1] = (cd_t){cos(theta), sin(theta)};
+  }
+  static const cd_t phi4[4] = {{1,0},{0,1},{-1,0},{0,-1}};
+
+  if (rank_indicator == 0) {
+    /* ── Rank 1 : W = (1/2)[v_l ; phi*v_l],  32 candidates ── */
+    double best = -1;
+    for (int l = 0; l < n_beams; l++) {
+      for (int n = 0; n < 4; n++) {
+        cd_t w[4] = { v_tab[l][0], v_tab[l][1],
+                      cd_mul(phi4[n], v_tab[l][0]),
+                      cd_mul(phi4[n], v_tab[l][1]) };
+        double acc = 0;
+        for (int rb = csirs_config_pdu->start_rb;
+             rb < csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs; rb++) {
+          if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+            continue;
+          uint16_t k  = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
+          uint16_t ko = k + mem_offset;
+          for (int sc = 0; sc < NR_NB_SC_PER_RB; sc++)
+            for (int rx = 0; rx < fp->nb_antennas_rx; rx++) {
+              cd_t hw = {0,0};
+              for (int p = 0; p < NP; p++)
+                hw = cd_add(hw, cd_mul(cd_from_c16(csi_rs_estimated_channel_freq[rx][p][ko+sc]), w[p]));
+              acc += cd_mag2(hw);
+            }
+        }
+        if (acc > best) { best = acc; i1[0] = l; i2[0] = n; }
+      }
+    }
+    i1[1] = 0; i1[2] = 0;
+    *precoded_sinr_dB = dB_fixed((uint32_t)(best / eff_noise));
+
+  } else if (rank_indicator == 1) {
+    /* ── Rank 2 : W = (1/2)[[v_l,v_l'],[phi*v_l,-phi*v_l']] ── */
+    double best = -1;
+    for (int l = 0; l < n_beams; l++) {
+      for (int k1 = 0; k1 < O1; k1++) {
+        int l2 = (l + k1) % n_beams;
+        for (int n = 0; n < 2; n++) {
+          cd_t phi  = phi4[n];
+          cd_t nphi = {-phi.r, -phi.i};
+          cd_t w0[4] = { v_tab[l][0],  v_tab[l][1],
+                         cd_mul(phi, v_tab[l][0]),  cd_mul(phi, v_tab[l][1]) };
+          cd_t w1[4] = { v_tab[l2][0], v_tab[l2][1],
+                         cd_mul(nphi, v_tab[l2][0]), cd_mul(nphi, v_tab[l2][1]) };
+          double acc = 0;
+          for (int rb = csirs_config_pdu->start_rb;
+               rb < csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs; rb++) {
+            if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+              continue;
+            uint16_t k  = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
+            uint16_t ko = k + mem_offset;
+            for (int sc = 0; sc < NR_NB_SC_PER_RB; sc++)
+              for (int rx = 0; rx < fp->nb_antennas_rx; rx++) {
+                cd_t h0 = {0,0}, h1 = {0,0};
+                for (int p = 0; p < NP; p++) {
+                  cd_t h = cd_from_c16(csi_rs_estimated_channel_freq[rx][p][ko+sc]);
+                  h0 = cd_add(h0, cd_mul(h, w0[p]));
+                  h1 = cd_add(h1, cd_mul(h, w1[p]));
+                }
+                acc += cd_mag2(h0) + cd_mag2(h1);
+              }
+          }
+          if (acc > best) { best = acc; i1[0] = l; i1[2] = k1; i2[0] = n; }
+        }
+      }
+    }
+    i1[1] = 0;
+    *precoded_sinr_dB = dB_fixed((uint32_t)(best / (2 * eff_noise)));
+
+  } else if (rank_indicator == 2) {
+    /* ── Rank 3 : W = (1/sqrt3)[[v_l, v_l2, v_l],[phi*v_l, phi*v_l2, -phi*v_l]]
+     *  l2 = (l + O1) % n_beams,  phi = phi4[nn],  nn in {0,1}
+     *  phase_sign: col0=+1, col1=+1, col2=-1                                    ── */
+    int l2_off = O1;
+    double best = -1;
+    for (int l = 0; l < n_beams; l++) {
+      int l2 = (l + l2_off) % n_beams;
+      for (int n = 0; n < 2; n++) {
+        cd_t phi  = phi4[n];
+        cd_t nphi = {-phi.r, -phi.i};
+        cd_t wc0[4] = { v_tab[l][0],  v_tab[l][1],
+                         cd_mul(phi, v_tab[l][0]),  cd_mul(phi, v_tab[l][1]) };
+        cd_t wc1[4] = { v_tab[l2][0], v_tab[l2][1],
+                         cd_mul(phi, v_tab[l2][0]), cd_mul(phi, v_tab[l2][1]) };
+        cd_t wc2[4] = { v_tab[l][0],  v_tab[l][1],
+                         cd_mul(nphi, v_tab[l][0]), cd_mul(nphi, v_tab[l][1]) };
+        double acc = 0;
+        for (int rb = csirs_config_pdu->start_rb;
+             rb < csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs; rb++) {
+          if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+            continue;
+          uint16_t k  = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
+          uint16_t ko = k + mem_offset;
+          for (int sc = 0; sc < NR_NB_SC_PER_RB; sc++)
+            for (int rx = 0; rx < fp->nb_antennas_rx; rx++) {
+              cd_t h0 = {0,0}, h1 = {0,0}, h2 = {0,0};
+              for (int p = 0; p < NP; p++) {
+                cd_t h = cd_from_c16(csi_rs_estimated_channel_freq[rx][p][ko+sc]);
+                h0 = cd_add(h0, cd_mul(h, wc0[p]));
+                h1 = cd_add(h1, cd_mul(h, wc1[p]));
+                h2 = cd_add(h2, cd_mul(h, wc2[p]));
+              }
+              acc += cd_mag2(h0) + cd_mag2(h1) + cd_mag2(h2);
+            }
+        }
+        if (acc > best) { best = acc; i1[0] = l; i2[0] = n; }
+      }
+    }
+    i1[1] = 0; i1[2] = 0;
+    *precoded_sinr_dB = dB_fixed((uint32_t)(best / (3 * eff_noise)));
+
+  } else if (rank_indicator == 3) {
+    /* ── Rank 4 : W = (1/2)[[v_l, v_l2, v_l, v_l2],[phi*v_l, phi*v_l2, -phi*v_l, -phi*v_l2]]
+     *  l2 = (l + O1) % n_beams,  phi = phi4[nn],  nn in {0,1}
+     *  phase_sign: col0=+1, col1=+1, col2=-1, col3=-1                           ── */
+    int l2_off = O1;
+    double best = -1;
+    for (int l = 0; l < n_beams; l++) {
+      int l2 = (l + l2_off) % n_beams;
+      for (int n = 0; n < 2; n++) {
+        cd_t phi  = phi4[n];
+        cd_t nphi = {-phi.r, -phi.i};
+        cd_t wc0[4] = { v_tab[l][0],  v_tab[l][1],
+                         cd_mul(phi, v_tab[l][0]),  cd_mul(phi, v_tab[l][1]) };
+        cd_t wc1[4] = { v_tab[l2][0], v_tab[l2][1],
+                         cd_mul(phi, v_tab[l2][0]), cd_mul(phi, v_tab[l2][1]) };
+        cd_t wc2[4] = { v_tab[l][0],  v_tab[l][1],
+                         cd_mul(nphi, v_tab[l][0]), cd_mul(nphi, v_tab[l][1]) };
+        cd_t wc3[4] = { v_tab[l2][0], v_tab[l2][1],
+                         cd_mul(nphi, v_tab[l2][0]), cd_mul(nphi, v_tab[l2][1]) };
+        double acc = 0;
+        for (int rb = csirs_config_pdu->start_rb;
+             rb < csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs; rb++) {
+          if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+            continue;
+          uint16_t k  = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
+          uint16_t ko = k + mem_offset;
+          for (int sc = 0; sc < NR_NB_SC_PER_RB; sc++)
+            for (int rx = 0; rx < fp->nb_antennas_rx; rx++) {
+              cd_t h0 = {0,0}, h1 = {0,0}, h2 = {0,0}, h3 = {0,0};
+              for (int p = 0; p < NP; p++) {
+                cd_t h = cd_from_c16(csi_rs_estimated_channel_freq[rx][p][ko+sc]);
+                h0 = cd_add(h0, cd_mul(h, wc0[p]));
+                h1 = cd_add(h1, cd_mul(h, wc1[p]));
+                h2 = cd_add(h2, cd_mul(h, wc2[p]));
+                h3 = cd_add(h3, cd_mul(h, wc3[p]));
+              }
+              acc += cd_mag2(h0) + cd_mag2(h1) + cd_mag2(h2) + cd_mag2(h3);
+            }
+        }
+        if (acc > best) { best = acc; i1[0] = l; i2[0] = n; }
+      }
+    }
+    i1[1] = 0; i1[2] = 0;
+    *precoded_sinr_dB = dB_fixed((uint32_t)(best / (4 * eff_noise)));
+
+  } else {
+    LOG_W(NR_PHY, "4-port PMI for rank %d not yet implemented, using default\n", rank_indicator + 1);
+    *precoded_sinr_dB = 0;
+    return -1;
+  }
+
+  LOG_I(NR_PHY, "4-port PMI: rank=%d i1=[%d,%d,%d] i2=%d SINR=%d dB\n",
+        rank_indicator+1, i1[0], i1[1], i1[2], i2[0], *precoded_sinr_dB);
+
+  /* ── Type-II CQI correction ──
+   * Recompute SINR with phase-quantized precoder for accurate CQI. */
+  if (csirs_config_pdu->type2_phase_alphabet > 0) {
+    uint32_t type1_sinr = *precoded_sinr_dB;
+
+    if (rank_indicator == 0) {
+      int N_ph = csirs_config_pdu->type2_phase_alphabet;
+      double ph_step = 2.0 * M_PI / N_ph;
+
+      cd_t w[4] = {{1,0},{1,0},{1,0},{1,0}};
+      for (int iter = 0; iter < 3; iter++) {
+        cd_t wn[4] = {{0,0},{0,0},{0,0},{0,0}};
+        for (int rb = csirs_config_pdu->start_rb;
+             rb < csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs; rb++) {
+          if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+            continue;
+          uint16_t kk = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
+          uint16_t ko2 = kk + mem_offset;
+          for (int sc = 0; sc < NR_NB_SC_PER_RB; sc++)
+            for (int rx = 0; rx < fp->nb_antennas_rx; rx++) {
+              cd_t y = {0,0};
+              for (int p = 0; p < NP; p++)
+                y = cd_add(y, cd_mul(cd_from_c16(csi_rs_estimated_channel_freq[rx][p][ko2+sc]), w[p]));
+              for (int p = 0; p < NP; p++) {
+                cd_t h = cd_from_c16(csi_rs_estimated_channel_freq[rx][p][ko2+sc]);
+                wn[p] = cd_add(wn[p], (cd_t){h.r*y.r + h.i*y.i, h.r*y.i - h.i*y.r});
+              }
+            }
+        }
+        double norm = 0;
+        for (int p = 0; p < NP; p++) norm += cd_mag2(wn[p]);
+        norm = sqrt(norm);
+        if (norm > 1e-10)
+          for (int p = 0; p < NP; p++) w[p] = (cd_t){wn[p].r / norm, wn[p].i / norm};
+      }
+
+      cd_t wq[4];
+      for (int p = 0; p < NP; p++) {
+        double ang = atan2(w[p].i, w[p].r);
+        if (ang < 0) ang += 2.0 * M_PI;
+        int pidx = (int)(ang / ph_step + 0.5) % N_ph;
+        wq[p] = (cd_t){cos(pidx * ph_step), sin(pidx * ph_step)};
+      }
+
+      double qacc = 0;
+      for (int rb = csirs_config_pdu->start_rb;
+           rb < csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs; rb++) {
+        if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
+          continue;
+        uint16_t kk = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
+        uint16_t ko2 = kk + mem_offset;
+        for (int sc = 0; sc < NR_NB_SC_PER_RB; sc++)
+          for (int rx = 0; rx < fp->nb_antennas_rx; rx++) {
+            cd_t hw = {0,0};
+            for (int p = 0; p < NP; p++)
+              hw = cd_add(hw, cd_mul(cd_from_c16(csi_rs_estimated_channel_freq[rx][p][ko2+sc]), wq[p]));
+            qacc += cd_mag2(hw);
+          }
+      }
+
+      uint32_t t2_sinr = dB_fixed((uint32_t)(qacc / eff_noise));
+      LOG_I(NR_PHY, "CQI: Type-I SINR=%d dB -> Type-II(%dPSK) SINR=%d dB\n",
+            type1_sinr, N_ph, t2_sinr);
+      *precoded_sinr_dB = t2_sinr;
+
+    } else {
+      int correction = (csirs_config_pdu->type2_phase_alphabet == 8) ? 1 : 3;
+      if (*precoded_sinr_dB >= (uint32_t)correction)
+        *precoded_sinr_dB -= correction;
+      else
+        *precoded_sinr_dB = 0;
+      LOG_I(NR_PHY, "CQI: Type-I SINR=%d dB -> Type-II(rank%d) SINR=%d dB (-%ddB)\n",
+            type1_sinr, rank_indicator + 1, *precoded_sinr_dB, correction);
+    }
+  }
+
+  return 0;
+}
+
 int nr_csi_rs_pmi_estimation(const PHY_VARS_NR_UE *ue,
                              const fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_config_pdu,
                              const nr_csi_info_t *nr_csi_info,
@@ -648,6 +1014,13 @@ int nr_csi_rs_pmi_estimation(const PHY_VARS_NR_UE *ue,
   // the precoding matrix is obtained by a single index (i2 field here) based on TS 38.214 Table 5.2.2.2.1-1.
   // The first column is applicable if the UE is reporting a Rank = 1, whereas the second column is applicable if the
   // UE is reporting a Rank = 2.
+
+  if (N_ports >= 4) {
+    return nr_csi_rs_pmi_estimation_4port(ue, csirs_config_pdu, N_ports, mem_offset,
+                                           csi_rs_estimated_channel_freq,
+                                           interference_plus_noise_power, rank_indicator,
+                                           i1, i2, precoded_sinr_dB);
+  }
 
   if(N_ports == 1) {
     // 단일 포트: PMI는 의미 없지만, SINR은 실제 계산해야 CQI가 정확함
@@ -786,227 +1159,6 @@ int nr_csi_rs_pmi_estimation(const PHY_VARS_NR_UE *ue,
   }
 
   LOG_I(NR_PHY, "PMI: Function completed successfully\n");
-  return 0;
-}
-
-int nr_csi_rs_type2_port_selection_pmi(const PHY_VARS_NR_UE *ue,
-                                      const fapi_nr_dl_config_csirs_pdu_rel15_t *csirs_config_pdu,
-                                      const uint8_t N_ports,
-                                      uint8_t mem_offset,
-                                      const c16_t csi_rs_estimated_channel_freq[][N_ports][ue->frame_parms.ofdm_symbol_size + FILTER_MARGIN],
-                                      const uint32_t interference_plus_noise_power,
-                                      const uint8_t rank_indicator,
-                                      const int16_t log2_re,
-                                      uint8_t port_sel_d,
-                                      uint8_t num_beams_L,
-                                      uint8_t phase_alphabet,
-                                      bool subband_amplitude_flag,
-                                      fapi_nr_csirs_measurements_t *meas,
-                                      uint32_t *precoded_sinr_dB)
-{
-  const NR_DL_FRAME_PARMS *fp = &ue->frame_parms;
-  const int num_rx = fp->nb_antennas_rx;
-  const int num_groups = N_ports / port_sel_d;
-
-  if (num_groups < 1 || port_sel_d < 1 || num_beams_L < 2 || num_beams_L > 4) {
-    LOG_E(NR_PHY, "Type-II PortSel: invalid params d=%d, L=%d, N_ports=%d\n",
-          port_sel_d, num_beams_L, N_ports);
-    return -1;
-  }
-
-  meas->is_type2 = true;
-  meas->num_beams = num_beams_L;
-  meas->port_sel_d = port_sel_d;
-
-  // Step 1: Port selection - find the best group of d contiguous ports
-  int64_t group_power[16] = {0};
-  int rb_count = 0;
-  for (int rb = csirs_config_pdu->start_rb;
-       rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
-    if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
-      continue;
-    rb_count++;
-    uint16_t k = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
-    uint16_t k_off = k + mem_offset;
-    for (int g = 0; g < num_groups; g++) {
-      for (int p = 0; p < port_sel_d; p++) {
-        int port_idx = g * port_sel_d + p;
-        if (port_idx >= N_ports) break;
-        for (int ar = 0; ar < num_rx; ar++) {
-          const c16_t h = csi_rs_estimated_channel_freq[ar][port_idx][k_off];
-          group_power[g] += (int64_t)h.r * h.r + (int64_t)h.i * h.i;
-        }
-      }
-    }
-  }
-
-  int best_group = 0;
-  for (int g = 1; g < num_groups; g++) {
-    if (group_power[g] > group_power[best_group])
-      best_group = g;
-  }
-  meas->port_selection_indicator = best_group;
-  int sel_port_start = best_group * port_sel_d;
-
-  LOG_D(NR_PHY, "Type-II PortSel: best_group=%d (ports %d..%d), power=%lld\n",
-        best_group, sel_port_start, sel_port_start + port_sel_d - 1,
-        (long long)group_power[best_group]);
-
-  // Step 2: For each layer, compute wideband per-port power for amplitude quantization.
-  // Need power for both polarizations: ports [sel_start .. sel_start+d-1] (pol 0)
-  // and ports [sel_start+N_ports/2 .. sel_start+N_ports/2+d-1] (pol 1).
-  int num_layers = rank_indicator + 1;
-  if (num_layers > FAPI_NR_TYPE2_MAX_LAYERS) num_layers = FAPI_NR_TYPE2_MAX_LAYERS;
-
-  int half_ports = N_ports / 2;
-  int total_coeffs_max = 2 * num_beams_L;
-  if (total_coeffs_max > 2 * port_sel_d) total_coeffs_max = 2 * port_sel_d;
-
-  // Per-coefficient wideband power (includes both polarizations)
-  int64_t coeff_power[2 * FAPI_NR_TYPE2_MAX_BEAMS] = {0};
-  for (int c = 0; c < total_coeffs_max && c < 2 * FAPI_NR_TYPE2_MAX_BEAMS; c++) {
-    int port_local = c % port_sel_d;
-    int pol = c / port_sel_d;
-    int port_idx = sel_port_start + port_local + pol * half_ports;
-    if (port_idx >= N_ports) continue;
-    for (int rb = csirs_config_pdu->start_rb;
-         rb < (csirs_config_pdu->start_rb + csirs_config_pdu->nr_of_rbs); rb++) {
-      if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
-        continue;
-      uint16_t k = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
-      uint16_t k_off = k + mem_offset;
-      for (int ar = 0; ar < num_rx; ar++) {
-        const c16_t h = csi_rs_estimated_channel_freq[ar][port_idx][k_off];
-        coeff_power[c] += ((int64_t)h.r * h.r + (int64_t)h.i * h.i) >> log2_re;
-      }
-    }
-  }
-
-  // Step 3: Quantize wideband amplitudes using per-coefficient power
-  for (int lay = 0; lay < num_layers; lay++) {
-    int64_t max_power = 0;
-    int strongest_idx = 0;
-    int total_coeffs = total_coeffs_max;
-
-    for (int c = 0; c < total_coeffs && c < 2 * FAPI_NR_TYPE2_MAX_BEAMS; c++) {
-      if (coeff_power[c] > max_power) {
-        max_power = coeff_power[c];
-        strongest_idx = c;
-      }
-    }
-    meas->strongest_coeff_indicator[lay] = strongest_idx;
-
-    for (int c = 0; c < total_coeffs && c < 2 * FAPI_NR_TYPE2_MAX_BEAMS; c++) {
-      if (c == strongest_idx) {
-        meas->wideband_amplitude[c][lay] = 0;
-        continue;
-      }
-      if (max_power > 0) {
-        int64_t ratio_x1024 = (coeff_power[c] * 1024) / max_power;
-        if (ratio_x1024 >= 724) meas->wideband_amplitude[c][lay] = 1;
-        else if (ratio_x1024 >= 362) meas->wideband_amplitude[c][lay] = 2;
-        else if (ratio_x1024 >= 181) meas->wideband_amplitude[c][lay] = 3;
-        else if (ratio_x1024 >= 91) meas->wideband_amplitude[c][lay] = 4;
-        else if (ratio_x1024 >= 45) meas->wideband_amplitude[c][lay] = 5;
-        else if (ratio_x1024 >= 16) meas->wideband_amplitude[c][lay] = 6;
-        else meas->wideband_amplitude[c][lay] = 7;
-      } else {
-        meas->wideband_amplitude[c][lay] = 7;
-      }
-    }
-  }
-
-  // Step 4: Subband phase/amplitude coefficients
-  // Use correct port index with polarization offset: pol0 ports = sel_start + local,
-  // pol1 ports = sel_start + local + N_ports/2
-  int total_rbs = csirs_config_pdu->nr_of_rbs;
-  int subband_size = (total_rbs >= 24) ? ((total_rbs >= 72) ? 8 : 4) : total_rbs;
-  int num_sb = (total_rbs + subband_size - 1) / subband_size;
-  if (num_sb > FAPI_NR_TYPE2_MAX_SUBBANDS) num_sb = FAPI_NR_TYPE2_MAX_SUBBANDS;
-  meas->num_subbands = num_sb;
-
-  {
-    int total_coeffs = total_coeffs_max;
-
-    for (int sb = 0; sb < num_sb; sb++) {
-      int sb_start_rb = csirs_config_pdu->start_rb + sb * subband_size;
-      int sb_end_rb = sb_start_rb + subband_size;
-      if (sb_end_rb > csirs_config_pdu->start_rb + total_rbs)
-        sb_end_rb = csirs_config_pdu->start_rb + total_rbs;
-
-      for (int lay = 0; lay < num_layers; lay++) {
-        for (int c = 0; c < total_coeffs && c < 2 * FAPI_NR_TYPE2_MAX_BEAMS; c++) {
-          int port_local = c % port_sel_d;
-          int pol = c / port_sel_d;
-          int port_idx = sel_port_start + port_local + pol * half_ports;
-          if (port_idx >= N_ports) {
-            meas->subband_phase[sb][c][lay] = 0;
-            meas->subband_amp[sb][c][lay] = 0;
-            continue;
-          }
-          int64_t sb_re = 0, sb_im = 0;
-
-          for (int rb = sb_start_rb; rb < sb_end_rb; rb++) {
-            if (csirs_config_pdu->freq_density <= 1 && csirs_config_pdu->freq_density != (rb % 2))
-              continue;
-            uint16_t k = (fp->first_carrier_offset + rb * NR_NB_SC_PER_RB) % fp->ofdm_symbol_size;
-            uint16_t k_off = k + mem_offset;
-            for (int ar = 0; ar < num_rx; ar++) {
-              const c16_t h = csi_rs_estimated_channel_freq[ar][port_idx][k_off];
-              sb_re += h.r;
-              sb_im += h.i;
-            }
-          }
-
-          int phase_idx = 0;
-          if (phase_alphabet == 4) {
-            if (sb_re >= 0 && sb_im >= 0) phase_idx = 0;
-            else if (sb_re < 0 && sb_im >= 0) phase_idx = 1;
-            else if (sb_re < 0 && sb_im < 0) phase_idx = 2;
-            else phase_idx = 3;
-          } else {
-            int64_t abs_re = sb_re < 0 ? -sb_re : sb_re;
-            int64_t abs_im = sb_im < 0 ? -sb_im : sb_im;
-            int octant;
-            if (abs_im <= (abs_re * 4142 / 10000))
-              octant = 0;
-            else if (abs_re <= (abs_im * 4142 / 10000))
-              octant = 2;
-            else
-              octant = 1;
-            if (sb_re >= 0 && sb_im >= 0) phase_idx = octant;
-            else if (sb_re < 0 && sb_im >= 0) phase_idx = 4 - octant;
-            else if (sb_re < 0 && sb_im < 0) phase_idx = 4 + octant;
-            else phase_idx = 8 - octant;
-            phase_idx &= 0x7;
-          }
-          meas->subband_phase[sb][c][lay] = phase_idx;
-
-          if (subband_amplitude_flag) {
-            int64_t sb_power = sb_re * sb_re + sb_im * sb_im;
-            int sb_rb_count = sb_end_rb - sb_start_rb;
-            int64_t threshold = (coeff_power[c] * sb_rb_count) / (2 * (rb_count > 0 ? rb_count : 1));
-            meas->subband_amp[sb][c][lay] = (sb_power >= threshold) ? 0 : 1;
-          } else {
-            meas->subband_amp[sb][c][lay] = 0;
-          }
-        }
-      }
-    }
-  }
-
-  // Step 5: Compute precoded SINR for CQI
-  uint32_t eff_noise = interference_plus_noise_power > 0 ? interference_plus_noise_power : 1;
-  int64_t signal_power = group_power[best_group];
-  if (rb_count > 0) signal_power /= rb_count;
-  if (num_rx > 0) signal_power /= num_rx;
-  if (log2_re > 0) signal_power >>= log2_re;
-
-  uint32_t sinr_linear = (signal_power > 0) ? (uint32_t)(signal_power / eff_noise) : 0;
-  *precoded_sinr_dB = dB_fixed(sinr_linear);
-
-  LOG_I(NR_PHY, "Type-II PortSel PMI: group=%d, L=%d, d=%d, layers=%d, SINR=%d dB, subbands=%d\n",
-        best_group, num_beams_L, port_sel_d, num_layers, *precoded_sinr_dB, num_sb);
   return 0;
 }
 
@@ -1261,142 +1413,69 @@ void nr_ue_csi_rs_procedures(PHY_VARS_NR_UE *ue,
   uint8_t i2[1] = {0};
   uint8_t cqi = 0;
   uint32_t precoded_sinr_dB = 0;
-  fapi_nr_csirs_measurements_t csirs_measurements;
-  memset(&csirs_measurements, 0, sizeof(csirs_measurements));
-  csirs_measurements.is_type2 = false;
-
   // bit 3 in bitmap to indicate PMI measurement
   if (csirs_config_pdu->measurement_bitmap & 8) {
-    uint32_t noise_used = csi_info->csi_im_meas_computed ? csi_info->interference_plus_noise_power : noise_power;
-    LOG_I(NR_PHY, "PMI: Calling PMI estimation with ports=%d, noise_power=%u, type2=%d\n",
-          mapping_parms.ports, noise_used, csirs_config_pdu->type2_port_selection);
+    LOG_I(NR_PHY, "PMI: Calling PMI estimation with ports=%d, noise_power=%u\n", 
+          mapping_parms.ports, csi_info->csi_im_meas_computed ? csi_info->interference_plus_noise_power : noise_power);
+    nr_csi_rs_pmi_estimation(ue,
+                             csirs_config_pdu,
+                             csi_info,
+                             mapping_parms.ports,
+                             mem_offset,
+                             csi_rs_estimated_channel_freq,
+                             csi_info->csi_im_meas_computed ? csi_info->interference_plus_noise_power : noise_power,
+                             rank_indicator,
+                             log2_re,
+                             i1,
+                             i2,
+                             &precoded_sinr_dB);
 
-    if (csirs_config_pdu->type2_port_selection && mapping_parms.ports > 2) {
-      nr_csi_rs_type2_port_selection_pmi(ue,
-                                         csirs_config_pdu,
-                                         mapping_parms.ports,
-                                         mem_offset,
-                                         csi_rs_estimated_channel_freq,
-                                         noise_used,
-                                         rank_indicator,
-                                         log2_re,
-                                         csirs_config_pdu->type2_port_sel_d,
-                                         csirs_config_pdu->type2_num_beams,
-                                         csirs_config_pdu->type2_phase_alphabet,
-                                         csirs_config_pdu->type2_subband_amplitude,
-                                         &csirs_measurements,
-                                         &precoded_sinr_dB);
-    } else {
-      nr_csi_rs_pmi_estimation(ue,
-                               csirs_config_pdu,
-                               csi_info,
-                               mapping_parms.ports,
-                               mem_offset,
-                               csi_rs_estimated_channel_freq,
-                               noise_used,
-                               rank_indicator,
-                               log2_re,
-                               i1,
-                               i2,
-                               &precoded_sinr_dB);
-    }
-
+    // bit 4 in bitmap to indicate CQI measurement
     if(csirs_config_pdu->measurement_bitmap & 16)
       nr_csi_rs_cqi_estimation(precoded_sinr_dB, &cqi);
   }
 
-  LOG_I(NR_PHY, "[UE %d] CSI-RS Results: RSRP=%d dBm, RI=%d, type2=%d, SINR=%d dB, CQI=%d\n",
-        ue->Mod_id, rsrp_dBm, rank_indicator + 1, csirs_measurements.is_type2,
-        precoded_sinr_dB, cqi);
+  // 상세한 CSI 측정 결과 로그 출력
+  LOG_I(NR_PHY, "[UE %d] CSI-RS Measurement Results:\n", ue->Mod_id);
+  LOG_I(NR_PHY, "  - Measurement Bitmap: 0x%02x\n", csirs_config_pdu->measurement_bitmap);
+  LOG_I(NR_PHY, "  - RSRP: %i dBm\n", rsrp_dBm);
+  LOG_I(NR_PHY, "  - Rank Indicator (RI): %i\n", rank_indicator + 1);
+  LOG_I(NR_PHY, "  - PMI i1: [%i, %i, %i]\n", i1[0], i1[1], i1[2]);
+  LOG_I(NR_PHY, "  - PMI i2: %i\n", i2[0]);
+  LOG_I(NR_PHY, "  - SINR: %i dB\n", precoded_sinr_dB);
+  LOG_I(NR_PHY, "  - CQI: %i\n", cqi);
+  
+  // 기존 switch 문 유지 (호환성)
+  switch (csirs_config_pdu->measurement_bitmap) {
+    case 1 :
+      LOG_I(NR_PHY, "[UE %d] RSRP = %i dBm\n", ue->Mod_id, rsrp_dBm);
+      break;
+    case 26 :
+      LOG_I(NR_PHY, "RI = %i i1 = %i.%i.%i, i2 = %i, SINR = %i dB, CQI = %i\n",
+            rank_indicator + 1, i1[0], i1[1], i1[2], i2[0], precoded_sinr_dB, cqi);
+      break;
+    case 30 : // 0x1e: RSRP + RI + PMI + CQI
+      LOG_I(NR_PHY, "RSRP = %i dBm, RI = %i i1 = %i.%i.%i, i2 = %i, SINR = %i dB, CQI = %i\n",
+            rsrp_dBm, rank_indicator + 1, i1[0], i1[1], i1[2], i2[0], precoded_sinr_dB, cqi);
+      break;
+    case 27 :
+      LOG_I(NR_PHY, "RSRP = %i dBm, RI = %i i1 = %i.%i.%i, i2 = %i, SINR = %i dB, CQI = %i\n",
+            rsrp_dBm, rank_indicator + 1, i1[0], i1[1], i1[2], i2[0], precoded_sinr_dB, cqi);
+      break;
+    default :
+      LOG_I(NR_PHY, "Measurement bitmap 0x%02x not in standard cases, but processing completed\n", 
+            csirs_config_pdu->measurement_bitmap);
+  }
 
+  // Send CSI measurements to MAC
+  fapi_nr_csirs_measurements_t csirs_measurements;
   csirs_measurements.rsrp = rsrp;
   csirs_measurements.rsrp_dBm = rsrp_dBm;
   csirs_measurements.rank_indicator = rank_indicator;
   csirs_measurements.i1 = *i1;
   csirs_measurements.i2 = *i2;
   csirs_measurements.cqi = cqi;
-  csirs_measurements.radiolink_monitoring = RLM_no_monitoring;
-
-  {
-    static int csi_log_init = 0;
-    static FILE *csi_log_fp = NULL;
-    if (!csi_log_init) {
-      csi_log_init = 1;
-      const char *lp = getenv("CSI_CHANNEL_LOG");
-      if (lp && lp[0]) {
-        csi_log_fp = fopen(lp, "wb");
-        if (csi_log_fp)
-          LOG_I(NR_PHY, "CSI Channel Log: writing to %s\n", lp);
-        else
-          LOG_E(NR_PHY, "CSI Channel Log: cannot open %s\n", lp);
-      }
-    }
-    if (csi_log_fp) {
-      const uint16_t np = mapping_parms.ports;
-      const uint16_t nr = frame_parms->nb_antennas_rx;
-      const uint32_t os = frame_parms->ofdm_symbol_size;
-      const uint8_t pt = csirs_measurements.is_type2 ? 1 : 0;
-
-      int tc = pt ? 2 * csirs_measurements.num_beams : 0;
-      if (tc > 2 * FAPI_NR_TYPE2_MAX_BEAMS) tc = 2 * FAPI_NR_TYPE2_MAX_BEAMS;
-      int nl = rank_indicator + 1;
-      if (nl > FAPI_NR_TYPE2_MAX_LAYERS) nl = FAPI_NR_TYPE2_MAX_LAYERS;
-
-      uint32_t ch_bytes = nr * np * os * sizeof(c16_t);
-      uint32_t sb_bytes = pt ? (csirs_measurements.num_subbands * tc * nl) : 0;
-      uint32_t rec_size = 64 + ch_bytes + sb_bytes;
-
-      uint8_t hdr[64];
-      memset(hdr, 0, 64);
-      uint32_t magic = 0x43534932;
-      memcpy(hdr +  0, &magic, 4);
-      memcpy(hdr +  4, &rec_size, 4);
-      uint32_t fv = (uint32_t)proc->frame_rx;
-      uint32_t sv = (uint32_t)proc->nr_slot_rx;
-      memcpy(hdr +  8, &fv, 4);
-      memcpy(hdr + 12, &sv, 4);
-      memcpy(hdr + 16, &np, 2);
-      memcpy(hdr + 18, &nr, 2);
-      memcpy(hdr + 20, &os, 4);
-      uint32_t fc = frame_parms->first_carrier_offset;
-      memcpy(hdr + 24, &fc, 4);
-      uint16_t srb = csirs_config_pdu->start_rb;
-      uint16_t nrb = csirs_config_pdu->nr_of_rbs;
-      memcpy(hdr + 28, &srb, 2);
-      memcpy(hdr + 30, &nrb, 2);
-      hdr[32] = mem_offset;
-      hdr[33] = rank_indicator;
-      hdr[34] = cqi;
-      hdr[35] = pt;
-      hdr[36] = i1[0];
-      hdr[37] = i2[0];
-      hdr[38] = csirs_measurements.port_selection_indicator;
-      hdr[39] = csirs_measurements.strongest_coeff_indicator[0];
-      hdr[40] = (nl > 1) ? csirs_measurements.strongest_coeff_indicator[1] : 0;
-      hdr[41] = csirs_measurements.num_beams;
-      hdr[42] = csirs_measurements.port_sel_d;
-      hdr[43] = csirs_config_pdu->type2_phase_alphabet;
-      for (int c = 0; c < 8 && c < tc; c++)
-        hdr[44 + c] = csirs_measurements.wideband_amplitude[c][0];
-      for (int c = 0; c < 8 && c < tc; c++)
-        hdr[52 + c] = (nl > 1) ? csirs_measurements.wideband_amplitude[c][1] : 0;
-      hdr[60] = csirs_measurements.num_subbands;
-
-      fwrite(hdr, 1, 64, csi_log_fp);
-      for (int arx = 0; arx < nr; arx++)
-        for (int pp = 0; pp < np; pp++)
-          fwrite(&csi_rs_estimated_channel_freq[arx][pp][0], sizeof(c16_t), os, csi_log_fp);
-
-      if (sb_bytes > 0) {
-        for (int sb = 0; sb < csirs_measurements.num_subbands; sb++)
-          for (int cc = 0; cc < tc; cc++)
-            for (int ll = 0; ll < nl; ll++)
-              fwrite(&csirs_measurements.subband_phase[sb][cc][ll], 1, 1, csi_log_fp);
-      }
-      fflush(csi_log_fp);
-    }
-  }
-
+  csirs_measurements.radiolink_monitoring = RLM_no_monitoring; // TODO do be activated in case of RLM based on CSI-RS
   nr_downlink_indication_t dl_indication;
   fapi_nr_rx_indication_t rx_ind = {0};
   nr_fill_dl_indication(&dl_indication, NULL, &rx_ind, proc, ue, NULL);

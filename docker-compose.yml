@@ -13,6 +13,8 @@ services:
     volumes:
       - ./vRAN_Socket:/workspace/vRAN_Socket
       - ./openairinterface5g_whan:/workspace/openairinterface5g_whan
+      - ./graduation:/workspace/graduation
+      - ./csinet_checkpoints:/workspace/csinet_checkpoints
       - /tmp/oai_gpu_ipc:/tmp/oai_gpu_ipc
     working_dir: /workspace
     deploy:

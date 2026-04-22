@@ -372,7 +372,7 @@ NR_tda_info_t get_ul_tda_info(const NR_UE_UL_BWP_t *ul_bwp,
   if (tdalist) {
     tda_info.valid_tda = tda_index < tdalist->list.count;
     if (!tda_info.valid_tda) {
-      LOG_E(NR_MAC, "TDA index from DCI %d exceeds TDA list array size %d\n", tda_index, tdalist->list.count);
+      LOG_D(NR_MAC, "TDA index from DCI %d exceeds PUSCH TDA list size %d (likely PDCCH false positive)\n", tda_index, tdalist->list.count);
       return tda_info;
     }
     NR_PUSCH_TimeDomainResourceAllocation_t *tda = tdalist->list.array[tda_index];
@@ -505,7 +505,7 @@ NR_tda_info_t set_tda_info_from_list(NR_PDSCH_TimeDomainResourceAllocationList_t
   NR_tda_info_t tda_info = {0};
   tda_info.valid_tda = tda_index < tdalist->list.count;
   if (!tda_info.valid_tda) {
-    LOG_E(NR_MAC, "TDA index from DCI %d exceeds TDA list array size %d\n", tda_index, tdalist->list.count);
+    LOG_D(NR_MAC, "TDA index from DCI %d exceeds PDSCH TDA list size %d (likely PDCCH false positive)\n", tda_index, tdalist->list.count);
     return tda_info;
   }
   NR_PDSCH_TimeDomainResourceAllocation_t *tda = tdalist->list.array[tda_index];
@@ -4878,7 +4878,7 @@ static void compute_pmi_bitlen(const NR_CSI_ReportConfig_t *csi_reportconfig, ui
         int wb_amp_bits = (2 * L - 1) * 3;  // 3-bit per coefficient, strongest omitted
         int total_coeffs = 2 * L;
         if (total_coeffs > 2 * d) total_coeffs = 2 * d;
-        int avg_phase_bits = 1 + 2 * total_coeffs * rank;  // 1-bit flag + QPSK(2bit) × coeffs × layers
+        int avg_phase_bits = 1 + log2_phase * total_coeffs * rank;  // 1-bit flag + phase_bits × coeffs × layers
         int wb_pmi_total = port_sel_bits + strongest_bits * rank + wb_amp_bits * rank + avg_phase_bits;
         csi_report->csi_meas_bitlen.type2_wideband_pmi_bitlen[i] = wb_pmi_total;
 

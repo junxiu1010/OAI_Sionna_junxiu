@@ -1,0 +1,11 @@
+services:
+  oai-gnb:
+    privileged: true
+    volumes:
+      - /home/dclserver78/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build/nr-softmodem:/opt/oai-gnb/bin/nr-softmodem
+      - /home/dclserver78/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build/librfsimulator.so:/usr/local/lib/librfsimulator.so
+  oai-nr-ue:
+    privileged: true
+    volumes:
+      - /home/dclserver78/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build/nr-uesoftmodem:/opt/oai-nr-ue/bin/nr-uesoftmodem
+      - /home/dclserver78/oai_sionna_junxiu/openairinterface5g_whan/cmake_targets/ran_build/build/librfsimulator.so:/usr/local/lib/librfsimulator.so

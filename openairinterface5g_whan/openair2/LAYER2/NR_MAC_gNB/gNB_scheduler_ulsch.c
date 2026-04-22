@@ -314,6 +314,22 @@ static int nr_process_mac_pdu(instance_t module_idP,
   log_dump(NR_MAC, pduP, pdu_len, LOG_DUMP_CHAR, "\n");
 #endif
 
+  {
+    int _chk = pdu_len < 64 ? pdu_len : 64;
+    int _allz = 1;
+    for (int _i = 0; _i < _chk; _i++) {
+      if (pduP[_i] != 0) { _allz = 0; break; }
+    }
+    if (_allz && pdu_len > 0) {
+      static uint64_t _azr_cnt = 0;
+      _azr_cnt++;
+      if (_azr_cnt <= 5 || _azr_cnt % 1000 == 0)
+        LOG_W(NR_MAC, "Rejecting all-zero UL MAC PDU (%d B) RNTI %04X %d.%d [#%lu]\n",
+              pdu_len, UE->rnti, frameP, slot, (unsigned long)_azr_cnt);
+      return 0;
+    }
+  }
+
   while (pdu_len > 0) {
     uint16_t mac_len = 0;
     uint8_t lcid = 0;
@@ -679,11 +695,23 @@ static void nr_rx_ra_sdu(const module_id_t mod_id,
 
   const int target_snrx10 = mac->pusch_target_snrx10;
   if (!sdu) { // NACK
-    if (ra->ra_state != nrRA_WAIT_Msg3)
+    if (ra->ra_state != nrRA_WAIT_Msg3) {
+      LOG_D(NR_MAC, "[MSG3_DIAG] RNTI %04x sdu=NULL but ra_state=%d (not WAIT_Msg3), skip\n",
+            rnti, ra->ra_state);
       return;
+    }
 
-    if((frame!=ra->Msg3_frame) || (slot!=ra->Msg3_slot))
+    if((frame!=ra->Msg3_frame) || (slot!=ra->Msg3_slot)) {
+      static int _msg3_mismatch = 0;
+      if (_msg3_mismatch < 50)
+        LOG_W(NR_MAC, "[MSG3_DIAG] RNTI %04x frame/slot mismatch: got %d.%d expect %d.%d round=%d\n",
+              rnti, frame, slot, ra->Msg3_frame, ra->Msg3_slot, ra->msg3_round);
+      _msg3_mismatch++;
       return;
+    }
+
+    LOG_I(NR_MAC, "[MSG3_DIAG] RNTI %04x Msg3 DTX at %d.%d round=%d/%d → retransmission\n",
+          rnti, frame, slot, ra->msg3_round, mac->ul_bler.harq_round_max);
 
     if (ul_cqi != 0xff)
       ra->msg3_TPC = nr_get_tpc(target_snrx10, ul_cqi, 30, 0);
@@ -2461,6 +2489,17 @@ void nr_schedule_ulsch(module_id_t module_id, frame_t frame, slot_t slot, nfapi_
       continue;
 
     uint16_t rnti = UE->rnti;
+    {
+      static uint64_t _ul_grant_cnt = 0;
+      _ul_grant_cnt++;
+      if (_ul_grant_cnt <= 20 || _ul_grant_cnt % 500 == 0)
+        LOG_W(NR_MAC, "[UL_GRANT_DIAG] #%lu RNTI %04x rb=%d frame.slot=%d.%d dci_fmt=%d ss_type=%d coreset=%ld\n",
+              (unsigned long)_ul_grant_cnt, rnti, sched_pusch->rbSize,
+              sched_pusch->frame, sched_pusch->slot,
+              UE->current_UL_BWP.dci_format,
+              sched_ctrl->search_space ? sched_ctrl->search_space->searchSpaceType->present : -1,
+              sched_ctrl->coreset ? sched_ctrl->coreset->controlResourceSetId : -1L);
+    }
     sched_ctrl->SR = false;
     int8_t harq_id = sched_pusch->ul_harq_pid;
     if (harq_id < 0) {

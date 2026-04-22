@@ -7,7 +7,7 @@ system:
   mode: gpu-ipc            # gpu-ipc | socket
   channel_mode: static     # dynamic | static
   batch_size: 4            # UE startup batch size
-  mu_mimo: false            # Enable MU-MIMO scheduling
+  mu_mimo: true             # Enable MU-MIMO scheduling
   force_mu_dl_traffic: false # Inject dummy DL bytes for MU-MIMO testing
 
 antenna:
@@ -59,7 +59,7 @@ srs:
   group_hopping: neither
   alpha: alpha1
   p0: -84
-  nrof_srs_ports: 1
+  nrof_srs_ports: 2
 
 csi_measurement:
   cqi_table: table1
@@ -83,12 +83,90 @@ channel:
   scenario: UMa-NLOS       # UMi-LOS | UMi-NLOS | UMa-LOS | UMa-NLOS
   sector_half_deg: 90.0    # half-sector span for UE angular placement (default was 60)
   jitter_std_deg: 20.0     # AoD/AoA jitter std dev per UE (default was 10)
+  # 3GPP TR 38.901 topology parameters
+  bs_height_m: 25.0          # BS antenna height (UMi=10, UMa=25)
+  ue_height_m: 1.5           # UE height (1.5~2.5 m)
+  isd_m: 500                 # Inter-Site Distance (UMi=200, UMa=500)
+  min_ue_distance_m: 35      # minimum BS-UE horizontal distance
+  max_ue_distance_m: 500     # maximum BS-UE horizontal distance
+  # 3GPP TR 38.901 large-scale fading
+  shadow_fading_std_dB: 6.0  # shadow fading σ (UMi-LOS=4, UMi-NLOS=7.82, UMa-LOS=4, UMa-NLOS=6)
+  k_factor_mean_dB: null     # K-factor mean (LOS only; null=scenario default; UMi-LOS=9, UMa-LOS=9)
+  k_factor_std_dB: null      # K-factor std  (LOS only; null=scenario default; UMi-LOS=5, UMa-LOS=3.5)
 
 carrier:
   frequency_GHz: 3.5
   bandwidth_prb: 106
   scs_kHz: 30
   band: 78
+
+multicell:
+  enabled: false
+  num_cells: 1
+  ues_per_cell: 4
+  ici_atten_dB: 15.0
+  p1b_npz: null
+  per_cell_overrides: {}
+
+bearer:
+  enable_sdap: false          # SDAP header DL/UL inclusion
+  drbs: 1                     # DRBs per PDU session (1-32)
+  um_on_default_drb: false    # Use RLC UM for default DRB (false=AM)
+  drb_ciphering: true         # DRB ciphering (NEA)
+  drb_integrity: false        # DRB integrity protection (NIA)
+
+qos:
+  default_5qi: 9              # Default 5QI (9=Non-GBR best effort)
+  session_ambr_ul: "10Gbps"   # Session AMBR uplink
+  session_ambr_dl: "10Gbps"   # Session AMBR downlink
+  arp_priority: 15            # ARP priority level (1-15, 15=lowest)
+  arp_preempt_cap: "NOT_PREEMPT"
+  arp_preempt_vuln: "PREEMPTABLE"
+
+traffic:
+  enabled: false                # true to auto-start traffic after UE attach
+  server_ip: "12.1.1.1"        # iperf3 server IP (UPF DN interface)
+  default_profile:
+    pattern: full_buffer        # full_buffer | periodic | bursty
+    direction: dl               # dl | ul | bidir
+    bitrate_mbps: 100           # target bitrate (ignored for full_buffer TCP)
+    protocol: udp               # tcp | udp
+    duration_s: 0               # 0 = indefinite
+    # Periodic pattern settings
+    packet_size_bytes: 1400
+    interval_ms: 1.0
+    # Bursty (ON/OFF) pattern settings
+    burst_on_ms: 100            # mean ON duration (exponential)
+    burst_off_ms: 200           # mean OFF inter-arrival (Poisson)
+    burst_rate_mbps: 50
+    # QoS marking
+    dscp: 0                     # 0=BE, 46=EF, 34=AF41
+    # UE mobility speed (km/h) — controls Sionna channel Doppler
+    speed_kmh: 3.0              # 0=static, 3=pedestrian, 30=urban, 120=highway, 350=HST
+  # Per-UE overrides (optional):
+  # ue_profiles:
+  #   - ue_idx: 0
+  #     pattern: bursty
+  #     speed_kmh: 60            # vehicular UE
+  #     burst_on_ms: 50
+  #     burst_off_ms: 100
+  #   - ue_idx: 1
+  #     pattern: periodic
+  #     speed_kmh: 3             # pedestrian UE
+  #     bitrate_mbps: 10
+
+csinet:
+  enabled: false              # CsiNet CSI compression sidecar 활성화
+  mode: baseline              # baseline | conditioned
+  compression_ratio: 0.25     # gamma (encoder output / input ratio)
+  scenario: UMi_NLOS          # UMi_NLOS | UMi_LOS | UMa_NLOS | UMa_LOS (underscore format)
+  checkpoint_dir: /workspace/csinet_checkpoints
+  csi_rs_period: 20           # H 캡처 주기 (슬롯 단위, CSI-RS periodicity와 동일 권장)
+  csinet_path: /workspace/graduation/csinet   # CsiNet 모듈 루트 경로
+  differential:
+    enabled: false            # Delta encoding for conditioning vector
+    threshold: 0.01           # Normalized delta energy threshold (||Δc||²/||c||² > th → send)
+    max_stale_slots: 100      # Force full update after this many skipped slots
 
 network:
   amf_ip: 192.168.70.132

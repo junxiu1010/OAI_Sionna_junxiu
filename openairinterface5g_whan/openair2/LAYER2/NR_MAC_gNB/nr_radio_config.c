@@ -1692,10 +1692,14 @@ static void config_downlinkBWP(NR_BWP_Downlink_t *bwp,
   asn1cSeqAdd(&bwp->bwp_Dedicated->pdcch_Config->choice.setup->controlResourceSetToAddModList->list, coreset2);
 
   searchspaceid = 10 + bwp->bwp_Id;
-  num_cces = get_coreset_num_cces(coreset2->frequencyDomainResources.buf, coreset2->duration);
-  verify_agg_levels(num_cces, num_agg_level_candidates, coreset->controlResourceSetId, searchspaceid, rrc_num_agg_level_candidates);
+  int uss_agg[NUM_PDCCH_AGG_LEVELS];
+  uss_agg[PDCCH_AGG_LEVEL1]  = NR_SearchSpace__nrofCandidates__aggregationLevel1_n0;
+  uss_agg[PDCCH_AGG_LEVEL2]  = NR_SearchSpace__nrofCandidates__aggregationLevel2_n0;
+  uss_agg[PDCCH_AGG_LEVEL4]  = NR_SearchSpace__nrofCandidates__aggregationLevel4_n1;
+  uss_agg[PDCCH_AGG_LEVEL8]  = NR_SearchSpace__nrofCandidates__aggregationLevel8_n0;
+  uss_agg[PDCCH_AGG_LEVEL16] = NR_SearchSpace__nrofCandidates__aggregationLevel16_n0;
   NR_SearchSpace_t *ss2 =
-      rrc_searchspace_config(false, searchspaceid, coreset2->controlResourceSetId, rrc_num_agg_level_candidates);
+      rrc_searchspace_config(false, searchspaceid, 0, uss_agg);
   asn1cSeqAdd(&bwp->bwp_Dedicated->pdcch_Config->choice.setup->searchSpacesToAddModList->list, ss2);
 
   bwp->bwp_Dedicated->pdcch_Config->choice.setup->searchSpacesToReleaseList = NULL;
@@ -3281,14 +3285,7 @@ static NR_SpCellConfig_t *get_initial_SpCellConfig(int uid,
   int searchspaceid = 4;
   NR_SearchSpace_t *ss = rrc_searchspace_config(true, searchspaceid, 0, css_num_agg_level_candidates);
   searchspaceid = 5;
-  int rrc_num_agg_level_candidates[NUM_PDCCH_AGG_LEVELS];
-  int num_cces = get_coreset_num_cces(coreset->frequencyDomainResources.buf, coreset->duration);
-  verify_agg_levels(num_cces,
-                    configuration->num_agg_level_candidates,
-                    coreset->controlResourceSetId,
-                    searchspaceid,
-                    rrc_num_agg_level_candidates);
-  NR_SearchSpace_t *ss2 = rrc_searchspace_config(false, searchspaceid, coreset->controlResourceSetId, rrc_num_agg_level_candidates);
+  NR_SearchSpace_t *ss2 = rrc_searchspace_config(false, searchspaceid, 0, css_num_agg_level_candidates);
   asn1cSeqAdd(&bwp_Dedicated->pdcch_Config->choice.setup->searchSpacesToAddModList->list, ss);
   asn1cSeqAdd(&bwp_Dedicated->pdcch_Config->choice.setup->searchSpacesToAddModList->list, ss2);
 

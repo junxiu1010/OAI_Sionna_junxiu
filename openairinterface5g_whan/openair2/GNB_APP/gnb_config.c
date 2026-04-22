@@ -1109,10 +1109,10 @@ void RCconfig_NR_L1(void)
       AssertFatal(*L1_ParamList.paramarray[j][L1_THREAD_POOL_SIZE].uptr == 2022,
                   "thread_pool_size removed, please use --thread-pool\n");
       gNB->ofdm_offset_divisor = *(L1_ParamList.paramarray[j][L1_OFDM_OFFSET_DIVISOR].uptr);
-      gNB->pucch0_thres = *(L1_ParamList.paramarray[j][L1_PUCCH0_DTX_THRESHOLD].uptr);
-      gNB->prach_thres = *(L1_ParamList.paramarray[j][L1_PRACH_DTX_THRESHOLD].uptr);
-      gNB->pusch_thres = *(L1_ParamList.paramarray[j][L1_PUSCH_DTX_THRESHOLD].uptr);
-      gNB->srs_thres = *(L1_ParamList.paramarray[j][L1_SRS_DTX_THRESHOLD].uptr);
+      gNB->pucch0_thres = *(L1_ParamList.paramarray[j][L1_PUCCH0_DTX_THRESHOLD].iptr);
+      gNB->prach_thres = *(L1_ParamList.paramarray[j][L1_PRACH_DTX_THRESHOLD].iptr);
+      gNB->pusch_thres = *(L1_ParamList.paramarray[j][L1_PUSCH_DTX_THRESHOLD].iptr);
+      gNB->srs_thres = *(L1_ParamList.paramarray[j][L1_SRS_DTX_THRESHOLD].iptr);
       gNB->max_ldpc_iterations = *(L1_ParamList.paramarray[j][L1_MAX_LDPC_ITERATIONS].uptr);
       gNB->L1_rx_thread_core = *(L1_ParamList.paramarray[j][L1_RX_THREAD_CORE].iptr);
       gNB->L1_tx_thread_core = *(L1_ParamList.paramarray[j][L1_TX_THREAD_CORE].iptr);
@@ -1819,6 +1819,8 @@ void RCconfig_nr_macrlc(configmodule_interface_t *cfg)
         dl_bler_options->harq_round_max = 1;
       else
         dl_bler_options->harq_round_max = *(MacRLC_ParamList.paramarray[j][MACRLC_DL_HARQ_ROUND_MAX_IDX].u8ptr);
+      dl_bler_options->filter_coeff = (float)*(MacRLC_ParamList.paramarray[j][MACRLC_DL_BLER_FILTER_COEFF_IDX].dblptr);
+      dl_bler_options->update_frames = *(MacRLC_ParamList.paramarray[j][MACRLC_DL_BLER_UPDATE_FRAMES_IDX].u8ptr);
       NR_bler_options_t *ul_bler_options = &RC.nrmac[j]->ul_bler;
       ul_bler_options->upper = *(MacRLC_ParamList.paramarray[j][MACRLC_UL_BLER_TARGET_UPPER_IDX].dblptr);
       ul_bler_options->lower = *(MacRLC_ParamList.paramarray[j][MACRLC_UL_BLER_TARGET_LOWER_IDX].dblptr);
@@ -1828,6 +1830,8 @@ void RCconfig_nr_macrlc(configmodule_interface_t *cfg)
         ul_bler_options->harq_round_max = 1;
       else
         ul_bler_options->harq_round_max = *(MacRLC_ParamList.paramarray[j][MACRLC_UL_HARQ_ROUND_MAX_IDX].u8ptr);
+      ul_bler_options->filter_coeff = (float)*(MacRLC_ParamList.paramarray[j][MACRLC_UL_BLER_FILTER_COEFF_IDX].dblptr);
+      ul_bler_options->update_frames = *(MacRLC_ParamList.paramarray[j][MACRLC_UL_BLER_UPDATE_FRAMES_IDX].u8ptr);
       RC.nrmac[j]->min_grant_prb = *(MacRLC_ParamList.paramarray[j][MACRLC_MIN_GRANT_PRB_IDX].u16ptr);
       RC.nrmac[j]->identity_pm = *(MacRLC_ParamList.paramarray[j][MACRLC_IDENTITY_PM_IDX].u8ptr);
       RC.nrmac[j]->mu_mimo_enabled = *(MacRLC_ParamList.paramarray[j][MACRLC_MU_MIMO_IDX].u8ptr);

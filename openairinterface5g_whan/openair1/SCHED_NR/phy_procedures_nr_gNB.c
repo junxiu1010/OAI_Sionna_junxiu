@@ -874,6 +874,24 @@ int phy_procedures_gNB_uespec_RX(PHY_VARS_gNB *gNB, int frame_rx, int slot_rx, N
         pusch_vars->ulsch_noise_power[aarx] /= num_dmrs;
         pusch_vars->ulsch_noise_power_tot += pusch_vars->ulsch_noise_power[aarx];
       }
+      {
+        static int _pusch_diag_cnt = 0;
+        int _pwr_db = dB_fixed_x10(pusch_vars->ulsch_power_tot);
+        int _nse_db = dB_fixed_x10(pusch_vars->ulsch_noise_power_tot);
+        if (_pusch_diag_cnt < 200 || _pusch_diag_cnt % 500 == 0) {
+          LOG_I(PHY, "[PUSCH_DIAG] %d.%d RNTI=%04x pwr_lin=%u noise_lin=%u "
+                "pwr_dBx10=%d noise_dBx10=%d thres=%d "
+                "per_ant_pwr=[%u,%u,%u,%u] per_ant_nse=[%u,%u,%u,%u]\n",
+                frame_rx, slot_rx, ulsch->rnti,
+                pusch_vars->ulsch_power_tot, pusch_vars->ulsch_noise_power_tot,
+                _pwr_db, _nse_db, gNB->pusch_thres,
+                pusch_vars->ulsch_power[0], pusch_vars->ulsch_power[1],
+                pusch_vars->ulsch_power[2], pusch_vars->ulsch_power[3],
+                pusch_vars->ulsch_noise_power[0], pusch_vars->ulsch_noise_power[1],
+                pusch_vars->ulsch_noise_power[2], pusch_vars->ulsch_noise_power[3]);
+        }
+        _pusch_diag_cnt++;
+      }
       if (dB_fixed_x10(pusch_vars->ulsch_power_tot) < dB_fixed_x10(pusch_vars->ulsch_noise_power_tot) + gNB->pusch_thres) {
         NR_gNB_PHY_STATS_t *stats = get_phy_stats(gNB, ulsch->rnti);
 

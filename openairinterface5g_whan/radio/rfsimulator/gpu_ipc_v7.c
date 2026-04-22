@@ -146,8 +146,20 @@ int gpu_ipc_v7_init(gpu_ipc_v7_ctx_t *ctx, gpu_ipc_v7_role_t role)
 
     if (load_cuda_runtime_v7(ctx) != 0) return -1;
 
+    const char *cell_idx_env = getenv("RFSIM_GPU_IPC_CELL_IDX");
+    int cell_idx = cell_idx_env ? atoi(cell_idx_env) : -1;
     const char *ue_idx_env = getenv("RFSIM_GPU_IPC_UE_IDX");
-    if (role == GPU_IPC_V7_ROLE_UE && ue_idx_env) {
+
+    if (cell_idx >= 0 && role == GPU_IPC_V7_ROLE_UE && ue_idx_env) {
+        int ue_idx = atoi(ue_idx_env);
+        snprintf(ctx->shm_path, sizeof(ctx->shm_path),
+                 GPU_IPC_V7_SHM_DIR "/gpu_ipc_shm_cell%d_ue%d", cell_idx, ue_idx);
+        LOG_V7("UE role: multi-cell SHM path %s (cell=%d, ue=%d)", ctx->shm_path, cell_idx, ue_idx);
+    } else if (cell_idx >= 0) {
+        snprintf(ctx->shm_path, sizeof(ctx->shm_path),
+                 GPU_IPC_V7_SHM_DIR "/gpu_ipc_shm_cell%d", cell_idx);
+        LOG_V7("gNB role: multi-cell SHM path %s (cell=%d)", ctx->shm_path, cell_idx);
+    } else if (role == GPU_IPC_V7_ROLE_UE && ue_idx_env) {
         int ue_idx = atoi(ue_idx_env);
         snprintf(ctx->shm_path, sizeof(ctx->shm_path),
                  GPU_IPC_V7_SHM_DIR "/gpu_ipc_shm_ue%d", ue_idx);
@@ -282,32 +294,34 @@ static int v7_circ_write(gpu_ipc_v7_ctx_t *ctx, void *gpu_base,
     uint32_t off = circ_offset(timestamp, nbAnt, cir);
     size_t data_size = total_samples * GPU_IPC_V7_SAMPLE_SIZE;
 
-    /* Periodic diagnostic: check source data content */
+    /* Periodic diagnostic: track non-zero write ratio */
     {
         static uint64_t _write_count = 0;
+        static uint64_t _nz_writes = 0;
         _write_count++;
-        if (_write_count == 1 || _write_count == 10 || _write_count == 100 ||
-            _write_count == 500 || _write_count == 1000 || _write_count == 5000) {
-            int16_t *s16 = (int16_t *)samples;
-            int total_i16 = (int)(total_samples * 2);
-            int check_len = total_i16 < 2048 ? total_i16 : 2048;
+        int16_t *s16 = (int16_t *)samples;
+        int total_i16 = (int)(total_samples * 2);
+        int check_len = total_i16 < 2048 ? total_i16 : 2048;
+        int has_data = 0;
+        int16_t src_max = 0;
+        for (int i = 0; i < check_len; i++) {
+            int16_t av = s16[i] < 0 ? -s16[i] : s16[i];
+            if (av > src_max) src_max = av;
+            if (av > 0) has_data = 1;
+        }
+        if (has_data) _nz_writes++;
+        if (_write_count <= 5 || (_write_count <= 200 && has_data) || _write_count % 2000 == 0) {
             int src_nz = 0;
-            int16_t src_max = 0;
-            for (int i = 0; i < check_len; i++) {
+            for (int i = 0; i < check_len; i++)
                 if (s16[i] != 0) src_nz++;
-                int16_t av = s16[i] < 0 ? -s16[i] : s16[i];
-                if (av > src_max) src_max = av;
-            }
-            LOG_V7("DL WRITE DIAG #%lu: src_nz=%d/%d src_max=%d "
+            LOG_V7("DL WRITE DIAG #%lu: src_nz=%d/%d max=%d "
                    "ts=%lu nsamps=%d nbAnt=%d off=%u cir=%u "
-                   "first8=[%d,%d,%d,%d,%d,%d,%d,%d]",
+                   "nz_total=%lu/%lu(%.1f%%)",
                    (unsigned long)_write_count,
                    src_nz, check_len, (int)src_max,
                    (unsigned long)timestamp, nsamps, nbAnt, off, cir,
-                   check_len>0?s16[0]:0, check_len>1?s16[1]:0,
-                   check_len>2?s16[2]:0, check_len>3?s16[3]:0,
-                   check_len>4?s16[4]:0, check_len>5?s16[5]:0,
-                   check_len>6?s16[6]:0, check_len>7?s16[7]:0);
+                   (unsigned long)_nz_writes, (unsigned long)_write_count,
+                   _write_count > 0 ? 100.0*(double)_nz_writes/(double)_write_count : 0.0);
         }
     }
 

@@ -209,6 +209,21 @@ if [ -n "$CORE_EMULATOR" ]; then
     UE_NY=$(_jp UE_NY "$UE_NY")
     POLARIZATION=$(_jp POLARIZATION "$POLARIZATION")
 
+    # 3GPP channel topology parameters
+    BS_HEIGHT_M=$(_jp BS_HEIGHT_M "25.0")
+    UE_HEIGHT_M=$(_jp UE_HEIGHT_M "1.5")
+    ISD_M=$(_jp ISD_M "500")
+    MIN_UE_DIST_M=$(_jp MIN_UE_DISTANCE_M "35")
+    MAX_UE_DIST_M=$(_jp MAX_UE_DISTANCE_M "500")
+    SHADOW_FADING_STD_DB=$(_jp SHADOW_FADING_STD_DB "6.0")
+    _KFM_RAW=$(_jp K_FACTOR_MEAN_DB "None")
+    _KFS_RAW=$(_jp K_FACTOR_STD_DB "None")
+    K_FACTOR_MEAN_DB=""
+    K_FACTOR_STD_DB=""
+    [ "$_KFM_RAW" != "None" ] && K_FACTOR_MEAN_DB="$_KFM_RAW"
+    [ "$_KFS_RAW" != "None" ] && K_FACTOR_STD_DB="$_KFS_RAW"
+    echo "[launcher] 3GPP: BS_h=${BS_HEIGHT_M}m UE_h=${UE_HEIGHT_M}m ISD=${ISD_M}m d=[${MIN_UE_DIST_M},${MAX_UE_DIST_M}]m SF_σ=${SHADOW_FADING_STD_DB}dB"
+
     echo "[launcher] Core Emulator에서 gnb.conf 생성 중..."
     GENERATED_CONF="/tmp/generated_gnb.conf"
     curl -sf "http://${CORE_HOST}:${CORE_HTTP_PORT}/gnb_conf" > "$GENERATED_CONF" 2>/dev/null || {
@@ -377,8 +392,55 @@ if [[ "$PROXY_VER" =~ ^v[2-9]$ ]] || [[ "$PROXY_VER" =~ ^v[0-9][0-9]+$ ]]; then
 fi
 
 PROXY_CORE_ARG=""
+PROXY_UE_SPEEDS_ARG=""
+PROXY_CSINET_ENV=""
 if [ -n "$CORE_EMULATOR" ]; then
     PROXY_CORE_ARG="--core-emulator=${CORE_EMULATOR}"
+    _SPEEDS_JSON=$(curl -sf "http://${CORE_HOST}:${CORE_HTTP_PORT}/api/v1/traffic/speeds" 2>/dev/null) || true
+    if [ -n "$_SPEEDS_JSON" ]; then
+        _SPEEDS_KMH=$(echo "$_SPEEDS_JSON" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+kmh = d.get('speeds_kmh', {})
+if kmh:
+    print(','.join(str(kmh[str(i)]) for i in sorted(int(k) for k in kmh)))
+" 2>/dev/null) || true
+        if [ -n "$_SPEEDS_KMH" ]; then
+            PROXY_UE_SPEEDS_ARG="--ue-speeds=${_SPEEDS_KMH}"
+            echo "[launcher] Core Emulator UE별 속도: ${_SPEEDS_KMH} km/h"
+        fi
+    fi
+
+    # CsiNet environment variables from Core Emulator
+    _CSINET_JSON=$(curl -sf "http://${CORE_HOST}:${CORE_HTTP_PORT}/api/v1/csinet/env" 2>/dev/null) || true
+    if [ -n "$_CSINET_JSON" ]; then
+        _csinet_val() { echo "$_CSINET_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$1','$2'))"; }
+        _CSINET_ENABLED=$(_csinet_val CSINET_ENABLED "0")
+        if [ "$_CSINET_ENABLED" = "1" ]; then
+            PROXY_CSINET_ENV="-e CSINET_ENABLED=1"
+            PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_MODE=$(_csinet_val CSINET_MODE baseline)"
+            PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_GAMMA=$(_csinet_val CSINET_GAMMA 0.25)"
+            PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_SCENARIO=$(_csinet_val CSINET_SCENARIO UMi_NLOS)"
+            PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_PERIOD=$(_csinet_val CSINET_PERIOD 20)"
+            PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_PATH=$(_csinet_val CSINET_PATH /workspace/graduation/csinet)"
+            PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_CHECKPOINT_DIR=$(_csinet_val CSINET_CHECKPOINT_DIR /workspace/csinet_checkpoints)"
+            echo "[launcher] CsiNet 활성화: mode=$(_csinet_val CSINET_MODE baseline), gamma=$(_csinet_val CSINET_GAMMA 0.25)"
+        else
+            echo "[launcher] CsiNet 비활성화"
+        fi
+    fi
+fi
+
+# Fallback: if not using Core Emulator, pick up host CSINET_* env vars
+if [ -z "$CORE_EMULATOR" ] && [ -z "$PROXY_CSINET_ENV" ] && [ "${CSINET_ENABLED:-0}" = "1" ]; then
+    PROXY_CSINET_ENV="-e CSINET_ENABLED=1"
+    PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_MODE=${CSINET_MODE:-baseline}"
+    PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_GAMMA=${CSINET_GAMMA:-0.25}"
+    PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_SCENARIO=${CSINET_SCENARIO:-UMi_NLOS}"
+    PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_PERIOD=${CSINET_PERIOD:-20}"
+    PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_PATH=${CSINET_PATH:-/workspace/graduation/csinet}"
+    PROXY_CSINET_ENV="$PROXY_CSINET_ENV -e CSINET_CHECKPOINT_DIR=${CSINET_CHECKPOINT_DIR:-/workspace/csinet_checkpoints}"
+    echo "[launcher] CsiNet 활성화 (호스트 환경변수): mode=${CSINET_MODE:-baseline}, gamma=${CSINET_GAMMA:-0.25}"
 fi
 
 PROXY_ANALYZER_ARG=""
@@ -409,7 +471,7 @@ if [ -n "$P1B_NPZ" ]; then
     fi
 fi
 
-docker exec -i $PROXY_ENV_ARGS oai_sionna_proxy python3 -u \
+docker exec -i $PROXY_ENV_ARGS $PROXY_CSINET_ENV oai_sionna_proxy python3 -u \
     "/workspace/vRAN_Socket/G1C_MultiUE_MIMO_Channel_Proxy/${PROXY_SCRIPT}" \
     --mode="$MODE" $PROXY_EXTRA_ARGS \
     --gnb-ant=$GNB_ANT --ue-ant=$UE_ANT \
@@ -420,7 +482,16 @@ docker exec -i $PROXY_ENV_ARGS oai_sionna_proxy python3 -u \
     --polarization=$POLARIZATION \
     --sector-half-deg=${SECTOR_HALF_DEG:-90.0} \
     --jitter-std-deg=${JITTER_STD_DEG:-20.0} \
+    --bs-height-m=${BS_HEIGHT_M:-25.0} \
+    --ue-height-m=${UE_HEIGHT_M:-1.5} \
+    --isd-m=${ISD_M:-500} \
+    --min-ue-dist-m=${MIN_UE_DIST_M:-35} \
+    --max-ue-dist-m=${MAX_UE_DIST_M:-500} \
+    --shadow-fading-std-dB=${SHADOW_FADING_STD_DB:-6.0} \
+    ${K_FACTOR_MEAN_DB:+--k-factor-mean-dB=$K_FACTOR_MEAN_DB} \
+    ${K_FACTOR_STD_DB:+--k-factor-std-dB=$K_FACTOR_STD_DB} \
     $PROXY_CORE_ARG \
+    $PROXY_UE_SPEEDS_ARG \
     $PROXY_ANALYZER_ARG \
     $PROXY_P1B_ARG \
     > "$LOG_DIR/proxy.log" 2>&1 &

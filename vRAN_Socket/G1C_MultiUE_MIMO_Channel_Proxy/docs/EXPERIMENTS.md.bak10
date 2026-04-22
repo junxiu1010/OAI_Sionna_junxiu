@@ -1,0 +1,1713 @@
+# G1C 실험 결과 및 분석
+
+> [README.md](../README.md)로 돌아가기
+
+## 목차
+
+### Part 1: 실험 결과 (연대기순)
+
+1. [v0 초기 실험 (2026-03-12)](#1-v0-초기-실험-2026-03-12)
+2. [v0 vs v1 비교 (2026-03-26)](#2-v0-vs-v1-비교-2026-03-26)
+3. [v1 bs 배치 크기 튜닝 (2026-03-27)](#3-v1-bs-배치-크기-튜닝-2026-03-27)
+4. [v2 Multi-UE 분석 (2026-03-26)](#4-v2-multi-ue-분석-2026-03-26)
+5. [v3 2UE 독립 P1B 채널 (2026-03-27)](#5-v3-2ue-독립-p1b-채널-2026-03-27)
+6. [v3 vs v4 비교 (2026-04-01~02)](#6-v3-vs-v4-비교-2026-04-0102)
+7. [v4 4×4 MIMO 실험 (2026-04-03)](#7-v4-4×4-mimo-실험-2026-04-03)
+
+### Part 2: 횡단 분석 (Cross-cutting Analysis)
+
+8. [스파이크 근본 분석](#8-스파이크-근본-분석)
+9. [Throughput / 시뮬레이션 속도 분석](#9-throughput--시뮬레이션-속도-분석)
+10. [VRAM 예산](#10-vram-예산)
+
+---
+
+# Part 1: 실험 결과
+
+---
+
+## 1. v0 초기 실험 (2026-03-12)
+
+**환경**: H100 NVL, IPC V6
+
+### Test 결과 요약
+
+| Test | 구성 | 결과 | DL Rate | Proxy/slot | UE 상태 |
+|:----:|------|:----:|--------:|-----------:|---------|
+| 1 | 1UE SISO bypass | **PASS** | 1567.7/s | 0.15 ms | in-sync |
+| 2 | 1UE 2x2 channel | **PASS** | 323.9/s | ~1.0 ms | in-sync, RI=2 |
+| 3 | 2UE SISO bypass | **PASS** | 1253.9/s | 0.27 ms | UE0 out-of-sync*, UE1 in-sync |
+| 4 | 2UE 2x2 bypass | **PASS** | 1030.1/s | 0.24 ms | UE0 in-sync, UE1 연결됨 |
+| 5 | 2UE 2x2 channel | **PASS** | 187.2/s | ~1.8 ms | **2UE 모두 in-sync, RI=2** |
+
+\* Test 3~4 UE0 out-of-sync은 bypass UL 설계 특성 (마지막 UE 데이터만 gNB에 유효)
+
+### 성능 상세
+
+```mermaid
+graph LR
+    subgraph Bypass["Bypass Mode (병목: IPC+OAI)"]
+        T1["Test 1<br/>1UE SISO<br/>1567.7 DL/s<br/>proxy: 0.15 ms"]
+        T3["Test 3<br/>2UE SISO<br/>1253.9 DL/s<br/>proxy: 0.27 ms"]
+        T4["Test 4<br/>2UE 2x2<br/>1030.1 DL/s<br/>proxy: 0.24 ms"]
+    end
+
+    subgraph Channel["Channel Mode (병목: Proxy)"]
+        T2["Test 2<br/>1UE 2x2<br/>323.9 DL/s<br/>proxy: ~1.0 ms"]
+        T5["Test 5<br/>2UE 2x2<br/>187.2 DL/s<br/>proxy: ~1.8 ms"]
+    end
+
+    T1 -->|"2UE: ×0.80"| T3
+    T2 -->|"2UE: ×0.58"| T5
+```
+
+### Per-Slot 타이밍 분석
+
+| Test | Proxy DL (ms) | Proxy UL (ms) | IPC+OAI (ms) | Wall (ms) | 병목 |
+|:----:|:-------------:|:-------------:|:------------:|:---------:|:----:|
+| 1 | 0.15 | 0.00 | 0.37 | 0.53 | IPC+OAI |
+| 2 | ~0.5 | ~0.5 | 0.02 | ~1.0 | Proxy |
+| 3 | 0.27 | 0.00 | 0.35 | 0.62 | IPC+OAI |
+| 4 | 0.24 | 0.00 | 0.54 | 0.79 | IPC+OAI |
+| 5 | ~0.7 | ~1.1 | 0.02 | ~1.8 | Proxy |
+
+### 병목 구조 분석
+
+```mermaid
+graph TD
+    subgraph BP["Bypass Mode"]
+        BP_PROXY["Proxy<br/>memcpy only<br/>0.15~0.27 ms"] -->|"빠름"| BP_WAIT["IPC+OAI 대기<br/>0.35~0.54 ms"]
+        BP_WAIT -->|"병목"| BP_WALL["Wall: 0.53~0.79 ms"]
+    end
+
+    subgraph CH["Channel Mode"]
+        CH_PROXY["Proxy<br/>FFT + H×x + CUDA Graph<br/>1.0~1.8 ms"] -->|"병목"| CH_WAIT["IPC+OAI 대기<br/>0.02 ms"]
+        CH_WAIT -->|"OAI가 Proxy 대기"| CH_WALL["Wall: 1.0~1.8 ms"]
+    end
+```
+
+### Multi-UE 스케일링
+
+| 비교 | 1UE | 2UE | Proxy 비율 | Rate 비율 |
+|------|:---:|:---:|:----------:|:---------:|
+| SISO bypass | 0.15 ms | 0.27 ms | **×1.8** | ×0.80 |
+| 2x2 channel | ~1.0 ms | ~1.8 ms | **×1.8** | ×0.58 |
+
+Proxy 처리 시간은 UE 수에 ~1.8배 비례 (이론 2.0배보다 낮음 — gNB dl_tx 읽기 등 공유 연산).
+
+### 실시간 가능성 (5G NR SCS 30kHz 기준: 1 slot = 0.5ms)
+
+| Test | Proxy/slot | 0.5ms 대비 | 실시간 |
+|:----:|:----------:|:----------:|:------:|
+| 1 (1UE SISO bypass) | 0.15 ms | 30% | **가능** |
+| 3 (2UE SISO bypass) | 0.27 ms | 54% | **가능** |
+| 4 (2UE 2x2 bypass) | 0.24 ms | 48% | **가능** |
+| 2 (1UE 2x2 channel) | ~1.0 ms | 200% | 2× 초과 |
+| 5 (2UE 2x2 channel) | ~1.8 ms | 360% | 3.6× 초과 |
+
+### Test 5 상세 (핵심 — 2UE MIMO Channel)
+
+| 항목 | UE0 (62f2) | UE1 (5a58) |
+|------|:----------:|:----------:|
+| 동기화 | **in-sync** | **in-sync** |
+| CQI | 15 | 15 |
+| RI | **2** | **2** |
+| PMI | (0,1) | (0,0) |
+| DL BLER | 5.3% | 9.2% |
+| UL BLER | 5.6% | 1.3% |
+| UL SNR | 20.0 dB | 61.5 dB |
+
+PMI가 UE별로 다른 것은 독립 채널 적용이 정상 동작하는 증거. RI=2는 MIMO 경로 인식 성공.
+
+---
+
+## 2. v0 vs v1 비교 (2026-03-26)
+
+**환경**: 1UE 2×2 MIMO, H100 NVL
+
+### 처리량 (Throughput)
+
+| 항목 | v0 (IPC V6) | v1 초기 측정 | v1 재현 (프리필 없음) |
+|------|:-----------:|:-----------:|:-------------------:|
+| DL rate (누적) | 416 DL/s | 784 DL/s | **432 DL/s** |
+| 순간 처리율 (후반) | — | 726~965 DL/s | 420~650 DL/s |
+| Proxy per-slot 평균 | 1.71 ms | 1.17 ms | — |
+| IPC+OAI 대기 | 0.02~1.29 ms | 0.00~0.04 ms | 0.01~0.02 ms |
+
+> **784 DL/s 과대 추정 원인 (2026-03-27 분석)**
+>
+> v1 초기 실험(16:51)에서 UE RA가 느리게 진행되어 **첫 9 프레임(~2.7초)이 DL-only 실시간(30ms/slot)** 모드로 동작하였다. 이 구간 동안 `ChannelProducer`가 링버퍼를 대량 프리필할 수 있었고, 이후 고속 모드 전환 시에도 버퍼 여유분 덕분에 stall 없이 높은 처리율을 유지하였다.
+>
+> 컨테이너 재시작 후 동일 조건(bs4200 기본값, 프리필 없음)으로 재실험하면 **432 DL/s**에 수렴하며, 이는 v0의 416 DL/s와 **4% 차이**에 불과하다. 즉 v0→v1의 DL rate 향상은 futex 기반 IPC 최적화보다 **우연한 버퍼 프리필 효과**에 의한 것일 가능성이 높다.
+>
+> **futex의 실제 기여**: IPC 대기 시간 제거(0.02~1.29ms → ≈0ms)로 per-slot 레이턴시 개선에는 효과가 있으나, **전체 스루풋의 병목은 ChannelProducer 생산 속도**이므로 DL rate 자체에는 미미한 영향.
+>
+> | DL=22,300 시점 비교 | v1 초기 (프리필 있음) | v1 재현 (프리필 없음) |
+> |---|:---:|:---:|
+> | 누적 DL rate | 669 DL/s | 432 DL/s |
+> | 초기 DL-only 프레임 | 9개 (2.7초) | 0개 |
+> | IPC_G1C+OAI (첫 프레임) | 295ms (실시간) | 0.28ms (고속) |
+
+### CQI / MCS / BLER
+
+| 항목 | v0 | v1 | 비고 |
+|------|:--:|:--:|------|
+| CQI | 0 | **15** | v0는 보고 안 됨, v1은 최대값 |
+| RI | 2 | 2 | 동일 (MIMO 경로 인식) |
+| MCS | 0 | 0 | DL BLER >10%로 MAC이 MCS 상승 억제 |
+| DL BLER | 11.8% | 21.2% | 채널 품질 개선 필요 |
+| UL BLER | 12.3% | 4.6% | **v1에서 개선** |
+| UL SNR | 63.5 dB | 63.0 dB | 동일 수준 |
+
+### DL Pipeline 프로파일 (안정화 후, CPU 타이머)
+
+| 단계 | v0 avg | v1 avg | v0 p99 | v1 p99 |
+|------|:------:|:------:|:------:|:------:|
+| GPU_COPY_IN | 0.07 ms | 0.33 ms | 0.35 ms | 0.36 ms |
+| CH_COPY | 0.05 ms | 0.04 ms | 0.23 ms | 0.11 ms |
+| NOISE_PREP | 0.01 ms | 0.02 ms | 0.04 ms | 0.08 ms |
+| GPU_COMPUTE | 0.07 ms | 0.08 ms | 0.11 ms | 0.12 ms |
+| GPU_COPY_OUT | 0.03 ms | 0.04 ms | 0.06 ms | 0.34 ms |
+| **TOTAL** | **0.24 ms** | **0.51 ms** | **0.57 ms** | **0.63 ms** |
+
+DL per-slot pipeline 자체는 v1이 약간 느려 보이나, 이는 v1에서 `futex_wake` 호출(timestamp 갱신 + syscall)이 포함된 결과이며, 시스템 전체로는 IPC 대기 제거로 **throughput 2배 향상**.
+
+### 스파이크 분석
+
+| 항목 | v0 | v1 |
+|------|:--:|:--:|
+| UL >60ms 스파이크 | 184/1122 (16.4%) | 214/5906 (3.6%) |
+| 스파이크 원인 | `usleep` 폴링 누적 + 채널 버퍼 고갈 | **채널 버퍼 고갈만** (주기 ~4초) |
+| 스파이크 크기 | 최대 ~98ms | 최대 ~86ms |
+| 스파이크 패턴 | 불규칙 | **규칙적** (~320 E2E frame 간격) |
+
+v1에서 스파이크 빈도가 대폭 감소(16.4% → 3.6%)했으며, 원인이 단일(채널 버퍼 고갈)로 수렴. 이는 `buffer-symbol-size` 튜닝 또는 채널 재활용으로 추가 개선 가능.
+
+### 1회성 스파이크 (v1 초기화)
+
+| 스파이크 | 시점 | 크기 | 원인 |
+|----------|------|------|------|
+| GPU_COPY_IN | slot ~1 | ~68ms | GPU SHM 첫 접근 page fault |
+| GPU_COMPUTE | slot ~350 | ~65ms | TF XLA ↔ CuPy GPU 컨텍스트 경합 |
+
+### 결론
+
+v1(IPC V7)은 **futex 기반 알림으로 IPC 대기를 제거**하여 throughput을 2배로 향상시켰다. 남은 과제는:
+1. **채널 버퍼 스파이크 완화**: `--buffer-symbol-size` 축소 (300→10 slots) 또는 채널 재활용
+2. **MCS 상승**: DL BLER 개선을 통한 MCS adaptation 유도
+3. **Multi-UE 스케일링**: GIL 경합 해소를 위한 Producer multiprocessing 분리
+
+---
+
+## 3. v1 bs 배치 크기 튜닝 (2026-03-27)
+
+**환경**: v1, 1UE, 2×2 MIMO Channel, GPU-IPC 모드, H100 NVL
+
+### 실험 조건
+
+- 컨테이너 클린 재시작 후 실행 (좀비 프로세스 없는 상태)
+- 4개 DL-only 프레임 없음 (OAI 즉시 연결 = 프리필 없는 공정한 조건)
+- baseline: `-bs` 미지정 (기본값 4200)
+- 튜닝: `-bs` 140 / 280 / 560 / 840
+
+### 종합 비교
+
+| 지표 | **baseline (bs4200)** | **bs140** | **bs280** | **bs560** | **bs840** |
+|------|:-------------------:|:--------:|:--------:|:--------:|:--------:|
+| DL rate (누적) | 432 | 284 | 666 | 741 | 429 |
+| **순간 처리율** | 420~650 | ~300 | **836~900** | 741~869 | 428~450 |
+| 실행 시간 | 53초 | 81초 | 54초 | 147초 | 200초 |
+| wall avg | 19.91 ms | 23.12 ms | **11.10 ms** | 11.43 ms | 16.85 ms |
+| wall p50 | 11.78 ms | 32.05 ms | **9.86 ms** | 7.45 ms | 23.95 ms |
+| wall p90 | 38.26 ms | 83.99 ms | **20.33 ms** | 23.13 ms | 64.47 ms |
+| wall p95 | 88.44 ms | 100.70 ms | **27.20 ms** | 28.21 ms | 71.02 ms |
+| wall p99 | 128.51 ms | 165.01 ms | **44.57 ms** | 47.18 ms | 103.66 ms |
+| wall max | 226.78 ms | 234.85 ms | **79.56 ms** | 101.76 ms | 151.78 ms |
+| 스파이크 >50ms | 7.5% | 30.5% | **0.5%** | 0.7% | 24.2% |
+| 스파이크 >80ms | 6.1% | 12.7% | **0.0%** | 0.0% | 3.5% |
+| 스파이크 >100ms | 2.5% | 5.1% | **0.0%** | 0.0% | 1.3% |
+| 프레임 건너뜀 | 52.5% | 60.9% | **40.1%** | 42.0% | 62.9% |
+| 통신 (RRC+PDU) | OK | OK | OK | OK | OK |
+| UE 에러/크래시 | 0 | 0 | 0 | 0 | 0 |
+
+> **누적 DL rate에 대한 주의**: 누적 rate는 `총 DL / 총 시간`이므로 실행 시간이 길수록 초기 warmup 비중이 줄어 수치가 올라간다. **공정한 비교 기준은 순간 처리율과 스파이크 분포**이다.
+
+### baseline 대비 bs280 개선
+
+| 지표 | baseline (bs4200) | **bs280** | 변화 |
+|------|:----------------:|:--------:|:----:|
+| 순간 처리율 | 420~650 DL/s | **836~900 DL/s** | **×1.6~2.0** |
+| wall avg | 19.91 ms | **11.10 ms** | -44% |
+| wall p50 | 11.78 ms | **9.86 ms** | -16% |
+| wall p95 | 88.44 ms | **27.20 ms** | -69% |
+| wall p99 | 128.51 ms | **44.57 ms** | -65% |
+| wall max | 226.78 ms | **79.56 ms** | -65% |
+| 스파이크 >80ms | 140/2288 (6.1%) | **0/4364 (0.0%)** | **제거** |
+
+### 역 U자형 성능 곡선
+
+```
+순간 처리율
+(DL/s)
+ 900 ┤              ┌──── bs280 (836~900)
+ 800 ┤              │     bs560 (741~869)
+ 700 ┤              │
+ 600 ┤              │                          ┌── baseline/bs4200 (420~650)
+ 500 ┤              │                          │
+ 400 ┤ ──────      │            ──────────────┘   bs840 (428~450)
+ 300 ┤ bs140       │
+ 200 ┤ (300)       │
+     └──┬──────────┬──────┬──────┬─────────────┬──
+       140        280    560    840           4200  batch size
+```
+
+- **bs140 (너무 작음)**: per-batch Python/GIL 오버헤드가 지배적. 자주 생산하지만 한 번에 너무 적어 버퍼가 항상 고갈
+- **bs280 (최적)**: 스파이크 사실상 제거 (>80ms 0건), 순간 처리율 최고 (836~900)
+- **bs560**: bs280과 비슷하나 간헐적 100ms+ 스파이크 잔존
+- **bs840 (너무 큼)**: 배치 생성 시간이 길어 매 배치 사이 긴 stall 발생
+
+### 결론 및 다음 단계
+
+1. **bs280이 최적** — 스파이크 제거 + 최고 순간 처리율
+2. **버퍼 프리필 도입 시 추가 개선 예상**: 이전 v1 실험에서 우연한 프리필(2.7초 DL-only 구간)로 누적 784 DL/s를 달성한 바 있음. 의도적 프리필을 bs280과 결합하면 안정적으로 800+ DL/s가 가능할 것으로 예상
+3. **ChannelProducer 생산 속도가 근본 병목**: bs 조절은 스파이크 형태를 개선하지만, 총 누적 대기 시간은 불변. 근본적 스루풋 향상은 생산 속도 자체를 올려야 함
+
+---
+
+## 4. v2 Multi-UE 분석 (2026-03-26)
+
+**환경**: 2UE 2×2 MIMO, H100 NVL
+
+### 발견된 문제 3건
+
+#### 1. UL Superposition으로 인한 RA 실패 (Proxy 구조적 문제)
+
+v2에서 2UE 2×2 채널 모드를 실행했을 때, **초기 Random Access 과정에서 1UE 또는 양쪽 UE가 실패**하는 현상이 관찰되었다.
+
+**gNB 로그 분석 (1차 RA, frame 121)**:
+
+```
+121.19  preamble 50, energy 15.6 dB (I0=0),  delay 8, symbol 0  ← 비정상적으로 낮은 energy
+121.19  preamble 48, energy 47.4 dB (I0=18), delay 1, symbol 4  ← 정상
+→ TC-RNTI 2369: Msg3 max harq rounds → RA 실패
+→ TC-RNTI e1e3: Msg4 Nack 반복 → Contention Resolution timer 만료 → RA 실패
+```
+
+**원인**: Proxy의 `_ipc_ul_superposition_slot()`이 **같은 slot에 있는 두 UE의 UL IQ를 채널 적용 후 합산**한다. 이 과정에서:
+
+1. 각 UE에 **독립적인 Sionna 채널 계수(frequency-selective fading)**가 곱해짐
+2. 원래 orthogonal하게 설계된 PRACH preamble이 서로 다른 채널 응답을 거치면서 **orthogonality가 깨짐**
+3. 합산된 신호에서 gNB PHY가 preamble을 검출할 때 에너지가 크게 저하됨 (47.4 dB → 15.6 dB)
+4. Msg3(PUSCH)도 같은 slot에 다른 RB로 스케줄링되지만, 채널 모델의 spectral leakage로 RB 간 분리 실패
+
+이는 **실제 무선 환경과의 차이**에서 비롯된다:
+- 실제 무선: 두 UE의 신호가 **동일한 물리 채널**을 거쳐 gNB 안테나에 도달 → orthogonality 유지
+- Proxy: 각 UE에 **독립적인 채널을 곱한 뒤** 숫자적으로 합산 → orthogonality 파괴
+
+**소켓 모드와의 차이**: 소켓 모드는 **superposition을 수행하지 않는다**. 각 UE의 UL이 독립적으로 gNB에 전달되므로 PRACH/Msg3 간섭이 원천적으로 없으며, multi-UE 실험이 안정적으로 동작한다.
+
+| | 소켓 모드 | IPC 모드 (superposition) |
+|---|---|---|
+| UL 전달 | 각 UE 독립, 순차 전달 | 채널 적용 후 합산 |
+| PRACH 간섭 | 없음 | 채널 모델이 orthogonality 파괴 |
+| Multi-UE RA | 안정적 | 1차 RA 빈번 실패 |
+| 물리적 정확도 | 낮음 (마지막 UE만 유효) | 높음 (실제 무선 근사) |
+
+#### 2. GPU OOM (TF 프로세스 메모리 경쟁)
+
+2개의 `ChannelProducerProcess`가 동시에 GPU 메모리를 점유할 때, `_H_TTI_sequential_fft_o_ELW2_noProfile` 1회 호출에 **~27.5GB**를 요구하여 OOM 발생:
+
+```
+cuMemAllocAsync failed to allocate 27525120152 bytes
+Free memory/Total memory: 9043968 / 99950002176  (9MB free / 93GB total)
+TF set_memory_growth Limit: ~20.5GB per process
+```
+
+| 소비자 | 사용량 |
+|---|---|
+| 메인 프로세스 (CuPy, 4 Pipeline, IPC 버퍼 등) | ~60-70GB |
+| ChannelProducerProcess[0] TF Limit | ~20.5GB |
+| **합계** | **~80-90GB** |
+| **H100 NVL 총 VRAM** | **~93GB** |
+
+→ 링버퍼 길이 1/4 축소 (42000 → 10500)로 완화, 근본적으로는 TF 텐서 크기 최적화 필요.
+
+#### 3. OAI `nr_rrc_prepare_msg3_payload()` assert(0) → segfault (OAI 버그)
+
+Contention Resolution 실패 시 OAI UE의 RRC 코드에서 **`assert(0)`을 호출하여 프로세스가 크래시**한다.
+
+```
+[MAC]   [UE 0] Contention resolution failed
+Assertion (0) failed!
+In nr_rrc_prepare_msg3_payload() rrc_UE.c:1010
+Segmentation fault (core dumped)
+```
+
+Contention resolution 실패는 3GPP TS 38.321에 정의된 **정상 시나리오**이며, UE는 backoff 후 RA를 재시도해야 한다. `assert(0)` 대신 RA 재시도 로직으로 분기해야 하나, OAI RFSIM 환경에서 multi-UE RA contention을 충분히 테스트하지 않아 이 경로가 **미구현 상태**로 남아 있다.
+
+### UL 처리 방식 비교: 소켓 모드 vs IPC 모드
+
+```
+소켓 모드 (동작 안정):
+  UE0 →[소켓]→ Proxy →[소켓]→ gNB    ← 각 UE 독립 전달, superposition 없음
+  UE1 →[소켓]→ Proxy →[소켓]→ gNB
+
+IPC 모드 — superposition (현재, 불안정):
+  UE0 ul_tx →[채널k=0]─┐
+                         ├─ Σ → gNB ul_rx   ← 합산 후 하나의 신호로 전달
+  UE1 ul_tx →[채널k=1]─┘
+
+IPC 모드 — 개별 UL (향후 1단계 목표):
+  UE0 ul_tx →[채널k=0]→ gNB ul_rx   ← per-UE 독립 전달, 소켓 모드와 동일 동작
+  UE1 ul_tx →[채널k=1]→ gNB ul_rx       (마지막 UE가 덮어씀)
+```
+
+### 해결 방향
+
+| 단계 | 내용 | 효과 | 물리적 정확도 |
+|:----:|------|------|:------------:|
+| **1단계** | **개별 UL** — superposition 제거, per-UE 독립 전달 (bypass와 동일 구조에 채널만 적용) | RA 간섭 제거, UE 독립 동작, OAI segfault 방지 | 낮음 (소켓 모드 수준) |
+| **2단계** | **UE stall 감지** — head 기반 inactive UE 감지 및 superposition에서 제외 | 1 UE 크래시 시 나머지 UE 계속 동작 | — |
+| **3단계** | **Superposition 재활성화** — gNB PHY의 multi-UE 수신 능력 검증 후 | 물리적으로 정확한 multi-UE 시뮬레이션 | 높음 |
+
+**1단계 근거**: 소켓 모드에서 multi-UE가 안정적으로 동작하는 것은 superposition 없이 개별 UL 전달이 유효함을 증명한다. IPC 모드에서도 동일한 방식을 적용하면 현재 발생하는 RA 실패, UL stall, OAI segfault가 모두 해소된다.
+
+**3단계 전제 조건**: superposition을 다시 활성화하려면 (1) OAI gNB PHY가 합산 신호에서 multi-UE를 정확히 분리할 수 있는지 검증, (2) OAI UE의 contention resolution 실패 처리 버그 수정, (3) 채널 모델이 orthogonal 신호의 orthogonality를 보존하는지 검증이 필요하다.
+
+### UE stall 감지 설계 (2단계)
+
+superposition 모드에서 1 UE 크래시 시 `min_ue_head`가 고정되어 전체 UL이 멈추는 문제에 대한 대응:
+
+```python
+# head 기반 stall 감지 (wall-clock 타임아웃이 아닌 샘플 카운터 기반)
+all_heads = {k: head_k for k in range(N) if head_k > 0}
+max_head = max(all_heads.values())
+
+# cir_time(circular buffer 한 바퀴 = ~15ms) 이상 뒤처진 UE는 inactive
+active = {k: h for k, h in all_heads.items()
+          if max_head - h < cir_time}
+
+# active UE들만으로 min_ue_head 계산 및 superposition 수행
+# inactive UE는 _ipc_ul_superposition_slot에서 완전 skip (stale data 방지)
+```
+
+wall-clock 타임아웃(500ms 등)이 아닌 **head 차이 기반 감지**를 사용하는 이유:
+- circular buffer는 ~15ms 분량 → 500ms 대기 시 활성 UE 데이터가 ~33회 덮어씌워짐
+- head 차이 기반이면 **circular buffer wrap 전에** 자동 감지
+- UE 복귀 시 head가 현재 max_head에 근접하여 자연스럽게 active로 복귀
+
+---
+
+## 5. v3 2UE 독립 P1B 채널 (2026-03-27)
+
+**환경**: v3, 2UE, 2×2 MIMO Channel, GPU-IPC 모드, H100 NVL
+
+### 실험 조건
+
+- P1B Ray Data: `Area1_7.5GHz_Rays_Valid_RXs.npz` (1037개 유효 RX, 400 rays/RX)
+- UE0 = **RX 98**, UE1 = **RX 498** (서로 다른 물리적 위치의 독립 ray tracing 데이터)
+- 로그: `logs/20260327_123312_G1C_v3_ipc_2ue_ga2x1_ua2x1/`
+
+```bash
+sudo bash launch_all.sh -v v3 -m gpu-ipc -ga 2 1 -ua 2 1 -n 2 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498
+```
+
+### 핵심 결과
+
+| 항목 | 결과 |
+|------|------|
+| **Superposition** | ✅ 두 UE 모두 동일 DL/UL 슬롯 카운트 — 독립 채널 합산 정상 동작 |
+| **Stall 감지** | 경고 0건 — 두 UE 모두 380초간 중단 없이 동작 |
+| **RA 성공** | UE0: 1회 성공 / UE1: 1회 성공 (RAR 실패 2회는 초기에만, 이후 안정) |
+| **등록** | 양쪽 모두 Registration Accept + PDU Session + TUN 인터페이스 정상 |
+| **총 프레임** | 20,956 E2E frames (frame#10 ~ #209560) |
+
+### 통신 품질
+
+| 항목 | UE0 (RNTI 9962, RX98) | UE1 (RNTI 2feb, RX498) |
+|------|:----------------------:|:----------------------:|
+| 동기화 | **in-sync** | **in-sync** |
+| CQI | 1 | 15 |
+| RI | **2** | **2** |
+| PMI | (0,0) | **(0,1)** |
+| DL BLER | 23.1% | 33.0% |
+| UL BLER | 0.96% | 1.02% |
+| UL SNR | 63.5 dB | 63.5 dB |
+| MCS | 0 | 0 |
+
+- **PMI가 UE별로 다름** → 독립 채널 적용이 정상 동작하는 물리적 증거
+- **RI=2** → 두 UE 모두 MIMO 경로 인식 성공
+- **UL BLER < 1.1%** → UL superposition 품질 양호
+- **DL MCS 0 고착 + DL BLER 23~33%** → OAI MAC 스케줄러의 MCS adaptation 미작동 (Phase 4 과제)
+
+### v2 대비 개선
+
+| 항목 | v2 (동일 ray) | v3 (독립 P1B ray) |
+|------|:------------:|:-----------------:|
+| RA 성공률 | 빈번 실패 (Msg3 간섭) | **안정적** (1회 성공) |
+| UE 크래시 | OAI assert(0) segfault | **0건** |
+| UL Superposition | 비정상 (orthogonality 파괴) | **정상** (독립 채널) |
+| Stall → 전체 UL 멈춤 | 발생 가능 | **자동 제외** (active_set) |
+| 380초 장시간 안정성 | 불가 | **달성** |
+
+### 성능 (wall time, ms)
+
+| 구간 | N | mean | p50 | p90 | p95 | p99 | max |
+|------|:---:|:----:|:---:|:---:|:---:|:---:|:---:|
+| **전체** | 20,955 | 18.14 | 13.77 | 33.19 | 54.65 | 74.92 | 450.70 |
+| **warmup** (frame < 200) | 19 | 160.07 | 47.19 | 303.27 | 450.70 | 450.70 | 450.70 |
+| **안정화 이후** (frame ≥ 200) | 20,937 | 18.01 | 13.76 | 32.98 | 54.55 | 74.24 | 100.54 |
+
+**Per-slot** (안정화 이후): mean 1.80 ms, p50 **1.36 ms**, p90 3.36 ms, p99 7.18 ms
+
+### 스파이크
+
+| 임계값 | 전체 (20,956) | 안정화 이후 (20,937) |
+|--------|:------------:|:-------------------:|
+| > 50 ms | 1,284 (6.1%) | 1,275 (6.1%) |
+| > 80 ms | 105 (0.5%) | 96 (0.5%) |
+| > 100 ms | 10 (0.05%) | **1 (0.005%)** |
+| > 200 ms | 9 (0.04%) | **0 (0.0%)** |
+
+- **>200ms 스파이크는 전부 warmup 구간** (OAI 연결 + UL JIT 컴파일)
+- 안정화 이후 최대 100.54ms, >100ms는 단 1건
+
+### v3 1UE bs280 추가 실험 (2026-04-01)
+
+v4 비교를 위한 v3 1UE baseline 측정. 로그: `20260401_231641_G1C_v3_ipc_1ue_ga2x1_ua2x1`
+
+| 항목 | 결과 |
+|------|------|
+| 통신 | ✅ 접속 + PDU Session 수립 |
+| CQI / RI / PMI | 15 / **2** / (0,1) |
+| DL BLER / UL BLER | 16.2% / 0.0% |
+| UL SNR | 63.5 dB |
+
+**Frame wall time (ms, 안정화 이후)**: N=8,463, avg=8.11, p50=7.74, p90=12.58, p95=13.40, p99=15.06, max=20.44
+
+**Per-slot (ms)**: avg=0.84, p50=0.77, p90=1.23, p95=1.32, p99=1.53
+
+### 결론
+
+v3의 **UE별 독립 P1B ray + active_set stall 감지**로 v2에서 실패하던 multi-UE superposition이 안정적으로 동작함을 검증. DL MCS 0 고착 및 DL BLER 문제는 OAI 환경 이슈로 Phase 4에서 별도 대응.
+
+---
+
+## 6. v3 vs v4 비교 (2026-04-01~02)
+
+**환경**: 2×2 MIMO bs280, H100 NVL
+
+### 실험 조건
+
+3개 실험을 동일 환경에서 순차 실행:
+
+| 실험 | 버전 | UE 수 | 안테나 | bs | P1B RX | 로그 |
+|------|:----:|:-----:|:------:|:--:|:------:|------|
+| A | v3 | 1 | 2×1 + 2×1 | 280 | random | `20260401_231641_G1C_v3_ipc_1ue_ga2x1_ua2x1` |
+| B | v3 | 2 | 2×1 + 2×1 | 280 | 수동 | `20260401_233442_G1C_v3_ipc_2ue_ga2x1_ua2x1` |
+| C | **v4** | 2 | 2×1 + 2×1 | 280 | 98,498 | `20260402_015241_G1C_v4_ipc_2ue_ga2x1_ua2x1` |
+
+```bash
+# A: v3 1UE
+sudo bash launch_all.sh -v v3 -m gpu-ipc -ga 2 1 -ua 2 1 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx random
+
+# B: v3 2UE
+sudo bash launch_all.sh -v v3 -m gpu-ipc -ga 2 1 -ua 2 1 -n 2 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498
+
+# C: v4 2UE
+sudo bash launch_all.sh -v v4 -m gpu-ipc -ga 2 1 -ua 2 1 -n 2 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498
+```
+
+### UE 접속 결과 (핵심 차이)
+
+| 항목 | v3 1UE (A) | v3 2UE (B) | **v4 2UE (C)** |
+|------|:----------:|:----------:|:--------------:|
+| UE0 Registration | ✅ | ✅ | ✅ |
+| UE0 PDU Session | ✅ | **❌ 미수립** | **✅** |
+| UE1 Registration | — | ✅ | ✅ |
+| UE1 PDU Session | — | ✅ | ✅ |
+| **양쪽 완전 접속** | — | **❌ (UE0 실패)** | **✅** |
+
+v3 2UE에서 UE0은 Registration은 성공했지만 **PDU Session이 수립되지 않아** 데이터 통신이 불가능했다. MAC 통계에도 UE0이 보고되지 않았다. v4에서는 **양쪽 UE 모두 완전 접속 + PDU Session 수립**에 성공했다.
+
+**원인 분석**: v3는 2개의 독립 TF 프로세스가 GPU를 경쟁하여, 초기 RA/Registration 과정에서 비대칭 GPU 자원 경합이 발생한다. 먼저 시작된 UE1이 GPU를 선점하고, UE0의 채널 생성이 지연되어 타이밍 데드라인을 놓친다. v4는 1개의 통합 TF 프로세스가 양쪽 UE 채널을 균등하게 생성하므로 이 비대칭이 해소된다.
+
+### 통신 품질
+
+| 항목 | v3 1UE (A) | v3 2UE (B)¹ | **v4 2UE (C)** UE0 | **v4 2UE (C)** UE1 |
+|------|:----------:|:-----------:|:------------------:|:------------------:|
+| CQI | 15 | 15 | **15** | **15** |
+| RI | **2** | **2** | **2** | **2** |
+| PMI | (0,1) | (0,0) | (0,1) | (0,0) |
+| UL-RI | 2 | 2 | 2 | 2 |
+| DL BLER | 16.2% | 28.0% | **16.1%** | **13.6%** |
+| UL BLER | 0.0% | 0.0% | 0.8% | 0.05% |
+| UL SNR | 63.5 dB | 60.5 dB | 63.5 dB | 60.5 dB |
+| MCS | 0 | 0 | 0 | 0 |
+
+¹ v3 2UE에서는 UE1만 MAC에 보고됨 (UE0 PDU 미수립)
+
+- v4에서 **양쪽 UE 모두** CQI=15, RI=2를 달성 — MIMO 경로 인식 정상
+- PMI가 UE별로 다름 `(0,1)` vs `(0,0)` → 독립 채널 적용 정상 동작
+- v4 DL BLER (13.6~16.1%)이 v3 2UE (28.0%)보다 **크게 개선** — GPU 경합 감소로 채널 적용 타이밍이 안정화된 효과
+
+### 성능 (Frame wall time, ms)
+
+| 실험 | N | avg | p50 | p90 | p95 | p99 | max |
+|------|:---:|:----:|:---:|:---:|:---:|:---:|:---:|
+| v3 1UE (A) 전체 | 8,472 | 8.42 | 7.75 | 12.59 | 13.42 | 15.24 | 303.19 |
+| v3 1UE (A) 안정² | 8,463 | **8.11** | **7.74** | **12.58** | **13.40** | **15.06** | **20.44** |
+| v3 2UE (B) 전체 | 12,068 | 15.09 | 13.19 | 24.27 | 27.85 | 32.86 | 304.61 |
+| v3 2UE (B) 안정² | 12,060 | **14.90** | **13.18** | **24.24** | **27.81** | **32.66** | 185.42 |
+| **v4 2UE (C)** 전체 | 2,828 | 21.49 | 19.17 | 29.65 | 30.71 | 33.46 | 307.99 |
+| **v4 2UE (C)** 안정² | 2,820 | **20.69** | **19.16** | **29.60** | **30.67** | **32.75** | 193.93 |
+
+² 안정 = wall < 200ms (warmup DL-only 프레임 제외)
+
+### 성능 (Per-slot wall time, ms)
+
+| 실험 | N | avg | p50 | p90 | p95 | p99 | max |
+|------|:---:|:----:|:---:|:---:|:---:|:---:|:---:|
+| v3 1UE (A) | 8,472 | **0.84** | **0.77** | 1.23 | 1.32 | 1.53 | 30.32 |
+| v3 2UE (B) | 12,068 | **1.50** | **1.30** | 2.37 | 2.69 | 3.26 | 30.46 |
+| **v4 2UE (C)** | 2,828 | **2.15** | **2.02** | 2.80 | 2.97 | 3.31 | 30.80 |
+
+### 스파이크 분석
+
+| 실험 | >20ms | >50ms | >80ms | >100ms |
+|------|:-----:|:-----:|:-----:|:------:|
+| v3 1UE (A) | 10/8472 (0.1%) | 9 (0.1%) | 9 (0.1%) | 9 (0.1%) |
+| v3 2UE (B) | 2788/12068 (**23.1%**) | 10 (0.1%) | 10 (0.1%) | 10 (0.1%) |
+| **v4 2UE (C)** | 1248/2828 (**44.1%**) | 9 (0.3%) | 9 (0.3%) | 9 (0.3%) |
+
+- v4의 >20ms 비율이 높은 것은 평균 frame time 자체가 ~20ms이기 때문 (정상 동작)
+- **>50ms 이상 스파이크**는 v3, v4 모두 warmup 구간에 집중 (안정화 이후 거의 없음)
+
+### UE Stall 비교
+
+| 실험 | UE0 stall (0D+0U) | UE1 stall (0D+0U) | 설명 |
+|------|:------------------:|:------------------:|------|
+| v3 2UE (B) | **260 프레임** | 14 프레임 | UE0 PDU 미수립 → 장기간 트래픽 없음 |
+| **v4 2UE (C)** | **13 프레임** | **13 프레임** | 양쪽 균등, warmup 초기에만 발생 |
+
+v4에서 UE0 stall이 260 → 13으로 **95% 감소**. v4의 통합 채널 생산이 UE 간 균등한 GPU 자원 분배를 보장함을 입증.
+
+### 아키텍처 차이 요약
+
+```
+v3: N개 독립 TF 프로세스
+
+  ┌──────────────────────┐   ┌──────────────────────┐
+  │ ChannelProducerProc  │   │ ChannelProducerProc  │
+  │ [UE0]                │   │ [UE1]                │
+  │ TF context #0        │   │ TF context #1        │
+  │ N_UE=1               │   │ N_UE=1               │
+  │ → RingBuffer[0]      │   │ → RingBuffer[1]      │
+  └───────┬──────────────┘   └───────┬──────────────┘
+          │ GPU 경합 ↕                │
+          └────────────┬─────────────┘
+                       ▼
+              Main Process (CuPy + CUDA Graph)
+
+v4: 1개 통합 TF 프로세스
+
+  ┌──────────────────────────────────────────┐
+  │ UnifiedChannelProducerProcess            │
+  │ TF context #0 (단일)                     │
+  │ N_UE=2 (Sionna 배치 차원)               │
+  │ → slice[0] → try_put_batch → RingBuf[0] │
+  │ → slice[1] → try_put_batch → RingBuf[1] │
+  └───────────────────┬──────────────────────┘
+                      │ GPU 경합 감소
+                      ▼
+              Main Process (CuPy + CUDA Graph)
+```
+
+| 항목 | v3 (N 프로세스) | v4 (1 프로세스) |
+|------|:--------------:|:--------------:|
+| TF 프로세스 수 | N개 (UE당 1개) | **1개** |
+| TF GPU 컨텍스트 | N개 독립 | **1개 통합** |
+| VRAM (2UE 추정) | ~31GB (13GB × 2 + 5GB) | **~20GB (18GB × 1 + 2GB)** |
+| GPU 경합 | TF ↔ TF ↔ Main (3자 경합) | **TF ↔ Main (2자 경합)** |
+| 채널 생성 호출 | N회/배치 (UE별 독립) | **1회/배치 (통합)** |
+| 버퍼 분배 | put_batch (blocking) | **try_put_batch (non-blocking)** |
+| UE 간 공정성 | GPU 스케줄러 의존 | **보장 (동일 배치)** |
+
+### 속도 vs 안정성 트레이드오프
+
+v4는 v3 2UE 대비 per-slot 시간이 43% 느려졌지만 (1.50 → 2.15ms), **통신 안정성에서 결정적 이점**이 있다:
+
+| 지표 | v3 2UE | v4 2UE | 변화 |
+|------|:------:|:------:|:----:|
+| Per-slot avg | 1.50ms | 2.15ms | +43% (느림) |
+| Per-slot p99 | 3.26ms | 3.31ms | ≈동일 |
+| 양쪽 UE 접속 | **❌** | **✅** | **핵심 개선** |
+| UE0 stall | 260 프레임 | 13 프레임 | **-95%** |
+| DL BLER | 28.0% | 13.6~16.1% | **-43~50%** |
+| PMI 독립 | ✅ | ✅ | 동일 |
+| RI=2 | ✅ | ✅ | 동일 |
+
+v4의 느려진 이유: 통합 TF가 `N_UE=2`로 더 큰 텐서를 생성하므로 단일 GPU 커널이 더 오래 걸리고, Main Process의 CUDA Graph 실행을 더 길게 blocking한다. 그러나 이 대가로 **2UE 양쪽 모두 완전 접속이 가능**해졌으며, 스파이크 분포도 더 균일하다.
+
+### 결론
+
+- **통신 기능**: v4가 v3 대비 결정적 우위 — 2UE 양쪽 완전 접속 + 낮은 DL BLER
+- **처리 속도**: v4가 v3 대비 43% 느림 — 통합 TF의 큰 커널이 원인
+- **VRAM 효율**: v4가 ~35% 절약 (TF 프로세스 1개 vs 2개)
+- **스케일링 잠재력**: v4가 VRAM과 GPU 경합 모두에서 유리하여 3+ UE 확장에 적합
+
+---
+
+## 7. v4 4×4 MIMO 실험 (2026-04-03)
+
+**환경**: H100 NVL, v4 proxy, IPC V7 futex, 1 UE, bs280
+**명령**: `sudo bash launch_all.sh -v v4 -m gpu-ipc -ga 2 2 -ua 2 2 -n 1 -bs 280 -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98`
+**로그**: `logs/20260403_163131_G1C_v4_ipc_1ue_ga2x2_ua2x2/`
+
+### 안테나 구성
+
+- gNB: 2×2 패널 → 4 TX/RX 안테나 (`pdsch_AntennaPorts_XP 2, pdsch_AntennaPorts_N1 2, pusch_AntennaPorts 4`)
+- UE: 2×2 패널 → 4 TX/RX 안테나 (`--ue-nb-ant-tx 4 --ue-nb-ant-rx 4`)
+- UE capability: `uecap_ports4.xml` (4 MIMO layers 선언)
+
+### 성능
+
+| 지표 | 값 | 비고 |
+|---|---|---|
+| Per-slot wall time | **~1.8ms** (범위 1.4~3.0ms) | 2x2 v4 1UE 대비 유사 |
+| Slot rate | **~550 slots/s** | |
+| 실시간 대비 | **~27.5%** | 2,000 slots/s 기준 |
+| Proxy 처리 | ~1.7ms/slot | DL+UL 합산 |
+| IPC 오버헤드 | ~0.05ms/slot | 무시할 수준 |
+
+### 시스템 리소스 (sysmon.csv)
+
+| 항목 | 값 |
+|---|---|
+| CPU | 0.7% |
+| RAM | ~12.3 GB / 386 GB |
+| GPU Utilization | **87~97%** (거의 풀 로드) |
+| GPU HBM | **10,442 MB** / 95,830 MB (~10.9%) |
+
+GPU 코어는 포화 상태이나, HBM은 여유가 매우 많아 4x4에서의 메모리 부담은 크지 않음.
+
+### 통신 상태 (PDSCH / PUSCH)
+
+| 항목 | 값 | 판정 |
+|---|---|---|
+| RRC | CONNECTED | 정상 |
+| PDU Session | established | 정상 |
+| CQI | **15** (최대) | 정상 |
+| DL BLER | 0.048 (dlsch_rounds 23/0/0/0, errors 0) | 정상 |
+| UL BLER | 0.090 (ulsch_rounds 482/9/7/6, errors 6, DTX 31) | 다소 높음 |
+| MAC TX/RX | TX 1566 / RX 3832 bytes | 데이터 교환 정상 |
+| UL Failure | **3회 발생** (PUSCH DTX 10+ 누적) | RA 재연결 성공 |
+
+UE가 연결되어 PDSCH/PUSCH 모두 동작하나, UL 방향에서 간헐적 DTX 및 재연결이 발생. 비실시간 환경에서 동작에는 영향 없음.
+
+### RI (Rank Indicator) 결과
+
+| 지표 | 값 | 비고 |
+|---|---|---|
+| **DL RI** | **1** (수정 전) → **1~4** (수정 후, 2026-04-03) | OAI UE PHY 미구현 → **`csi_rx.c` 4x4 RI/PMI 구현 완료** |
+| UL-RI | 4 | gNB 측에서 설정 |
+| DL PMI | (0, 0) | |
+| UL TPMI | 0 | |
+
+**DL RI=1 원인 (수정 전)**: UE 로그에 다음 경고가 반복 출력되었음:
+
+```
+[NR_PHY] Rank indicator computation is not implemented for 4 x 4 system
+```
+
+이는 OAI UE PHY (`csi_rx.c`의 `nr_csi_rs_ri_estimation()`)가 **2×2 시스템만 구현**하고 4×4는 미구현이었던 것이 원인. 프록시 또는 채널 모델의 문제가 아님.
+
+> **2026-04-03 해결 완료**: `nr_csi_rs_ri_estimation_4x4()` + `nr_csi_rs_pmi_estimation_4port()` 구현으로 4×4 RI 1~4 / PMI (Rank 1~2) 보고 가능. 상세는 아래 [4×4 Spatial Multiplexing 해결](#4×4-spatial-multiplexing-해결--구현-완료-2026-04-03) 및 `MODIFICATION_LOG.md` 참조.
+
+### 2×2 vs 4×4 RI 비교
+
+| 실험 | 안테나 구성 | CSI-RS Port | DL RI | UL-RI |
+|---|---|---|---|---|
+| v4 1UE ga2x1 ua2x1 (4/2) | 2 ant | 2 port | **RI=2** | 2 |
+| v0 1UE ga2x2 ua2x2 (3/29) | 4 ant | 4 port | **RI=1** | 4 |
+| v4 1UE ga2x2 ua2x2 (4/3) | 4 ant | 4 port | **RI=1** | 4 |
+
+2×2에서는 RI=2가 정상 보고되며, 4×4에서만 OAI 미구현으로 RI=1 고정.
+
+### OAI RI 구현 현황
+
+`csi_rx.c` → `nr_csi_rs_ri_estimation()` (438~569행) 분석:
+
+| RX 안테나 × CSI-RS Port | RI 계산 | 최대 RI |
+|---|---|---|
+| 1 × N 또는 N × 1 | 즉시 return (rank>1 불가) | RI=1 고정 |
+| **2 × 2** | **구현됨** (H^H·H 조건수 기반) | **RI=2** |
+| 4 × 4, 2 × 4, 4 × 2, 기타 | ~~미구현~~ → **구현 완료** (2026-04-03) | **RI=1~4** |
+
+PMI (`nr_csi_rs_pmi_estimation`): 4-port Type I SinglePanel codebook Rank 1~4 구현 완료. Rank 1/2 (2026-04-03), **Rank 3/4 (2026-04-05 추가)**.
+
+gNB 측은 RI를 자체 계산하지 않고, UE UCI 보고를 디코딩하여 사용. UE 측이 미구현이면 gNB에서도 RI=1만 수신.
+
+**프록시 수정과의 관계**: G1B v4에서 수행한 OAI 수정 4건(CSI 보고 경로 활성화, ri_bitlen=0 안전장치 등)은 RI 계산 로직 자체를 변경하지 않음. 4×4 RI=1 고정은 OAI develop 브랜치(`94da422712`)의 원래 한계.
+
+### 4×4 Spatial Multiplexing 해결 — 구현 완료 (2026-04-03)
+
+**gNB 상위 계층 Rank 3/4 지원 확인** (코드 검증 완료):
+
+| 계층 | 파일 / 함수 | Rank 3/4 지원 | 근거 |
+|------|------------|:------------:|------|
+| gNB MAC: RI→layers | `get_dl_nrOfLayers()` | **지원** | `ri + 1` 그대로 반환, 상한 제한 없음 |
+| gNB MAC: PMI→precoding | `get_pm_index()` | **지원** | 4포트 Type I codebook i11/i12/i13 파싱 구현 |
+| gNB MAC: codebook 초기화 | `init_DL_MIMO_codebook()` | **지원** | `max_mimo_layers = min(num_antenna_ports, NR_MAX_NB_LAYERS=4)`, layer 1~4 순회하며 행렬 생성 |
+| gNB PHY: layer mapping | `nr_layer_mapping()` | **지원** | `case 3:`, `case 4:` 모두 AVX512/AVX2/NEON SIMD 최적화 구현 |
+| gNB PHY: layer precoding | `nr_layer_precoder_simd()` | **지원** | `n_layers` 파라미터로 동적 처리, 제한 없음 |
+| gNB PHY: PDSCH 전송 | `nr_dlsch.c` | **지원** | `nrOfLayers` 변수 기반, DMRS 포트 자동 매핑 |
+| 시스템 상수 | `NR_MAX_NB_LAYERS` | **4** | `nr_common.h` |
+
+**결론**: 병목은 **UE PHY의 `csi_rx.c` 단 하나**였으며, **2026-04-03에 구현 완료**.
+
+**구현 내용 (`csi_rx.c` 수정, `MODIFICATION_LOG.md` 참조)**:
+
+| 함수 | 파일 | 수정 전 | 수정 후 |
+|------|------|---------|---------|
+| `nr_csi_rs_ri_estimation()` | `csi_rx.c` | 4×4 미구현 → RI=1 fallback | `nr_csi_rs_ri_estimation_4x4()` dispatch — progressive sub-matrix condition number (2x2→3x3→4x4, double precision) |
+| `nr_csi_rs_pmi_estimation()` | `csi_rx.c` | 2포트 코드북만 구현 | `nr_csi_rs_pmi_estimation_4port()` dispatch — 4-port Type I SinglePanel codebook (DFT beam × co-phase) Rank 1~4 탐색 |
+
+**gnb config 변경** (`gnb.sa.band78.fr1.106PRB.usrpb210.conf`):
+
+| 파라미터 | 변경 전 | 변경 후 |
+|----------|---------|---------|
+| `nrof_ports` | 2 | **4** |
+| `freq_allocation` | `[0, 16]` | **`[32, 0]`** (row4) |
+| `ri_restriction` | `0x3` | **`0xF`** |
+| `nrof_srs_ports` | 1 | **2** |
+
+**남은 제약**:
+- Rank 3/4 PMI: RI 3/4 보고 가능하나 PMI codebook 탐색은 Rank 1-2만 구현. gNB가 Rank 3/4 할당 시 PMI는 기본값 사용
+- UL MIMO: gNB MAC에서 `ul_ri + 1 > 2` assertion으로 UL Rank 2 제한
+
+**검증 실험 (필요)**:
+
+| # | 실험 | 예상 결과 | 확인 사항 |
+|---|------|----------|----------|
+| 1 | 4T4R 1UE 채널 bypass (no noise) | RI > 1 보고 확인 | UE 로그에서 `4x4 RI: count2/3/4 → rank=N` |
+| 2 | 4T4R 1UE Sionna 채널 (CDL-C) | RI 2+ 및 throughput 향상 | 2x2 대비 DL throughput 비교 |
+| 3 | 4T4R 1UE noise sweep | RI/CQI/MCS 적응 동작 | SNR 변화에 따른 RI/CQI 변동 |
+| 4 | 4T4R 2UE MU-MIMO | 다중 사용자 공간 다중화 | 합산 throughput 증가 확인 |
+
+### 7.5 Rank 3/4 PMI 구현 검증 (2026-04-05)
+
+`nr_csi_rs_pmi_estimation_4port()`에 Rank 3/4 코드북 탐색 추가 후 검증 실험.
+
+#### 실험 A: 바이패스 (채널 없음)
+
+**명령**: `sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -b`
+
+| 항목 | 값 | 판정 |
+|------|---|------|
+| RRC | CONNECTED | 정상 |
+| PMI 보고 | `rank=4 i1=[0,0,0] i2=0 SINR=80 dB` (전체 일정) | **정상** |
+| CQI | 15 (최대) | 정상 |
+| gNB 수신 | `CQI 15, RI 4, PMI (0,0)` | 정상 |
+| `"not yet implemented"` 경고 | **0건** | 해결 확인 |
+
+바이패스에서는 채널 왜곡이 없으므로 모든 빔/코-페이즈 후보가 동일 성능 → `i1=[0,0,0]` 고정은 정상.
+
+#### 실험 B: P1B 채널 (RX 98, noise 없음)
+
+**명령**: `sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98`
+
+| 항목 | 값 | 판정 |
+|------|---|------|
+| RRC | CONNECTED (RA 4회, 재연결 포함) | 정상 |
+| PMI 보고 (68회) | Rank 4: 45회, Rank 2: 23회 | **동적 변화 확인** |
+| Rank 4 PMI | `i1=[0,0,0] i2=0 SINR=80 dB` | 정상 |
+| Rank 2 PMI | `i1=[7,0,1] i2=0 SINR=87 dB` | **채널 적응 확인** |
+| CQI | 15 (전체) | 정상 |
+| gNB 수신 | `CQI 15, RI 2, PMI (7,0)` | 정상 |
+| DL BLER | 14.4% | P1B 채널 환경에서 허용 범위 |
+| UL BLER | 16.1% (DTX 37) | 비실시간 허용 |
+
+채널 환경에서 RI가 Rank 4↔2 동적 전환, PMI 인덱스가 beam 7/k1=1로 채널 방향 적응 동작 확인.
+
+#### 실험 C: P1B 채널 + noise -40 dBFS (실패)
+
+**명령**: `sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -40`
+
+| 항목 | 값 |
+|------|---|
+| PRACH 전송 | 133회 |
+| RAR 수신 | **0회 (전부 실패)** |
+| 원인 | P1B fading + noise floor -40 dBFS 조합이 PRACH 검출 임계값 초과 |
+
+→ P1B 채널 + noise 실험은 noise floor를 -50~-60 dBFS로 완화하거나, `-snr 30` 상대 모드 사용 필요.
+
+#### 수정 전후 비교 (바이패스 기준)
+
+| 항목 | 수정 전 (Rank 3/4 미구현) | 수정 후 |
+|------|--------------------------|---------|
+| RI 보고 | RI=4 (정상) | RI=4 (정상) |
+| PMI SINR | **0 dB** (fallback) | **80 dB** |
+| CQI | **0** | **15** |
+| PMI | (0,0) default | (0,0) 탐색 결과 |
+| MCS | **0** (연쇄 실패) | 0 (스케줄러 적응 대기) |
+| 경고 로그 | `"4-port PMI for rank 4 not yet implemented"` | **없음** |
+
+---
+
+# Part 2: 횡단 분석
+
+---
+
+## 8. 스파이크 근본 분석
+
+### 스파이크 원인 요약
+
+v1의 주기적 UL 스파이크(~70-85ms, ~4초 간격)는 **ChannelProducer(Sionna)의 생산 속도 < Consumer(Proxy)의 소비 속도**에 기인한다.
+
+```
+Producer:  ~11,570 sym/s  (4200 sym/batch, ~360ms/batch)
+Consumer:  ~21,924 sym/s  (14 sym/slot × DL+UL × 783 slot/s)
+Buffer:    42,000 sym     (~4초 분량 → 4초마다 고갈 → 블로킹 스파이크)
+```
+
+두 가지 독립 조절 축:
+- **`--buffer-symbol-size` (배치 크기)**: 스파이크 **크기** 결정 (작을수록 작은 스파이크)
+- **`--buffer-len` (버퍼 길이)**: 스파이크 **빈도** 결정 (클수록 덜 자주)
+
+### 권장 실험 순서
+
+#### 1단계: 배치 크기 튜닝 (코드 변경 없음, 인자만 변경)
+
+배치 크기를 줄이면 1 batch 생성 시간이 짧아져 스파이크 크기가 줄어든다. XLA overhead가 ~1ms로 작으므로 효율 손실도 미미.
+
+```bash
+# 기준 (현재 기본값)
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 1
+
+# A: 3 slots/batch (최소 단위)
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 1 -bs 42
+
+# B: 10 slots/batch (권장 시작점)
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 1 -bs 140
+
+# C: 20 slots/batch
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 1 -bs 280
+
+# D: 40 slots/batch
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 1 -bs 560
+
+# E: 100 slots/batch
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 1 -bs 1400
+```
+
+| 테스트 | -bs | slots/batch | 예상 batch 시간 | 예상 스파이크 최대 | 효율 |
+|:------:|----:|:-----------:|:---------------:|:-----------------:|:----:|
+| 기준 | 4200 | 300 | ~360ms | ~70-85ms | 99.7% |
+| A | 42 | 3 | ~4.6ms | ~4-5ms | ~78% |
+| B | 140 | 10 | ~13ms | ~10-13ms | ~92% |
+| C | 280 | 20 | ~25ms | ~15-25ms | ~96% |
+| D | 560 | 40 | ~49ms | ~30-50ms | ~97% |
+| E | 1400 | 100 | ~120ms | ~50-70ms | ~99% |
+
+#### 2단계: 최적 배치 크기로 장시간 실험
+
+1단계에서 선정한 최적 `-bs` 값으로 장시간(수 분 이상) 실행하여 안정성 확인.
+
+#### 3단계: 채널 재활용 (reuse) 구현 — 스파이크 근본 제거
+
+동일 채널 계수를 N slot 동안 재사용하여 소비 속도를 줄인다. `reuse=2`만으로 Producer가 Consumer를 추월하여 **버퍼 고갈 자체가 사라진다.**
+
+```
+reuse=2: 소비 21,924 → 10,962 sym/s < 생산 11,570 → 고갈 없음
+```
+
+slow-fading 채널에서 연속 2 slot(~67μs)은 채널 변화가 거의 없으므로 물리적으로 정당화 가능. 코드 수정 필요.
+
+#### 4단계: 1회성 스파이크 제거 — GPU Warmup 강화
+
+메인 루프 진입 전 SHM GPU 메모리에 더미 read/write를 수행하여 page fault 선제 해소.
+
+#### 5단계: Multi-UE 스케일 테스트
+
+```bash
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 2 -bs <최적값>
+sudo bash launch_all.sh -v v1 -m gpu-ipc -ga 2 1 -ua 2 1 -n 4 -bs <최적값>
+```
+
+UE 증가 시 GIL 경합으로 성능 저하가 관측되면 6단계 진행.
+
+#### 6단계: Producer multiprocessing 분리 (필요 시)
+
+ChannelProducer를 `threading.Thread` → `multiprocessing.Process`로 변경하여 GIL 경합 제거.
+- GIL 분리 → Producer/Consumer 양쪽 GPU 연산 독립 실행
+- 채널 데이터는 shared memory로 전달
+- Multi-UE에서 Producer 간 경합도 해소
+
+### 배치 크기 조절의 한계 — "조삼모사" 분석
+
+배치 크기(`--buffer-symbol-size`)를 줄이면 스파이크 **크기**는 줄어들지만, **총 누적 대기 시간은 변하지 않는다.**
+
+```
+근본 원인: Producer 생산 속도(~11,570 sym/s) < Consumer 소비 속도(~21,924 sym/s)
+→ 생산-소비 불균형이 존재하는 한, 총 대기 시간 = f(불균형 비율) 로 일정
+```
+
+| 배치 크기 | 스파이크 형태 | 총 대기 시간 |
+|:---------:|:------------:|:----------:|
+| 300 slots | 드물고 큰 (~70ms × 드물게) | ≈ 동일 |
+| 10 slots | 잦고 작은 (~10ms × 자주) | ≈ 동일 |
+
+배치를 줄이면 큰 스파이크를 여러 작은 지연으로 **분산**시키는 것이지 **제거**하는 것이 아니다.
+
+**그럼에도 작은 배치가 유리한 이유**: OAI는 실시간 시스템으로, 드문 70ms 스파이크가 잦은 10ms 지터보다 더 치명적이다 (HARQ 타임아웃, MCS 급락, 슬롯 미스 유발). 시스템 **안정성 및 예측 가능성** 측면에서 작은 배치가 유리하나, **총 throughput은 동일**하다.
+
+**결론**: 배치 크기 조절은 증상 완화(스파이크 분산)이며, 근본 해결은 생산-소비 불균형 자체를 해소해야 한다.
+
+### 채널 재활용(Reuse)의 TDD 적합성
+
+채널 재활용은 동일 Sionna 채널 계수를 연속 N slot에 재사용하여 소비 속도를 `1/N`으로 줄이는 방법이다. TDD 시스템에서의 적합성:
+
+- **TDD 채널 호혜성(reciprocity)**: DL과 UL이 동일 주파수를 사용하므로 동일 시점에서 `h_DL ≈ h_UL`. 현재 코드에서는 DL/UL에 별도 채널을 소비하고 있어, TDD 호혜성을 활용하면 DL/UL 간 채널 공유만으로도 소비율을 절반으로 줄일 수 있다.
+- **시간적 coherence**: 30kHz SCS에서 slot duration = 0.5ms. 전형적 채널 coherence time은 수 ms~수십 ms이므로, 2~4 slot 재활용은 물리적으로 정당하다.
+- **시뮬레이션 vs 실제**: Sionna는 매 slot마다 독립적 채널을 생성하나, 실제 무선 환경에서도 0.5ms 간격의 채널 변화는 미미하다. 재활용이 오히려 현실에 가까울 수 있다.
+
+`reuse=2`만으로도 소비 속도(10,962 sym/s)가 생산 속도(11,570 sym/s) 이하가 되어 버퍼 고갈 자체가 제거된다.
+
+### Multi-GPU 분리의 실효성 (NVLink)
+
+Producer(Sionna/TF)와 Consumer(Proxy/CuPy)를 별도 GPU에 배치하는 방안에 대한 분석:
+
+**잠재적 이점**:
+- GPU 컨텍스트 경합 완전 해소 (TF와 CuPy가 서로 다른 GPU에서 독립 실행)
+- 각 GPU의 메모리 대역폭을 100% 활용 가능
+- Multi-UE 시 GPU 연산 병렬성 극대화
+
+**NVLink 전송 오버헤드**:
+
+```
+채널 배치 데이터 크기 (300 slots, 2×2 MIMO):
+  4200 symbols × 16 bytes(complex128) × 4(antenna pairs) = ~269 KB/batch
+
+H100 NVLink 4.0 대역폭: 900 GB/s (단방향)
+전송 시간: 269 KB / 900 GB/s ≈ 0.3 μs — 무시 가능
+```
+
+데이터 전송 자체는 무시할 수준이나, **실질적 오버헤드**는 다른 곳에 있다:
+
+| 항목 | 오버헤드 | 비고 |
+|------|:--------:|------|
+| NVLink 데이터 전송 | ~0.3 μs | 무시 가능 |
+| CUDA 커널 런치 + 동기화 | ~5-10 μs | 발생 |
+| Python GIL 경합 | 변동 | multi-GPU만으로 해결 불가 |
+| 코드 복잡도 증가 | — | 유지보수 비용 |
+
+**핵심 문제**: Multi-GPU만으로는 Python GIL 경합을 해소하지 못한다. Producer와 Consumer가 같은 프로세스 내에 있으면, GIL이 Python 레벨 코드 실행을 직렬화하므로 GPU가 분리되어도 Python 코드에서 병목이 발생한다.
+
+**효과적인 조합**: Multi-GPU + Multiprocessing을 **함께** 적용해야 의미가 있다.
+- `multiprocessing.Process`로 Producer를 분리 → GIL 독립
+- 분리된 프로세스에서 별도 GPU 사용 → GPU 경합 독립
+- 채널 데이터는 GPU Direct RDMA 또는 host 경유 shared memory로 전달
+
+**1 UE 기준 판단**: 현재 1 UE에서는 GPU 활용률이 낮으므로 GPU 분리 이점이 미미하다. Multi-UE(4+)에서 GPU 경합이 심화될 때 고려할 가치가 있다.
+
+### 근본 해결 방향 정리
+
+| 방안 | 효과 | 복잡도 | 우선순위 |
+|------|------|:------:|:--------:|
+| 배치 크기 축소 (`-bs`) | 스파이크 분산 (총량 불변) | 낮음 (인자 변경) | ★★★★★ |
+| 채널 재활용 (reuse=N) | **근본 해결** — 버퍼 고갈 제거 | 중간 (코드 수정) | ★★★★☆ |
+| Producer multiprocessing | GIL 해소 → 생산 속도 향상 | 중간 | ★★★☆☆ |
+| Multi-GPU 분리 | GPU 경합 해소 (Multi-UE 시) | 높음 | ★★☆☆☆ |
+| Sionna 모델 경량화 | 생산 속도 직접 향상 | 중간 | ★★★☆☆ |
+
+**권장 순서**: 배치 크기 튜닝 → 채널 재활용 구현 → Multi-UE 테스트 → (필요 시) Multiprocessing/Multi-GPU
+
+---
+
+## 9. Throughput / 시뮬레이션 속도 분석
+
+### 비실시간 시뮬레이션 환경
+
+본 시스템은 **비실시간(non-real-time) 시뮬레이션**이다.
+OAI gNB/UE는 **슬롯 번호(timestamp) 기반**으로 프로토콜을 진행하며, wall-clock 시간은 관여하지 않는다.
+
+- Proxy가 느려도 OAI 프로토콜 자체는 **정상 동작**한다 (HARQ RTT 등 실시간 타이밍 이슈 없음)
+- "느림"은 시뮬레이션 완료까지의 **소요 시간이 늘어나는 것**을 의미할 뿐
+- 접속 실패의 원인은 "속도 저하" 자체가 아니라 **GPU 독점/경합으로 인한 IPC 통신 불능** (futex timeout)
+
+### 이론적 최대 throughput
+
+5G NR 실시간 기준 (SCS 30 kHz, μ=1):
+
+```
+1 slot = 0.5ms → 2,000 slots/s (이론적 실시간 상한)
+```
+
+Proxy의 per-slot 처리 시간이 0.5ms 이하가 되어야 실시간 1:1에 도달한다.
+현재 가장 빠른 v3 1UE도 0.81ms/slot이므로, **실시간의 61.7%** 수준이다.
+
+### 측정 구조
+
+`_check_e2e_frame()`이 프레임 단위로 측정하는 `wall` 시간:
+
+```
+wall = proxy_ms (GPU DL+UL 연산) + IPC_G1C+OAI (OAI 대기)
+
+  gNB trx_write ─┐
+                  ├── IPC_G1C+OAI 대기 (Proxy가 데이터 기다림)
+  UE trx_write  ─┘
+                  ↓
+             Proxy DL+UL 처리 (proxy_ms)
+                  ↓
+            다음 프레임 경계 → wall 측정 완료
+```
+
+### 시스템 리소스 모니터링 (sysmon)
+
+`launch_all.sh` 실행 시 `sysmon.csv`가 1초 간격으로 자동 기록된다.
+`proxy.log`의 E2E frame 로그에 포함된 `ts=` (epoch 타임스탬프)와 매칭하여 리소스-성능 상관관계를 분석할 수 있다.
+
+```
+sysmon.csv:   1711943521.123, 34.2, 12345, 64000, 47, 18234, 81920
+proxy.log:    [E2E frame#120 ...] wall=17.40ms ... ts=1711943521.456
+              ────────────────────────────────────────── ↑ epoch 매칭
+```
+
+| 컬럼 | 설명 |
+|------|------|
+| `epoch` | Unix 타임스탬프 (ms 정밀도) |
+| `cpu_pct` | CPU 사용률 (%) |
+| `ram_used_mb` / `ram_total_mb` | RAM 사용량 / 전체 (MB) |
+| `gpu_util_pct` | GPU Core 사용률 (%) |
+| `gpu_mem_used_mb` / `gpu_mem_total_mb` | GPU HBM 사용량 / 전체 (MB) |
+
+### Proxy vs OAI 시간 비율
+
+| 실험 | wall 총합 | proxy_ms | OAI 대기 | **Proxy 비율** |
+|------|--------:|--------:|--------:|:----------:|
+| v3 1UE | 69s | 67s | 1s | **97.9%** |
+| v3 2UE | 180s | 178s | 2s | **99.0%** |
+| v4 2UE | 58s | 58s | <1s | **99.3%** |
+
+→ **시스템은 100% Proxy-bound**. OAI는 Proxy를 기다리고 있으며, OAI 자체의 처리 시간은 전체의 1~2%에 불과하다.
+
+### Throughput 측정 결과 (안정 구간, warmup 제외)
+
+| 실험 | 슬롯 수 | wall | **Slot rate** | **Per-slot** | **실시간 대비** |
+|------|------:|-----:|:-----------:|:----------:|:----------:|
+| v3 1UE | 84,617 | 69s | **1,233**/s | 0.81ms | **61.7%** |
+| v3 2UE | 120,599 | 180s | **671**/s | 1.49ms | **33.6%** |
+| **v4 2UE** | 28,201 | 58s | **483**/s | 2.07ms | **24.2%** |
+
+- **이론 실시간**: 2,000 slots/s (per-slot 0.5ms)
+- **현재 최고 (v3 1UE)**: 1,233 slots/s → 실시간의 **61.7%**, 실시간보다 **1.62× 느림**
+- **v4 2UE**: 483 slots/s → 실시간의 **24.2%**, 실시간보다 **4.14× 느림**
+- v4 2UE가 v3 1UE보다 느린 원인: UE 2개의 DL/UL 순차 처리 + 통합 TF 커널 크기 증가
+
+### UE 접속 성공과 실패의 원인
+
+비실시간 시뮬레이션이므로 "느림" 자체는 접속 실패를 유발하지 않는다.
+실제 실패 원인은 **GPU 독점/경합이 IPC 통신을 막는 것**이다.
+
+| 실험 | Per-slot | 실시간 대비 | UE 접속 | **실패 원인** |
+|------|:-------:|:---------:|:------:|-----------|
+| v3 1UE | 0.81ms | 61.7% | ✅ | — |
+| v3 2UE | 1.49ms | 33.6% | ⚠️ UE0 실패 | 2개 TF 프로세스 비대칭 GPU 경합 → UE0 IPC 데드라인 초과 |
+| **v4 2UE** | 2.07ms | 24.2% | **✅ 양쪽** | 통합 프로세스로 GPU 경합 해소 → 균등 처리 |
+| v4 XLA | ~6.7ms | ~7.5% | ❌ 양쪽 | XLA 대형 커널이 수 ms 동안 GPU 독점 → IPC futex timeout |
+
+핵심 관찰:
+- **v4 2UE는 v3 2UE보다 느리지만** (24.2% < 33.6%), GPU 경합이 균등하므로 **양쪽 모두 접속 성공**
+- **v4 XLA는** throughput 자체보다 대형 커널의 GPU 독점이 IPC futex timeout을 유발하여 **RA 자체 불가**
+- **결론: throughput ratio가 아닌 GPU 경합 패턴이 접속 성패를 결정**
+
+### v4 스케일링 한계 추정
+
+#### UE 스케일링 (2×2 MIMO)
+
+Main Process에서 DL/UL 파이프라인은 UE별 순차 처리이므로, per-slot 시간은 UE 수에 근사 선형:
+
+| UE 수 | Per-slot 추정 | Slot rate | 실시간 대비 | VRAM 추정 | 비고 |
+|:------:|:------------:|:---------:|:---------:|:---------:|:----:|
+| 1 | ~1.2ms¹ | ~830/s | ~42% | ~20GB | 미측정 |
+| **2** | **2.07ms** | **483/s** | **24.2%** | **~20GB** | **✅ 실측** |
+| 3 | ~2.8ms | ~360/s | ~18% | ~21GB | 검증 필요 |
+| 4 | ~3.5ms | ~290/s | ~14% | ~22GB | 검증 필요 |
+| 5 | ~4.3ms | ~230/s | ~12% | ~23GB | 검증 필요 |
+
+¹ v4 1UE는 미측정. v3 1UE(0.81ms) + v4 통합 오버헤드(~0.4ms)로 추정
+
+- **VRAM**: v4는 TF 1개(~18GB) + main(~2-5GB)으로 UE 추가 시 VRAM 증가가 미미 (~0.8GB/UE). **6 UE까지 VRAM 여유**
+- **OAI 접속**: 비실시간이므로 속도 자체로는 실패하지 않음. 단, UE 수 증가 → per-slot GPU 커널 길어짐 → IPC 영향 여부는 실측 필요
+- **실용적 고려**: 시뮬레이션이 느려지는 것은 감수 가능하나, GPU 커널 독점 시간이 길어지면 IPC 불안정 가능성 존재
+
+#### 안테나 스케일링 (v4, 1UE)
+
+CUDA Graph 파이프라인의 MIMO 연산은 `H × X` 행렬곱으로, O(n_rx × n_tx × FFT_SIZE) per symbol:
+
+| 안테나 | MIMO 크기 | 연산 배율 | Per-slot 추정 | 실시간 대비 | 비고 |
+|:------:|:---------:|:---------:|:------------:|:---------:|:----:|
+| 2×1+2×1 | 2×2 (4) | 1× | ~1.2ms | ~42% | 현재 구성 |
+| 4×1+4×1 | 4×4 (16) | ~3-4× | ~4-5ms | ~10-13% | VRAM ~22-25GB, 여유 있음 |
+| 2×2+2×2 | 4×4 (16) | ~3-4× | ~4-5ms | ~10-13% | 위와 동일 |
+| 8×1+8×1 | 8×8 (64) | ~12-16× | ~15-20ms | ~3% | VRAM 초과 가능 |
+
+- **4×4 1UE**: VRAM 충분, 동작 가능. 느려도 비실시간이므로 접속은 가능. 단 per-slot ~4-5ms로 GPU 커널이 길어져 IPC 안정성 실측 필요
+- **4×4 2UE**: per-slot ~8-10ms 추정. 시뮬레이션 매우 느림 (실시간 대비 ~5%)
+
+#### 복합 스케일링 요약
+
+```
+                     안테나 수
+                2×2     4×4      8×8
+UE 수  ┌──────────────────────────────
+  1    │  ✅ 42%     ⚠️ 10%     ❌ 3% (VRAM)
+  2    │  ✅ 24%     ⚠️ 5%      ❌
+  3    │  ⚠️ 18%     ❌          ❌
+  4    │  ⚠️ 14%     ❌          ❌
+
+✅ = 동작 확인/예상  ⚠️ = 가능하나 IPC 안정성 검증 필요  ❌ = VRAM 초과 또는 IPC 불안정 예상
+```
+
+비실시간 시뮬레이션이므로 "느림"은 접속 실패를 의미하지 않는다.
+⚠️ 는 GPU 커널 독점 시간이 길어져 IPC futex 영향 가능성이 있어 실측이 필요한 구간이다.
+
+### 개선 방향
+
+| 방안 | 효과 | 적용 대상 |
+|------|------|----------|
+| **bs 재튜닝** (bs140 등) | TF 커널 크기 축소 → GPU blocking 감소 | v4 F-1 |
+| **Multi-GPU** (채널생산 ↔ 파이프라인 분리) | GPU 경합 완전 제거 → throughput 대폭 향상 | 대규모 스케일 |
+| **파이프라인 병렬화** (UE별 DL 동시 처리) | per-slot의 UE 선형 증가 완화 | 3+ UE |
+| **Sionna 경량화 / float32 전환** | TF 커널 시간 단축 | 전체 |
+| **채널 재활용 (reuse=2)** | 채널 소비 속도 절반 → 버퍼 고갈 방지 | 간접 효과 |
+
+---
+
+## 10. VRAM 예산
+
+### 10.1 핵심 요약
+
+- **실측**: 1 UE 4T4R, H100 NVL → **10.4 GB** (94 GB 중 11%)
+- **VRAM 구성**: Ring Buffer(50%) > CUDA Context(33%) > Sionna(16%) > IPC+Pipeline(1%)
+- **병목**: 기본 buffer_len에서는 Ring Buffer 지배적 → 축소하면 Sionna가 병목
+- **스케일링**: Ring Buffer는 `buffer_len × 안테나² × UE수`, Sionna는 ~O(N_UE^1.4)
+- 멀티셀 확장 시: Sionna의 N_UE 초선형 × 안테나 스케일링이 궁극적 병목
+- PyTorch(Sionna 2) 전환으로 Sionna 메모리 절감 시 멀티셀 확장 여유 확보 가능
+- 4T4R multi-UE 실측 데이터가 없으므로, N_UE를 2→4→8로 실측하여 `sysmon.csv`의 `gpu_mem_used_mb` 추이를 확인하는 것이 가장 정확함
+
+### 10.2 4T4R VRAM 예산 (ga2x2, ua2x2, buf=10500 기본)
+
+1 UE만 sysmon 실측. multi-UE Sionna는 2T2R 역산값 × 1.84 외삽 (1 UE 안테나 비율 기반).
+
+| 항목 | 1 UE (실측) | 4 UE (추정) | 8 UE (추정) | 스케일링 |
+|------|:----------:|:----------:|:----------:|---------|
+| CUDA Ctx + TF Libs | 3.4 GB | 3.4 GB | 3.4 GB | 고정 |
+| Ring Buffer | 5.1 GB | 20.5 GB | 41.0 GB | N_UE × 5.1 GB |
+| Sionna 런타임 | ~1.7 GB | ~11.9 GB (*) | ~25.5 GB (*) | ~N_UE^1.4 × 1.84 |
+| IPC V7 | 56 MB | 141 MB | 253 MB | (1+N_UE) × 28 MB |
+| GPU Pipeline | 52 MB | 208 MB | 416 MB | N_UE × 52 MB |
+| **합계** | **~10.4 GB** | **~36.2 GB** | **~70.6 GB** | |
+
+> 1 UE: 실측 10,442 MB와 정합 (오차 < 1%).
+> (*) 4+ UE Sionna 값은 2T2R 역산 × 1.84 외삽. 실측 시 풀 오버헤드로 추가 4-5% 가능.
+> 4T4R multi-UE 실측 데이터가 확보되면 교체 필요.
+
+**참고: buffer_len 축소 시 (4T4R 1 UE)**:
+
+| buf_len | Ring/UE | 1 UE 총 | 비고 |
+|:-------:|:-------:|:-------:|------|
+| 10500 (기본) | 5.1 GB | 10.4 GB | 실측 |
+| 4200 | 2.0 GB | 7.3 GB | Ring 3.1 GB 절감 |
+| 1050 | 0.5 GB | 5.6 GB | Ring 4.6 GB 절감 |
+
+**참고: noise_enabled=True 시 추가 비용** (기본 비활성):
+noise buffer = 256 × (2, total_cpx × max_ant) × float64 ≈ 1 GB/UE (4T4R)
+
+### 10.3 2T2R 교차검증 (ga2x1, ua2x1, buf=42000)
+
+4T4R 분석의 근거가 되는 2T2R 데이터. 기존 실측값과 역산값이 3-5% 이내 정합.
+
+**H100 NVL 94GB 기준 실측**:
+
+| UE 수 | buffer-len=42000 | buffer-len=4200 |
+|:------:|:----------------:|:---------------:|
+| 1 | 9.6 GB (✓) | 5.0 GB (✓) |
+| 2 | 16.7 GB (✓) | 7.5 GB (✓) |
+| 4 | 31.0 GB (✓) | 12.6 GB (✓) |
+| 8 | 59.5 GB (✓) | 22.7 GB (✓) |
+| 16 | 116.4 GB (✗) | 42.8 GB (✓) |
+
+Multi-UE 확장 시 `buffer-len` 축소를 병행하면 16 UE까지 VRAM 내에서 수용 가능.
+
+**역산 분해**:
+
+기존 테이블(위 H100 NVL 표) 역산 기반. buf=42000/4200 양쪽 정합, 오차 4-5%.
+
+| 항목 | 1 UE | 2 UE | 4 UE | 8 UE | 스케일링 |
+|------|:----:|:----:|:----:|:----:|---------|
+| CUDA Ctx + TF Libs | 3.4 GB | 3.4 GB | 3.4 GB | 3.4 GB | 고정 |
+| Ring Buffer | 5.1 GB | 10.3 GB | 20.5 GB | 41.0 GB | N_UE × 5.1 GB |
+| Sionna 런타임 | ~0.9 GB | ~2.7 GB | ~6.3 GB | ~13.5 GB | ~N_UE^1.4 |
+| IPC V7 | 28 MB | 42 MB | 71 MB | 127 MB | (1+N_UE) × 14 MB |
+| GPU Pipeline | 17 MB | 34 MB | 69 MB | 138 MB | N_UE × 17 MB |
+| **합계** | **~9.5 GB** | **~16.5 GB** | **~30.4 GB** | **~58.1 GB** | |
+
+> 기존 테이블의 실측값(9.6/16.7/31.0/59.5 GB)과 ~3-5% 이내 정합. 차이는 CuPy/TF 메모리 풀 오버헤드.
+
+### 10.4 멀티셀 스케일링 + GPU 비교
+
+#### 멀티셀 스케일링 추정
+
+회의(260402)에서 논의된 멀티셀 RF 채널 수 공식:
+
+```
+기지국 안테나 = 4 × N_cell
+단말 안테나 = 4 × K_UE × N_cell  (셀당 K_UE 단말)
+총 RF 채널 = 4N × 4KN = 16 × K × N²  (크로스셀 포함 시 256 × N²)
+```
+
+채널 H 행렬이 N² 으로 증가하므로, Ring Buffer + Sionna 양쪽이 급증:
+
+**4T4R, buf=10500 기본** (Sionna는 2T2R × 1.84 외삽):
+
+| 구성 | Ring Buffer | Sionna (외삽) | Context+기타 | 합계 | H100 (94GB) |
+|------|:-----------:|:-----------:|:----------:|:----:|:-----------:|
+| 1셀 × 4 UE | 20.5 GB | ~11.9 GB | ~3.8 GB | ~36 GB | **가능** |
+| 1셀 × 8 UE | 41.0 GB | ~25.5 GB | ~4.1 GB | ~71 GB | **빠듯** |
+
+buf_len 축소 시 (buf=1050, 4T4R):
+
+| 구성 | Ring Buffer | Sionna (외삽) | Context+기타 | 합계 | H100 |
+|------|:-----------:|:-----------:|:----------:|:----:|:----:|
+| 1셀 × 8 UE | 4.1 GB | ~25.5 GB | ~4.1 GB | ~34 GB | **가능** |
+| 1셀 × 16 UE | 8.2 GB | ~55 GB (*) | ~4.8 GB | ~68 GB | **빠듯** |
+
+(*) 16 UE Sionna는 O(N_UE^1.4) 외삽이므로 불확실도 높음.
+
+#### H100 vs L40S 비교
+
+| GPU | VRAM | 4T4R buf=10500 1셀 | buf 축소(1050) 1셀 |
+|-----|:----:|:------------------:|:-----------------:|
+| **H100 NVL** | 94 GB | ~4 UE (36 GB) | ~8 UE (34 GB) |
+| **L40S** | 48 GB | ~1 UE (10 GB) | ~4 UE 한계 |
+
+### 10.5 상세 계산 근거 (v4 실측 기반, 2026-04-03)
+
+<details>
+<summary>항목별 VRAM 계산 상세 (클릭하여 펼치기)</summary>
+
+v4 로그 (`sysmon.csv`, `proxy.log`)와 코드 분석을 기반으로 한 메모리 내역.
+
+**실측 조건**: 1 UE, 4×4 (ga2x2, ua2x2), H100 NVL
+
+| 항목 | 값 | 출처 |
+|------|-----|------|
+| GPU 총 VRAM | 95,830 MB (93.6 GB) | sysmon.csv `gpu_mem_total_mb` |
+| 런타임 GPU 사용량 | **10,442 MB (10.2 GB)** | sysmon.csv `gpu_mem_used_mb` |
+| TF가 본 free VRAM | 92,411 MB | proxy.log `GPU:0 with 92411 MB` |
+
+- TF 시작 전 사용량 (CUDA ctx ×2 + Pipeline): 95,830 − 92,411 = **3,419 MB**
+  (교차검증: 2T2R 2UE 런에서 3,403 MB → ±16 MB 재현)
+- TF 시작 후 추가분: 10,442 − 3,419 = **7,023 MB**, 내역:
+  - Ring Buffer (CuPy, 자식 프로세스): 5,250 MB (정확 계산)
+  - IPC V7 (CuPy, 메인 프로세스): 56 MB (로그 확인)
+  - Sionna 런타임 (TF 텐서, 잔차): ~1,717 MB
+
+#### 항목별 계산 (4T4R = gnb_ant=4, ue_ant=4)
+
+**1) IPC 순환 버퍼** (v4.py `GPUIpcV7Interface`)
+
+```
+cir_time = 460,800 샘플
+SAMPLE_SIZE = 4 bytes (2 × int16)
+per_buffer = cir_time × nbAnt × SAMPLE_SIZE
+```
+
+| 버퍼 | cir_size | bytes | 확인 |
+|------|----------|-------|------|
+| dl_tx | 460,800 × 4 = 1,843,200 | 7,372,800 (7.0 MB) | `[GPU IPC V7] allocated dl_tx (7372800 bytes)` |
+| dl_rx / ul_tx / ul_rx | 동일 | 7.0 MB 각 | 로그 확인 |
+| **인터페이스 1개** | | **28.1 MB** | |
+
+인터페이스 수 = gNB 1개 + UE N개 → **(1 + N_UE) × 28.1 MB**
+
+**2) GPU Pipeline** (v4.py `GPUSlotPipeline`, DL+UL 각 1개/UE)
+
+fft_size=2048, 14 심볼, complex128 기준:
+
+| 배열 | shape | 크기 |
+|------|-------|------|
+| gpu_H | (14, 4, 4, 2048) × complex128 | 7.0 MB |
+| _buf_HX | 동일 | 7.0 MB |
+| gpu_x | (14, 4, 2048) × complex128 | 1.8 MB |
+| gpu_iq_in/out | int16 | 0.5 MB × 2 |
+| gpu_out, noise, Yf, out_2d, iq_out_3d | | ~7.5 MB |
+| **파이프라인 1개** | | **~26 MB** |
+
+DL + UL = 2개/UE → **~52 MB/UE**
+
+**3) IPC Ring Buffer** (v4.py `IPCRingBufferProducer`)
+
+```
+entry shape = (ue_ant, gnb_ant, FFT_SIZE) × complex128    # v4.py:1899
+buffer depth = buffer_len (default 10500, --buffer-len 인자)  # v4.py:2671
+
+4T4R: entry = 4 × 4 × 2048 × 16 bytes = 524,288 bytes = 0.5 MB/entry
+2T2R: entry = 2 × 2 × 2048 × 16 bytes = 131,072 bytes = 0.125 MB/entry
+```
+
+| 안테나 | entry | buf=10500 (기본) | buf=42000 | buf=4200 |
+|:------:|:-----:|:---------------:|:---------:|:--------:|
+| 2T2R | 0.125 MB | 1,312 MB | 5,250 MB | 525 MB |
+| 4T4R | 0.5 MB | 5,250 MB | 21,000 MB | 2,100 MB |
+
+**스케일링**: `buffer_len × n_rx × n_tx × 2048 × 16 × N_UE`
+
+**4) CUDA Context ×2 + TF 라이브러리 (고정)**
+
+메인 프로세스 CUDA ctx + 자식 프로세스 TF CUDA ctx + cuDNN/cuBLAS/cuFFT.
+현 계측 수준으로는 내부 분리 불가.
+
+| 실행 | 안테나 | N_UE | Pre-TF − Pipeline | 값 |
+|------|:------:|:----:|:-----------------:|:--:|
+| ga2x2_ua2x2 | 4T4R | 1 | 3,419 − 56 | **3,363 MB** |
+| ga2x1_ua2x1 | 2T2R | 2 | 3,403 − 34 | **3,369 MB** |
+
+→ **~3,365 MB 고정** (안테나·UE 무관, ±10 MB)
+
+**5) Sionna 런타임 (잔차 추정)**
+
+Sionna 모델 텐서(h_field, PDP, Topology) + 매 호출 중간 텐서 + CuPy dlpack/fft 임시.
+`memory_growth=True` → 점진 할당, 내부 분해 불가.
+
+4T4R 1UE 실측 잔차: 10,442 − 3,419 − 56(IPC) − 5,250(Ring) = **~1,717 MB**
+
+2T2R 기존 테이블 역산 (buf=42000):
+
+| N_UE | Sionna (잔차) | /UE |
+|:----:|:-----------:|:---:|
+| 1 | ~935 MB | 935 |
+| 2 | ~2,754 MB | 1,377 |
+| 4 | ~6,490 MB | 1,623 |
+| 8 | ~13,865 MB | 1,728 |
+
+→ N_UE에 대해 초선형 (~O(N_UE^1.4))
+→ 안테나 비율: 4T4R(1,717) / 2T2R(935) = **1.84×** (1 UE 기준)
+
+</details>
+
+### 10.5.1 Noise 기준 조건 실측 (2026-04-05)
+
+**명령어** (bs280 재실험, GPU 1):
+```bash
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+```
+
+**목적**: P1B 채널 + noise 환경에서 UE 접속 가능 여부 확인, 이후 VRAM 측정 실험의 기준 조건 확립.
+
+**결과** (2026-04-06, GPU 1 클린 상태, bs280):
+
+| 항목 | 값 |
+|------|-----|
+| UE 접속 | **성공** (RRC_CONNECTED + REGISTRATION_ACCEPT) |
+| RI 분포 | Rank 1: 99회 (69%), Rank 4: 44회 (31%) |
+| CQI | 15 (100%) |
+| DL BLER | 0.45 |
+| UL BLER | 0.003 |
+| MCS | (1) 0 |
+| UL SNR | 33.5 dB |
+| **VRAM (GPU 1)** | **10,831 MB (10.6 GB)** / 95,830 MB |
+| GPU util | 83~95% |
+| TF 가용 메모리 | 91,451 MB (GPU 1 클린) |
+| buffer timeout | 0건 |
+| ring buffer full | 465건 (정상 — producer가 소비보다 빠름) |
+
+**§7 대비 비교** (bs280, P1B, noise 유무):
+
+| 항목 | §7 (noise 없음) | 이번 (noise −60 dBFS) | 차이 |
+|------|:---:|:---:|:---:|
+| VRAM | 10,442 MB | **10,831 MB** | **+389 MB** (noise 버퍼) |
+| GPU util | 87~97% | 83~95% | 유사 |
+
+**분석**:
+- −60 dBFS noise에서도 P1B 채널의 fading 효과로 RI가 동적으로 전환됨 (Rank 1 ↔ 4)
+- CQI=15로 고정 — noise가 매우 약해 SINR 충분히 높음
+- **noise 추가 VRAM 비용: ~389 MB** — §10.2 추정(~1 GB)보다 적음
+- §10.2 예산표의 1 UE 4T4R VRAM 10.4 GB와 정합 확인 (오차 < 4%)
+- 이전 bs4200 실험(58.2 GB)과 좀비 프로세스 환경(27 GB)은 모두 부정확한 조건이었음이 확정
+
+> **교훈**: VRAM 실측 시 (1) `-bs 280` 필수, (2) 클린 GPU 사용 (좀비 프로세스 확인), (3) GPU 0에 좀비가 있으면 GPU 1 사용.
+
+**결론**: −60 dBFS + bs280을 이후 VRAM 측정 실험의 **기준 조건**으로 확정. VRAM baseline = **10.8 GB** (1 UE 4T4R).
+
+### 10.6 다음 실험
+
+현재 문서의 추정값(*)을 실측으로 교체하고, 미검증 가정을 확인하기 위한 실험 목록.
+완료된 실험의 결과는 해당 섹션으로 이동하고, 여기에는 완료 이력만 남긴다.
+
+> **순서 근거**: VRAM 예산은 채널+노이즈가 켜진 실 운용 조건에서 측정해야 의미가 있다 (bypass 시 Sionna/RingBuffer/noise 버퍼가 미할당되어 VRAM의 ~70%가 누락됨). 따라서 noise sweep으로 UE 접속 가능한 채널+노이즈 조건을 먼저 확보한 뒤, 그 조건에서 VRAM 실측을 진행한다.
+
+| 우선 | # | 실험 | 측정 대상 | 결과 반영 위치 | 상태 |
+|:---:|:-:|------|----------|-------------|:----:|
+| ~~1~~ | 8 | ~~4T4R noise baseline (bs280 재실험)~~ | RI/CQI/MCS, 접속 확인, VRAM baseline | §10.5.1 VRAM 교체 완료 | **완료** |
+| **2** | 1 | **4T4R multi-UE VRAM** | `sysmon.csv` gpu_mem_used_mb | 10.2 4T4R 예산 → 실측으로 교체 | TODO |
+| **3** | 2 | 4T4R buf_len 축소 실측 | `sysmon.csv` gpu_mem_used_mb | 10.2 buffer_len 축소 참고 표 | TODO |
+| **4** | 5 | noise VRAM 증분 | 추가 VRAM 증분 (noise on vs off) | 10.2 noise 참고 행 실측 교체 | TODO |
+| **5** | 7 | 4T4R throughput 비교 | iperf3 DL throughput | 2x2 vs 4x4 성능 비교 | TODO |
+| **6** | 3 | 2T2R→4T4R 안테나 비율 검증 | Sionna 잔차 비교 | 10.5 안테나 비율(1.84x) 확인/수정 | TODO |
+| **7** | 4 | Sionna 스케일링 지수 정밀화 | UE별 잔차 기울기 | 10.5 O(N_UE^1.4) 지수 갱신 | TODO |
+| — | 6 | ~~4T4R RI > 1 검증~~ | — | §7.5 | **완료** |
+
+#### 공통 규칙
+
+- **`-bs 280` 필수**: §3 bs 튜닝에서 최적으로 확정 (§6, §7 실험에서도 사용). bs4200(기본값)은 Sionna 텐서 폭발로 VRAM 5~6배 낭비 + OOM 위험.
+- **P1B npz**: `../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz` (1037개 유효 RX, 400 rays/RX)
+- **noise 기준**: `-nf -60` (§10.5.1에서 접속 확인됨)
+- **RX 인덱스**: 1 UE=`98`, 2 UE=`98,498`, 4 UE=`98,498,193,700`, 8 UE=`98,498,193,700,52,298,601,900` (P1B npz `rx_indices`에서 유효성 검증 완료. 기존 200/50/300/600은 npz에 없어 가장 가까운 유효 인덱스로 교체)
+- **GPU 1 사용**: GPU 0에 좀비 프로세스(~15 GB)가 상주하므로 GPU 1에서 실험. 변경 파일: `v4.py` (gpu_num=1), `gpu_ipc_v7.c` (cudaSetDevice(1)), OAI 재빌드 완료.
+- **sysmon.csv 주의**: `nvidia-smi`가 GPU 2개를 각각 한 줄씩 출력하므로, csv 파싱 시 GPU 1 행만 사용할 것.
+
+#### ~~우선1: 4T4R noise baseline (bs280 재실험)~~ ✅ 완료 (2026-04-06)
+
+§10.5.1의 bs4200 실험을 bs280 + GPU 1로 재실행. 결과는 §10.5.1에 반영됨.
+
+- **VRAM**: 10,831 MB (10.6 GB) — §10.2 예산표 10.4 GB와 정합 (오차 < 4%)
+- **noise VRAM 증분**: +389 MB (§7 noise 없음 10,442 MB → 10,831 MB)
+- **RI**: Rank 1(69%) ↔ Rank 4(31%), CQI=15, UL SNR 33.5 dB
+- **ring buffer full**: 465건 (정상), timeout/bypass copy 0건
+
+#### 우선2: 4T4R multi-UE VRAM
+
+UE 수 증가에 따른 VRAM 스케일링 실측. §10.2 추정표 → 실측으로 교체.
+
+```bash
+# 2-a: 1 UE (우선1과 동일, 결과 재활용)
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+
+# 2-b: 2 UE
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 2 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498 -nf -60
+
+# 2-c: 4 UE
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 4 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498,193,700 -nf -60
+
+# 2-d: 8 UE
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 8 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498,193,700,52,298,601,900 -nf -60
+```
+
+확인 사항: 각 UE 수별 `sysmon.csv` gpu_mem_used_mb, UE 접속 수, OOM 발생 여부.
+OOM 발생 시 → 해당 UE 수에서 중단하고 `-bl` (buffer_len) 축소 병행 검토.
+
+##### 2-a 결과 (1 UE) — 우선1 재활용
+
+VRAM **10,831 MB** (§10.5.1 참조)
+
+##### 2-b 결과 (2 UE, 2026-04-06)
+
+| 항목 | UE0 (RX 98) | UE1 (RX 498) | 비고 |
+|------|:---:|:---:|------|
+| 접속 | RRC_CONNECTED | RRC_CONNECTED + REG_ACCEPT | 2 UE 모두 성공 |
+| RI=1 | 58회 (63%) | 56회 (62%) | |
+| RI=4 | 34회 (37%) | 34회 (38%) | |
+| CQI | 15 (100%) | 15 (100%) | |
+| DL BLER | 0.107 | 0.456 | UE1이 높은 건 RX 498 채널 조건 차이 |
+| UL BLER | 0.103 | 0.023 | |
+| UL SNR | 25.0 dB | 25.5 dB | |
+| PMI (최종) | i1=[2,0,0] i2=0 | i1=[3,0,0] i2=1 | UE별 채널에 맞는 빔 선택 확인 |
+
+| VRAM/성능 | 값 |
+|------|-----|
+| **GPU 1 VRAM** | **20,339 MB (19.9 GB)** — 실험 전체 일정 |
+| GPU 0 | 4,602 MB (좀비, 변화 없음) |
+| GPU util | 61~98% (안정 시 95~98%) |
+| per-slot wall | 3.2~6.8 ms |
+| ring buffer full | 466건 (정상) |
+| timeout / bypass | 0건 |
+| OOM | 없음 |
+
+**스케일링**: 1 UE 10,831 MB → 2 UE **20,339 MB** (1.88x, UE당 +9,508 MB)
+
+##### 2-c 결과 (4 UE, 2026-04-06)
+
+> ⚠️ 짧은 실행 — 안정기 도달 전 종료. VRAM은 시작부터 일정하므로 신뢰 가능하나, RI 분포/BLER 샘플 적음.
+
+| UE | RX | 접속 | RI 보고 | RI 분포 | CQI | 비고 |
+|:---:|:---:|:---:|:---:|------|:---:|------|
+| UE0 | 98 | **성공** | 54회 | RI=1: 29 (54%), RI=2: 19 (35%), RI=4: 6 (11%) | 15 (100%) | |
+| UE1 | 498 | **실패** | 0회 | — | — | PBCH 디코딩 에러 203건, 접속 불가 |
+| UE2 | 193 | **성공** | 18회 | RI=1: 4 (22%), RI=2: 14 (78%) | 15 (100%) | REGISTRATION_ACCEPT |
+| UE3 | 700 | **성공** (늦음) | 3회 | RI=1: 3 (100%) | 15 (100%) | PBCH 에러 79건 후 늦게 접속 |
+
+**접속: 3/4 UE 성공**. UE1(RX498)은 4 UE 부하에서 proxy per-slot 시간 증가(~8-12 ms)로 PBCH sync 실패 추정.
+
+| gNB MAC | RNTI | CQI | RI | PMI | DL BLER | UL BLER | UL SNR |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| UE e547 | CU-ID 1 | 15 | 1 | (2,1) | 0.258 | 0.583 | 63.5 dB |
+| UE abcc | CU-ID 3 | — | — | — | 0.510 | 0.554 | 12.0 dB |
+
+| VRAM/성능 | 값 |
+|------|-----|
+| **GPU 1 VRAM** | **39,253 MB (38.3 GB)** — 시작부터 종료까지 일정 |
+| GPU 0 | 5,645 MB (좀비) |
+| GPU util | 94~100% |
+| per-slot wall | 3.1~12.1 ms (2 UE 대비 ~2x 증가) |
+| ring buffer full | 584건 (정상) |
+| timeout / bypass | 0건 |
+| OOM | 없음 |
+
+**스케일링 누적**:
+
+| UE 수 | VRAM (GPU 1) | 배수 (vs 1 UE) | UE당 증분 |
+|:---:|:---:|:---:|:---:|
+| 1 | 10,831 MB | 1.00x | — |
+| 2 | 20,339 MB | 1.88x | +9,508 MB |
+| **4** | **39,253 MB** | **3.62x** | **+9,457 MB** |
+
+UE당 증분 ~9.5 GB로 일관됨. 선형 대비 효율적 (4x → 3.62x, CUDA ctx 등 고정비용 분산).
+H100 NVL 95.8 GB 기준 → **8 UE 예상: ~39,253 + 4×9,457 ≈ 77 GB (80.4%)** — OOM 없이 가능할 것으로 예상.
+
+##### 속도 통계 가공 가이드 (후처리)
+
+각 실험의 `proxy.log`에 per-frame E2E 타이밍이 기록되어 있으므로, 실험 완료 후 일괄 파싱 가능.
+
+**원본 로그 형식** (`proxy.log`):
+```
+[E2E frame#22750 4UE (6D+4U) UE0(6D+4U)...] wall=83.37ms  Proxy(DL=57.5+UL=25.9)=83.33ms  IPC_G1C+OAI=0.05ms  | per slot(6+4=10): wall=8.34  proxy=8.33  ipc_g1c+oai=0.00 ms
+```
+
+**추출 항목**:
+
+| 지표 | 소스 필드 | 단위 | 의미 |
+|------|----------|:---:|------|
+| per-slot wall | `per slot(...): wall=X` | ms | 슬롯당 E2E 지연 (proxy + IPC + OAI) |
+| per-slot proxy | `proxy=X` | ms | 슬롯당 proxy 처리 시간 (채널 적용) |
+| DL proxy | `Proxy(DL=X+...)` | ms | 프레임당 DL 방향 proxy 시간 |
+| UL proxy | `Proxy(...+UL=X)` | ms | 프레임당 UL 방향 proxy 시간 |
+| IPC+OAI overhead | `ipc_g1c+oai=X` | ms | GPU IPC + OAI 처리 오버헤드 |
+| frame wall | `wall=Xms` (첫 번째) | ms | 프레임 전체 E2E 지연 |
+| slot 수 | `per slot(D+U=N)` | 개 | 해당 프레임의 활성 슬롯 수 |
+
+**산출할 통계** (UE 수별):
+
+| 통계 | 계산 방법 |
+|------|----------|
+| per-slot wall 평균/p50/p95/max | 전체 프레임에서 per-slot wall 값 수집 후 분위수 |
+| DL/UL 비율 | DL proxy / (DL+UL) proxy |
+| RT feasibility | per-slot wall < 0.5ms (1ms slot) 비율 |
+| UE 수 vs per-slot wall 추세 | 1/2/4/8 UE별 p50 비교 → 스케일링 지수 |
+
+**로그 위치**: `logs/<timestamp>_G1C_v4_*/proxy.log` (각 실험별 보존됨)
+
+#### 우선3: 4T4R buf_len 축소 실측
+
+buffer_len 축소에 따른 VRAM 절감 실측. Ring Buffer가 VRAM의 ~50%이므로 효과 큼.
+
+```bash
+# 3-a: buf_len=4200 (기본 10500의 40%)
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -bs 280 -bl 4200 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+
+# 3-b: buf_len=1050 (기본의 10%)
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -bs 280 -bl 1050 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+```
+
+확인 사항: `sysmon.csv` gpu_mem_used_mb, 채널 버퍼 timeout/bypass 빈도 (buf_len이 너무 작으면 stall 증가).
+
+#### 우선4: noise VRAM 증분
+
+noise on vs off의 VRAM 차이 실측. §10.2 추정: ~1 GB/UE (4T4R).
+
+```bash
+# 4-a: noise OFF (P1B 채널만, noise 없음)
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98
+
+# 4-b: noise ON (우선1과 동일, 결과 재활용)
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+```
+
+확인 사항: 두 실험의 gpu_mem_used_mb 차이 = noise 버퍼 비용.
+참고: §7 실험(bs280, P1B, noise 없음)이 이미 10,442 MB이므로, 4-a는 이 값과 재현되는지 확인. 4-b는 우선1 결과 재활용 가능.
+
+#### 우선5: 4T4R throughput 비교
+
+2T2R vs 4T4R의 DL throughput 차이. iperf3로 측정.
+
+```bash
+# 5-a: 2T2R baseline
+sudo bash launch_all.sh -v v4 -ga 2 1 -ua 2 1 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+# (안정화 후) iperf3 -c <UE_IP> -t 30
+
+# 5-b: 4T4R
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+# (안정화 후) iperf3 -c <UE_IP> -t 30
+```
+
+확인 사항: iperf3 DL throughput (Mbps), RI/PMI/CQI/MCS 비교.
+참고: 비실시간 환경이므로 throughput 절대값보다 **2T2R 대비 4T4R 향상 비율**이 중요.
+
+#### 우선6: 2T2R→4T4R 안테나 비율 검증
+
+동일 UE 수에서 2T2R→4T4R의 Sionna VRAM 비율 실측. §10.5 추정: 1.84×.
+
+```bash
+# 6-a: 2T2R 2UE
+sudo bash launch_all.sh -v v4 -ga 2 1 -ua 2 1 -n 2 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498 -nf -60
+
+# 6-b: 4T4R 2UE (우선2의 2-b 결과 재활용)
+sudo bash launch_all.sh -v v4 -ga 2 2 -ua 2 2 -n 2 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498 -nf -60
+```
+
+확인 사항: (6-b VRAM − 고정비용) / (6-a VRAM − 고정비용) = 안테나 비율. 1.84× 추정과 비교.
+
+#### 우선7: Sionna 스케일링 지수 정밀화
+
+2T2R에서 UE 수 증가에 따른 Sionna VRAM 스케일링 지수 실측. §10.5 추정: O(N_UE^1.4).
+
+```bash
+# 7-a ~ 7-e: 2T2R, UE=1/2/4/8/16
+sudo bash launch_all.sh -v v4 -ga 2 1 -ua 2 1 -n 1 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98 -nf -60
+
+sudo bash launch_all.sh -v v4 -ga 2 1 -ua 2 1 -n 2 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498 -nf -60
+
+sudo bash launch_all.sh -v v4 -ga 2 1 -ua 2 1 -n 4 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498,193,700 -nf -60
+
+sudo bash launch_all.sh -v v4 -ga 2 1 -ua 2 1 -n 8 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx 98,498,193,700,52,298,601,900 -nf -60
+
+sudo bash launch_all.sh -v v4 -ga 2 1 -ua 2 1 -n 16 -bs 280 \
+  -p1b ../P1B_Valid_Results/Area1_7.5GHz_Rays_Valid_RXs.npz -rx random -nf -60
+```
+
+확인 사항: UE별 gpu_mem_used_mb에서 고정비용(CUDA ctx + Ring Buffer + IPC + Pipeline) 차감 후 Sionna 잔차 추출. log-log 기울기로 지수 산출.
+
+#### 완료 이력
+
+(실험 완료 시 아래에 기록)
+
+| 날짜 | # | 결과 요약 | 반영 위치 |
+|------|:-:|----------|------------|
+| 2026-04-05 | 6 | RI 1~4 + PMI Rank 1~4 정상 동작 (bypass: RI=4/CQI=15, P1B: RI=2↔4 동적) | §7.5 |
+| 2026-04-05 | 8-old | ~~P1B+noise(−60 dBFS) bs4200 — VRAM 58.2 GB 부정확~~ → bs280 재실험으로 대체 | §10.5.1 |
+| 2026-04-06 | 8 | **bs280 재실험 완료 (GPU 1)**. VRAM **10,831 MB (10.6 GB)**, RI=1(69%)↔4(31%), CQI=15. noise VRAM 증분 +389 MB. §10.2 예산표와 정합 확인 | §10.5.1 |
+| 2026-04-06 | 1-2b | **2 UE 4T4R**: VRAM **20,339 MB (19.9 GB)**, 2 UE 모두 접속 성공, 스케일링 1.88x (UE당 +9.5 GB), OOM 없음 | 우선2 |
+| 2026-04-06 | 1-2c | **4 UE 4T4R**: VRAM **39,253 MB (38.3 GB)**, 3/4 UE 접속 (UE1 PBCH 실패), 스케일링 3.62x (UE당 +9.5 GB 일관), OOM 없음. 짧은 실행 | 우선2 |

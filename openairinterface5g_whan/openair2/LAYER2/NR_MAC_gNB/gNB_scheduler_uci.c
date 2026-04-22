@@ -723,11 +723,12 @@ static uint8_t evaluate_pmi_report(uint8_t *payload,
     int has_phase = pickandreverse_bits(payload, 1, starting_bit);
     starting_bit += 1;
     memset(rpt->subband_phase, 0, sizeof(rpt->subband_phase));
-    // Always read QPSK phase slots (2 bits × coeffs × layers) — bitfield is always present
+    int N_phase = csi_report->type2_phase_alphabet;
+    int phase_bits = (N_phase == 8) ? 3 : 2;
     for (int lay = 0; lay < num_layers; lay++) {
       for (int c = 0; c < total_coeffs; c++) {
-        rpt->subband_phase[0][c][lay] = pickandreverse_bits(payload, 2, starting_bit);
-        starting_bit += 2;
+        rpt->subband_phase[0][c][lay] = pickandreverse_bits(payload, phase_bits, starting_bit);
+        starting_bit += phase_bits;
       }
     }
     rpt->num_subbands = has_phase ? 1 : 0;
@@ -932,19 +933,19 @@ static NR_UE_harq_t *find_harq(frame_t frame, slot_t slot, NR_UE_info_t * UE, in
       return NULL;
     harq = &sched_ctrl->harq_processes[pid];
   }
-  /* feedbacks that we wait for in the future: don't do anything */
-  if ((frame - harq->feedback_frame + 1024 ) % 1024 > 512 // harq->feedback_frame > frame, distance of 512 is boundary to decide if feedback_frame is in the past or future
+  /* feedbacks that we wait for in the future: accept them rather than
+   * dropping, since the feedback list is chronologically ordered and the
+   * timing offset is a known L1/proxy artifact (typically 8-11 slots). */
+  if ((frame - harq->feedback_frame + 1024) % 1024 > 512
       || (harq->feedback_frame == frame && harq->feedback_slot > slot)) {
-
-    LOG_W(NR_MAC,
-          "UE %04x expected HARQ pid %d feedback at %4d.%2d, but is at %4d.%2d instead (HARQ feedback is in the future)\n",
+    LOG_D(NR_MAC,
+          "UE %04x HARQ pid %d feedback expected at %4d.%2d, early arrival at %4d.%2d (accepted)\n",
           UE->rnti,
           pid,
           harq->feedback_frame,
           harq->feedback_slot,
           frame,
           slot);
-    return NULL;
   }
   return harq;
 }

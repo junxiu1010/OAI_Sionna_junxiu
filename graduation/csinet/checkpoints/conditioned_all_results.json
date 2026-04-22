@@ -1,0 +1,74 @@
+[
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.25,
+    "test_nmse_dB": -0.2669055680319563,
+    "test_cos_sim": 0.2744165137410164
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.125,
+    "test_nmse_dB": -0.843162909122293,
+    "test_cos_sim": 0.40008436888456345
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.0625,
+    "test_nmse_dB": -0.39206553306263187,
+    "test_cos_sim": 0.2640576921403408
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.03125,
+    "test_nmse_dB": 2.232457069756863,
+    "test_cos_sim": 0.05770091153681278
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.25,
+    "test_nmse_dB": 3.1767633813115452,
+    "test_cos_sim": 0.003821067090939323
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.125,
+    "test_nmse_dB": 4.6579112837237275,
+    "test_cos_sim": 0.008654529810883105
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.0625,
+    "test_nmse_dB": 3.2000120833093533,
+    "test_cos_sim": 0.0018863458826672286
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.03125,
+    "test_nmse_dB": 14.136469745684847,
+    "test_cos_sim": 0.010164850275032222
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.25,
+    "test_nmse_dB": 1.9663279955943256,
+    "test_cos_sim": -0.0012593606079462916
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.125,
+    "test_nmse_dB": 3.054312841452598,
+    "test_cos_sim": 0.003115010855253786
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.0625,
+    "test_nmse_dB": 5.749759540585088,
+    "test_cos_sim": 0.0039830909663578495
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.03125,
+    "test_nmse_dB": 1.5717200317483615,
+    "test_cos_sim": -0.005467863054946065
+  }
+]

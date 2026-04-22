@@ -1,0 +1,86 @@
+name: "MU-MIMO 8T8R Type-II"
+description: "8-antenna dual-pol (4x1), Type-II PortSelection codebook, 4-UE MU-MIMO"
+tags: [mu-mimo, type2, 8t8r, dual-pol]
+config:
+  system:
+    num_ues: 4
+    mu_mimo: true
+    force_mu_dl_traffic: true
+  antenna:
+    gnb:
+      nx: 4
+      ny: 1
+      polarization: dual
+    ue:
+      nx: 1
+      ny: 1
+  codebook:
+    type: type2
+    sub_type: typeII_PortSelection
+    mode: 1
+    pmi_restriction: 0xff
+    ri_restriction: 0x01
+    n1_n2_config: four_one
+    phase_alphabet_size: n4
+    subband_amplitude: 0
+    number_of_beams: 4
+    port_selection_sampling_size: 4
+  csi_rs:
+    periodicity: 20
+    nrof_ports: 8
+    cdm_type: fd_CDM2
+    density: 1
+    first_symbol: 13
+    power_offset: 0
+    freq_start_rb: 0
+    freq_nrof_rbs: 106
+    freq_allocation: [32, 0]
+    qcl_info: 0
+  srs:
+    periodicity: 20
+    nrof_srs_ports: 2
+    start_position: 0
+    num_symbols: 1
+    repetition_factor: 1
+    comb_offset: 0
+    cyclic_shift: 0
+    freq_domain_position: 0
+    freq_domain_shift: 0
+    freq_hopping_b_srs: 0
+    freq_hopping_b_hop: 0
+    freq_hopping_c_srs: 0
+    group_hopping: neither
+    alpha: alpha1
+    p0: -84
+  csi_measurement:
+    report_periodicity: 20
+    report_offset: 0
+    cqi_table: table1
+    ri_table: table1
+    pmi_table: table1
+    cqi_threshold: 0
+    ri_threshold: 0
+    enable_rsrp: 1
+    enable_ri: 1
+    enable_pmi: 1
+    enable_cqi: 1
+    enable_sinr: 1
+  bearer:
+    enable_sdap: false
+    drbs: 1
+    um_on_default_drb: false
+    drb_ciphering: true
+    drb_integrity: false
+  qos:
+    default_5qi: 9
+    session_ambr_ul: "10Gbps"
+    session_ambr_dl: "10Gbps"
+    arp_priority: 15
+    arp_preempt_cap: "NOT_PREEMPT"
+    arp_preempt_vuln: "PREEMPTABLE"
+  channel:
+    path_loss_dB: 0.0
+    snr_dB: null
+    noise_dBFS: null
+    speed: 3.0
+    scenario: UMa-NLOS

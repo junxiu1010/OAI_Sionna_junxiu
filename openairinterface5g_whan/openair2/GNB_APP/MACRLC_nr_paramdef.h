@@ -79,6 +79,10 @@
 #define CONFIG_STRING_MACRLC_BEAM_DURATION                 "beam_duration"
 #define CONFIG_STRING_MACRLC_BEAMS_PERIOD                  "beams_per_period"
 #define CONFIG_STRING_MACRLC_BEAM_WEIGHTS_LIST             "beam_weights"
+#define CONFIG_STRING_MACRLC_DL_BLER_FILTER_COEFF            "dl_bler_filter_coeff"
+#define CONFIG_STRING_MACRLC_DL_BLER_UPDATE_FRAMES          "dl_bler_update_frames"
+#define CONFIG_STRING_MACRLC_UL_BLER_FILTER_COEFF            "ul_bler_filter_coeff"
+#define CONFIG_STRING_MACRLC_UL_BLER_UPDATE_FRAMES          "ul_bler_update_frames"
 #define CONFIG_STRING_MACRLC_PUSCH_RSSI_THRESHOLD          "pusch_RSSI_Threshold"
 #define CONFIG_STRING_MACRLC_PUCCH_RSSI_THRESHOLD          "pucch_RSSI_Threshold"
 
@@ -100,6 +104,10 @@
 #define HLP_MACRLC_AB "Flag to enable analog beamforming"
 #define HLP_MACRLC_BEAM_DURATION "number of consecutive slots for a given set of beams"
 #define HLP_MACRLC_BEAMS_PERIOD "set of beams that can be simultaneously allocated in a period"
+#define HLP_MACRLC_DL_BLER_FILT "DL BLER IIR filter coefficient (0..1, higher=slower)"
+#define HLP_MACRLC_DL_BLER_UPD  "DL BLER update period in frames"
+#define HLP_MACRLC_UL_BLER_FILT "UL BLER IIR filter coefficient (0..1, higher=slower)"
+#define HLP_MACRLC_UL_BLER_UPD  "UL BLER update period in frames"
 #define HLP_MACRLC_PUSCH_RSSI_THRESHOLD "Limits PUSCH TPC commands based on RSSI to prevent ADC railing. Value range [-1280, 0], unit 0.1 dBm/dBFS"
 #define HLP_MACRLC_PUCCH_RSSI_THRESHOLD "Limits PUCCH TPC commands based on RSSI to prevent ADC railing. Value range [-1280, 0], unit 0.1 dBm/dBFS"
 
@@ -155,6 +163,10 @@
   {CONFIG_STRING_MACRLC_PUCCH_RSSI_THRESHOLD,        HLP_MACRLC_PUCCH_RSSI_THRESHOLD, \
                                                                                0, .iptr=NULL,   .defintval=0,               TYPE_INT,     0}, \
   {CONFIG_STRING_MACRLC_FORCE_MU_DL_TRAFFIC,        HLP_MACRLC_FORCE_MU_DL_TRAFFIC, PARAMFLAG_BOOL, .u8ptr=NULL, .defintval=0, TYPE_UINT8, 0}, \
+  {CONFIG_STRING_MACRLC_DL_BLER_FILTER_COEFF,      HLP_MACRLC_DL_BLER_FILT,  0, .dblptr=NULL, .defdblval=0.7,            TYPE_DOUBLE,  0}, \
+  {CONFIG_STRING_MACRLC_DL_BLER_UPDATE_FRAMES,     HLP_MACRLC_DL_BLER_UPD,   0, .u8ptr=NULL,  .defintval=5,              TYPE_UINT8,   0}, \
+  {CONFIG_STRING_MACRLC_UL_BLER_FILTER_COEFF,      HLP_MACRLC_UL_BLER_FILT,  0, .dblptr=NULL, .defdblval=0.9,            TYPE_DOUBLE,  0}, \
+  {CONFIG_STRING_MACRLC_UL_BLER_UPDATE_FRAMES,     HLP_MACRLC_UL_BLER_UPD,   0, .u8ptr=NULL,  .defintval=10,             TYPE_UINT8,   0}, \
 }
 // clang-format off
 
@@ -202,6 +214,10 @@
 #define MACRLC_PUSCH_RSSI_THRES_IDX                            41
 #define MACRLC_PUCCH_RSSI_THRES_IDX                            42
 #define MACRLC_FORCE_MU_DL_TRAFFIC_IDX                         43
+#define MACRLC_DL_BLER_FILTER_COEFF_IDX                        44
+#define MACRLC_DL_BLER_UPDATE_FRAMES_IDX                       45
+#define MACRLC_UL_BLER_FILTER_COEFF_IDX                        46
+#define MACRLC_UL_BLER_UPDATE_FRAMES_IDX                       47
 
 #define MACRLCPARAMS_CHECK { \
   { .s5 = { NULL } }, \
@@ -248,6 +264,10 @@
   { .s2 =  { config_check_intrange, {-1280, 0}} }, /* PUSCH RSSI threshold range */ \
   { .s2 =  { config_check_intrange, {-1280, 0}} }, /* PUCCH RSSI threshold range */ \
   { .s5 = { NULL } }, /* force_mu_dl_traffic */ \
+  { .s5 = { NULL } }, /* dl_bler_filter_coeff */ \
+  { .s2 = { config_check_intrange, {1, 100} } }, /* dl_bler_update_frames */ \
+  { .s5 = { NULL } }, /* ul_bler_filter_coeff */ \
+  { .s2 = { config_check_intrange, {1, 100} } }, /* ul_bler_update_frames */ \
 }
 
 /*---------------------------------------------------------------------------------------------------------------------------------------------------------*/

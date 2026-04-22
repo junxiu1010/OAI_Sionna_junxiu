@@ -76,7 +76,7 @@ try:
 except ImportError:
     tf = None
 
-gpu_num = 0
+gpu_num = 1
 os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
 os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu_num}"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
@@ -1616,38 +1616,50 @@ class UnifiedChannelProducerProcess(_mp_ctx.Process):
             ring_buffers.append(rb_k)
             print(f"[v4 UnifiedChannelProducerProcess] UE[{k}] IPC handle sent")
 
-        print(f"[v4 UnifiedChannelProducerProcess] Entering generation loop (pid={_os.getpid()}, N_UE={num_ues})")
+        use_xla = cfg.get('use_xla', False)
+        xla_tag = " +XLA" if use_xla else ""
+        print(f"[v4 UnifiedChannelProducerProcess] Entering generation loop (pid={_os.getpid()}, N_UE={num_ues}{xla_tag})")
 
         params = dict(Fs=Fs_local, scs=scs_local,
                       N_UE=N_UE, N_BS=N_BS,
                       N_UE_active=cfg['num_rx'], N_BS_serving=cfg['num_tx'])
+
+        sample_times_fixed = _tf.cast(
+            _tf.range(buffer_symbol_size), gen.rdtype
+        ) / _tf.constant(params['scs'], gen.rdtype)
+        ActiveUE_fixed = _tf.constant(
+            random_binary_mask_tf_complex64(params['N_UE'], k=params['N_UE_active']),
+            dtype=_tf.complex64)
+        ServingBS_fixed = _tf.constant(
+            random_binary_mask_tf_complex64(params['N_BS'], k=params['N_BS_serving']),
+            dtype=_tf.complex64)
+
+        def _generate_eager():
+            h_delay, _, _, _ = gen._H_TTI_sequential_fft_o_ELW2_noProfile(
+                topology, ActiveUE_fixed, ServingBS_fixed, sample_times_fixed,
+                h_field, aoa, zoa)
+            h_delay = h_delay[0, :, :, 0, :, :, :]
+            h_delay = _tf.transpose(h_delay, [3, 2, 0, 1, 4])
+            h_c128 = _tf.cast(h_delay, _tf.complex128)
+            energy = _tf.reduce_sum(_tf.abs(h_c128) ** 2, axis=3, keepdims=True)
+            h_norm = h_delay / _tf.cast(_tf.sqrt(energy + 1e-30), h_delay.dtype)
+            return _tf.cast(h_norm, _tf.complex128)
+
+        if use_xla:
+            generate_fn = _tf.function(_generate_eager, jit_compile=True)
+            print(f"[v4 XLA] Compiling XLA graph (first call will be slow)...")
+            _t_xla = time.time()
+            _ = generate_fn()
+            print(f"[v4 XLA] Compilation done ({time.time()-_t_xla:.1f}s)")
+        else:
+            generate_fn = _generate_eager
+
         symbol_counter = 0
         drop_count = [0] * num_ues
 
         while not self.stop_event.is_set():
             try:
-                sample_times = _tf.cast(
-                    _tf.range(buffer_symbol_size), gen.rdtype
-                ) / _tf.constant(params['scs'], gen.rdtype)
-                ActiveUE = _tf.constant(
-                    random_binary_mask_tf_complex64(params['N_UE'], k=params['N_UE_active']),
-                    dtype=_tf.complex64)
-                ServingBS = _tf.constant(
-                    random_binary_mask_tf_complex64(params['N_BS'], k=params['N_BS_serving']),
-                    dtype=_tf.complex64)
-                h_delay, _, _, _ = gen._H_TTI_sequential_fft_o_ELW2_noProfile(
-                    topology, ActiveUE, ServingBS, sample_times,
-                    h_field, aoa, zoa)
-
-                # h_delay shape: [B=1, N_r, N_t, N_BS=1, N_UE, N_sym, N_FFT]
-                # N_UE 차원 유지: v3에서는 0으로 인덱싱했으나, v4에서는 ':'로 전체 유지
-                h_delay = h_delay[0, :, :, 0, :, :, :]  # (N_r, N_t, N_UE, N_sym, N_FFT)
-                h_delay = _tf.transpose(h_delay, [3, 2, 0, 1, 4])  # (N_sym, N_UE, N_r, N_t, N_FFT)
-
-                h_c128 = _tf.cast(h_delay, _tf.complex128)
-                energy = _tf.reduce_sum(_tf.abs(h_c128) ** 2, axis=3, keepdims=True)  # N_t 축
-                h_norm = h_delay / _tf.cast(_tf.sqrt(energy + 1e-30), h_delay.dtype)
-                h_c128_norm = _tf.cast(h_norm, _tf.complex128)
+                h_c128_norm = generate_fn()
 
                 try:
                     h_cp = _cp.from_dlpack(
@@ -1655,11 +1667,9 @@ class UnifiedChannelProducerProcess(_mp_ctx.Process):
                 except Exception:
                     h_cp = _cp.asarray(h_c128_norm.numpy())
 
-                # (N_sym, N_UE, N_r, N_t, N_FFT) → FFT on last axis
                 h_cp = _cp.fft.fft(h_cp, axis=-1)
 
                 for ue_k in range(num_ues):
-                    # per-UE shape: (N_sym, N_r, N_t, N_FFT)
                     h_ue_k = h_cp[:, ue_k, :, :, :]
                     inserted = ring_buffers[ue_k].try_put_batch(h_ue_k)
                     dropped = h_ue_k.shape[0] - inserted
@@ -1723,11 +1733,13 @@ class Proxy:
                  gnb_ant=1, ue_ant=1,
                  gnb_nx=1, gnb_ny=1, ue_nx=1, ue_ny=1,
                  num_ues=1,
-                 p1b_npz=None, ue_rx_indices=None):
+                 p1b_npz=None, ue_rx_indices=None,
+                 use_xla=False):
         self.mode = mode
         self.num_ues = num_ues
         self.p1b_npz = p1b_npz
         self.ue_rx_indices = ue_rx_indices
+        self.use_xla = use_xla
         self._stalled_ue_logged = set()
         self.gnb_ant = gnb_ant
         self.ue_ant = ue_ant
@@ -1892,6 +1904,7 @@ class Proxy:
             'mean_xpr': mean_xpr_list["UMa-NLOS"],
             'stddev_xpr': stddev_xpr_list["UMa-NLOS"],
             'gpu_num': gpu_num,
+            'use_xla': self.use_xla,
         }
 
         if self.p1b_npz and self.ue_rx_indices:
@@ -2367,10 +2380,11 @@ class Proxy:
                   f"| per slot({nd}+{nu}={ns}): "
                   f"wall={wall_ms/ns:.2f}  "
                   f"proxy={proxy_ms/ns:.2f}  "
-                  f"{overhead_label.lower()}={overhead_ms/ns:.2f} ms")
+                  f"{overhead_label.lower()}={overhead_ms/ns:.2f} ms"
+                  f" ts={now:.3f}")
         else:
             print(f"\n[E2E frame#{self._e2e_next_frame_boundary} {self.num_ues}UE] "
-                  f"baseline set (comparison starts next frame)")
+                  f"baseline set ts={now:.3f}")
         self._e2e_next_frame_boundary += self._e2e_frame_slots
         self._e2e_last_wall = now
         self._e2e_proxy_dl_accum_ms = 0.0
@@ -2699,6 +2713,11 @@ def main():
     ap.add_argument("--num-ues", type=int, default=1,
                     help="Number of UEs to support (default: 1)")
 
+    ap.add_argument("--xla", dest='use_xla', action="store_true",
+                    help="Enable XLA JIT compilation for channel generation (kernel fusion)")
+    ap.add_argument("--no-xla", dest='use_xla', action="store_false")
+    ap.set_defaults(use_xla=False)
+
     ap.add_argument("--p1b-npz", type=str, default=None,
                     help="P1B npz file path for per-UE independent ray data")
     ap.add_argument("--ue-rx-indices", type=str, default=None,
@@ -2750,7 +2769,8 @@ def main():
         noise_std_abs = None
 
     print("=" * 80)
-    print("G1C v3 Multi-UE MIMO Channel Proxy (P1B ray + stall detection)")
+    xla_str = " +XLA" if args.use_xla else ""
+    print(f"G1C v4 Unified Multi-UE MIMO Channel Proxy{xla_str}")
     print("=" * 80)
     print(f"Mode: {args.mode.upper()}")
     print(f"UEs: {args.num_ues}")
@@ -2785,11 +2805,15 @@ def main():
         print(f"AWGN Noise: Disabled")
     print("=" * 80)
 
-    print("\n[v3 Architecture]")
+    print("\n[v4 Architecture]")
     if args.enable_gpu and GPU_AVAILABLE:
         print(f"  + Multi-UE: {args.num_ues} UE(s), per-UE IPC/pipeline/channel/noise")
-        print("  + ChannelProducer: multiprocessing.Process (spawn, independent TF context)")
-        print("  + RingBuffer: CUDA IPC cross-process GPU ring buffer")
+        print("  + ChannelProducer: UnifiedChannelProducerProcess (single TF context, N_UE batch)")
+        print("  + RingBuffer: CUDA IPC cross-process GPU ring buffer + non-blocking try_put_batch")
+        if args.use_xla:
+            print("  + XLA: JIT compilation enabled (kernel fusion)")
+        else:
+            print("  + XLA: Disabled (eager mode)")
         print("  + DL Broadcast: gNB dl_tx → per-UE channel → UE[k] dl_rx")
         if args.custom_channel:
             print("  + UL Superposition: UE[k] ul_tx → per-UE channel → sum → gNB ul_rx")
@@ -2830,6 +2854,7 @@ def main():
         num_ues=args.num_ues,
         p1b_npz=args.p1b_npz,
         ue_rx_indices=resolved_rx_indices,
+        use_xla=args.use_xla,
     )
 
     def _sigterm_handler(signum, frame):

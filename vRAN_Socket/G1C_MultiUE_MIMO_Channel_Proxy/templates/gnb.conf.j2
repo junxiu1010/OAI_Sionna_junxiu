@@ -6,6 +6,7 @@
 {#-   gnb_spatial = gnb.nx * gnb.ny                                               -#}
 {#-   xp          = pol_mult                                                      -#}
 {#-   n1          = gnb_spatial if xp==2 else gnb_ant                             -#}
+{%- set br = bearer | default({}) -%}
 Active_gNBs = ( "gNB-OAI");
 # Asn1_verbosity, choice in: none, info, annoying
 Asn1_verbosity = "none";
@@ -63,9 +64,9 @@ gNBs =
           prach_msg1_FrequencyStart                                 = 0;
           zeroCorrelationZoneConfig                                 = 13;
           preambleReceivedTargetPower                               = -96;
-          preambleTransMax                                          = 6;
+          preambleTransMax                                          = 8;
         powerRampingStep                                            = 1;
-        ra_ResponseWindow                                           = 4;
+        ra_ResponseWindow                                           = 5;
         ssb_perRACH_OccasionAndCB_PreamblesPerSSB_PR                = 4;
         ssb_perRACH_OccasionAndCB_PreamblesPerSSB                   = 14;
         ra_ContentionResolutionTimer                                = 7;
@@ -76,11 +77,11 @@ gNBs =
         restrictedSetConfig                                         = 0,
 
         msg3_DeltaPreamble                                          = 1;
-        p0_NominalWithGrant                                         =-90;
+        p0_NominalWithGrant                                         =-70;
 
         pucchGroupHopping                                           = 0;
         hoppingId                                                   = 40;
-        p0_nominal                                                  = -90;
+        p0_nominal                                                  = -70;
 
       ssb_PositionsInBurst_Bitmap                                   = 1;
       ssb_periodicityServingCell                                    = 2;
@@ -94,7 +95,7 @@ gNBs =
       nrofUplinkSlots                                               = 2;
       nrofUplinkSymbols                                             = 4;
 
-      ssPBCH_BlockPower                                             = -25;
+      ssPBCH_BlockPower                                             = 0;
   }
 
   );
@@ -193,8 +194,12 @@ gNBs =
     {
         GNB_IPV4_ADDRESS_FOR_NG_AMF              = "{{ network.gnb_ip }}/{{ network.gnb_ip_prefix }}";
         GNB_IPV4_ADDRESS_FOR_NGU                 = "{{ network.gnb_ip }}/{{ network.gnb_ip_prefix }}";
-        GNB_PORT_FOR_S1U                         = 2152;
+        GNB_PORT_FOR_S1U                         = {{ network.get('gtpu_port', 2152) if network is mapping else 2152 }};
     };
+
+    enable_sdap = {{ 1 if br.get('enable_sdap', false) else 0 }};
+    drbs        = {{ br.get('drbs', 1) }};
+    um_on_default_drb = {{ 1 if br.get('um_on_default_drb', false) else 0 }};
 
   }
 );
@@ -206,6 +211,10 @@ MACRLCs = (
   tr_n_preference             = "local_RRC";
   pusch_TargetSNRx10          = 150;
   pucch_TargetSNRx10          = 200;
+  ul_harq_round_max           = 8;
+  dl_harq_round_max           = 8;
+  pucch_FailureThres          = 1000;
+  pusch_FailureThres          = 1000;
   mu_mimo                     = {{ 1 if system.mu_mimo | default(true) else 0 }};
   force_mu_dl_traffic         = {{ 1 if system.force_mu_dl_traffic | default(false) else 0 }};
 }
@@ -215,9 +224,11 @@ L1s = (
 {
   num_cc = 1;
   tr_n_preference       = "local_mac";
-  prach_dtx_threshold   = 120;
-  pucch0_dtx_threshold  = 100;
-  ofdm_offset_divisor   = 8;
+  prach_dtx_threshold   = 10;
+  pucch0_dtx_threshold  = 0;
+  pusch_dtx_threshold   = -10;
+  tx_amp_backoff_dB     = 12;
+  ofdm_offset_divisor   = 4294967295;
 }
 );
 
@@ -287,8 +298,8 @@ rfsimulator :
 security = {
   ciphering_algorithms = ( "nea0" );
   integrity_algorithms = ( "nia2", "nia0" );
-  drb_ciphering = "yes";
-  drb_integrity = "no";
+  drb_ciphering = "{{ 'yes' if br.get('drb_ciphering', true) else 'no' }}";
+  drb_integrity = "{{ 'yes' if br.get('drb_integrity', false) else 'no' }}";
 };
 
 log_config :

@@ -967,22 +967,29 @@ static int rfsimulator_write_internal(rfsimulator_state_t *t, openair0_timestamp
     if (t->role == SIMU_ROLE_SERVER) {
       {
         static uint64_t _wr_cnt = 0;
+        static uint64_t _nz_cnt = 0;
+        static uint64_t _zero_cnt = 0;
         _wr_cnt++;
-        if (_wr_cnt == 1 || _wr_cnt == 10 || _wr_cnt == 100 || _wr_cnt == 1000) {
-          int nz0=0, nz1=0;
-          int16_t *b0 = (int16_t *)samplesVoid[0];
-          int chk = nsamps*2 < 512 ? nsamps*2 : 512;
-          for (int i=0;i<chk;i++) if(b0[i]!=0) nz0++;
+        int nz0=0;
+        int16_t *b0 = (int16_t *)samplesVoid[0];
+        int chk = nsamps*2 < 512 ? nsamps*2 : 512;
+        for (int i=0;i<chk;i++) if(b0[i]!=0) { nz0++; break; }
+        if (nz0 > 0) _nz_cnt++; else _zero_cnt++;
+        if (_wr_cnt <= 5 || (_wr_cnt <= 200 && nz0 > 0) || _wr_cnt % 1000 == 0) {
+          int nz0_full=0, nz1=0;
+          for (int i=0;i<chk;i++) if(b0[i]!=0) nz0_full++;
           if (nbAnt>1) {
             int16_t *b1 = (int16_t *)samplesVoid[1];
             for (int i=0;i<chk;i++) if(b1[i]!=0) nz1++;
           }
           LOG_I(HW,"[GPU_IPC_DL_SRC] #%lu ant0_nz=%d/%d ant1_nz=%d/%d ts=%lu nsamps=%d nbAnt=%d "
-                "ant0[0..3]=[%d,%d,%d,%d] ptr0=%p ptr1=%p\n",
-                (unsigned long)_wr_cnt, nz0,chk, nz1,chk,
+                "nz_total=%lu zero_total=%lu pct=%.1f%% "
+                "ant0[0..3]=[%d,%d,%d,%d]\n",
+                (unsigned long)_wr_cnt, nz0_full,chk, nz1,chk,
                 (unsigned long)timestamp, nsamps, nbAnt,
-                chk>0?b0[0]:0, chk>1?b0[1]:0, chk>2?b0[2]:0, chk>3?b0[3]:0,
-                samplesVoid[0], nbAnt>1?samplesVoid[1]:NULL);
+                (unsigned long)_nz_cnt, (unsigned long)_zero_cnt,
+                _wr_cnt > 0 ? 100.0*(double)_nz_cnt/(double)_wr_cnt : 0.0,
+                chk>0?b0[0]:0, chk>1?b0[1]:0, chk>2?b0[2]:0, chk>3?b0[3]:0);
         }
       }
       if (nbAnt == 1) {
@@ -995,6 +1002,30 @@ static int rfsimulator_write_internal(rfsimulator_state_t *t, openair0_timestamp
         ret = gpu_ipc_v7_dl_write(&t->gpu_ipc_v7, tmpBuf, nsamps, nbAnt, timestamp);
       }
     } else {
+      {
+        static uint64_t _ul_wr_cnt = 0;
+        static uint64_t _ul_nz_cnt = 0;
+        _ul_wr_cnt++;
+        int nz0=0;
+        int16_t *b0 = (int16_t *)samplesVoid[0];
+        int chk = nsamps*2 < 512 ? nsamps*2 : 512;
+        for (int i=0;i<chk;i++) if(b0[i]!=0) { nz0++; break; }
+        if (nz0 > 0) _ul_nz_cnt++;
+        if (_ul_wr_cnt <= 5 || (_ul_wr_cnt <= 200 && nz0 > 0) || _ul_wr_cnt % 2000 == 0) {
+          int nz0_full=0, nz1=0;
+          for (int i=0;i<chk;i++) if(b0[i]!=0) nz0_full++;
+          if (nbAnt>1) {
+            int16_t *b1 = (int16_t *)samplesVoid[1];
+            for (int i=0;i<chk;i++) if(b1[i]!=0) nz1++;
+          }
+          LOG_I(HW,"[GPU_IPC_UL_SRC] #%lu ant0_nz=%d/%d ant1_nz=%d/%d ts=%lu nsamps=%d nbAnt=%d "
+                "nz_total=%lu/%lu pct=%.1f%%\n",
+                (unsigned long)_ul_wr_cnt, nz0_full,chk, nz1,chk,
+                (unsigned long)timestamp, nsamps, nbAnt,
+                (unsigned long)_ul_nz_cnt, (unsigned long)_ul_wr_cnt,
+                _ul_wr_cnt > 0 ? 100.0*(double)_ul_nz_cnt/(double)_ul_wr_cnt : 0.0);
+        }
+      }
       if (nbAnt == 1) {
         ret = gpu_ipc_v7_ul_write(&t->gpu_ipc_v7, samplesVoid[0], nsamps, nbAnt, timestamp);
       } else {
@@ -1559,16 +1590,27 @@ static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimest
             (t->gpu_ipc_v7.shm_raw + _V7_OFF_UL_SYNC_TS);
         uint64_t sync_ts = *sync_p;
         if (sync_ts > 0) {
-          LOG_I(HW, "GPU IPC V7 gNB UL sync: nextRxTstamp %lu → %lu\n",
-                (unsigned long)t->nextRxTstamp, (unsigned long)sync_ts);
+          int samples_per_slot = nsamps > 0 ? nsamps : 30720;
+          uint64_t cur_slot = t->nextRxTstamp / samples_per_slot;
+          uint64_t new_slot = sync_ts / samples_per_slot;
+          LOG_I(HW, "GPU IPC V7 gNB UL sync: nextRxTstamp %lu → %lu "
+                "(cur_slot=%lu mod20=%d new_slot=%lu mod20=%d)\n",
+                (unsigned long)t->nextRxTstamp, (unsigned long)sync_ts,
+                (unsigned long)cur_slot, (int)(cur_slot % 20),
+                (unsigned long)new_slot, (int)(new_slot % 20));
           t->nextRxTstamp = sync_ts;
           t->ul_ts_synced = 1;
         }
       }
-      ret = gpu_ipc_v7_ul_read(&t->gpu_ipc_v7, dst, nsamps, nbAnt, t->nextRxTstamp, 50);
+      ret = gpu_ipc_v7_ul_read(&t->gpu_ipc_v7, dst, nsamps, nbAnt, t->nextRxTstamp, 100);
       if (ret <= 0) {
+        volatile uint64_t *_last_rx_p = (volatile uint64_t *)
+            (t->gpu_ipc_v7.shm_raw + _V7_OFF_LAST_UL_RX_TS);
+        uint64_t proxy_ul_head = *_last_rx_p;
+        int64_t gap = (int64_t)proxy_ul_head - (int64_t)t->nextRxTstamp;
         int ul_retry = 0;
-        while (ret <= 0 && ul_retry < 40) {
+        int max_retry = (gap >= 0) ? 80 : 40;
+        while (ret <= 0 && ul_retry < max_retry) {
           usleep(2000);
           ret = gpu_ipc_v7_ul_read(&t->gpu_ipc_v7, dst, nsamps, nbAnt, t->nextRxTstamp, 10);
           ul_retry++;
@@ -1576,9 +1618,13 @@ static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimest
         if (ret <= 0) {
           memset(dst, 0, nsamps * nbAnt * sizeof(sample_t));
           static int _ul_empty_warn = 0;
-          if (_ul_empty_warn < 20) {
-            LOG_W(HW, "[GPU_IPC_V7] UL read EMPTY after %d retries at ts=%lu\n",
-                  ul_retry, (unsigned long)t->nextRxTstamp);
+          if (_ul_empty_warn < 50) {
+            proxy_ul_head = *_last_rx_p;
+            LOG_W(HW, "[GPU_IPC_V7] UL read EMPTY after %d retries at ts=%lu "
+                  "proxy_head=%lu gap=%ld\n",
+                  ul_retry, (unsigned long)t->nextRxTstamp,
+                  (unsigned long)proxy_ul_head,
+                  (long)((int64_t)proxy_ul_head - (int64_t)t->nextRxTstamp));
             _ul_empty_warn++;
           }
         }
@@ -1593,6 +1639,65 @@ static int rfsimulator_read(openair0_device *device, openair0_timestamp *ptimest
           ((sample_t *)samplesVoid[a])[s] = tmpBuf[s * nbAnt + a];
     }
 
+    /* V7 read energy diagnostic — multi-antenna + TDD + proxy gap */
+    if (t->role != SIMU_ROLE_CLIENT) {
+      static uint64_t _v7rd_cnt = 0;
+      static uint64_t _v7rd_nz = 0;
+      static uint64_t _ul_slot_cnt = 0;
+      static uint64_t _ul_slot_nz = 0;
+      _v7rd_cnt++;
+
+      int64_t e_all[4] = {0,0,0,0};
+      int16_t max_all[4] = {0,0,0,0};
+      int has_any = 0;
+
+      for (int a = 0; a < nbAnt && a < 4; a++) {
+        int16_t *rd = (int16_t *)samplesVoid[a];
+        for (int i = 0; i < nsamps * 2; i++) {
+          int16_t av = rd[i] < 0 ? -rd[i] : rd[i];
+          if (av > max_all[a]) max_all[a] = av;
+          e_all[a] += (int64_t)rd[i] * rd[i];
+        }
+        if (max_all[a] > 0) has_any = 1;
+      }
+      if (has_any) _v7rd_nz++;
+
+      int sps = nsamps > 0 ? nsamps : 30720;
+      uint64_t slot_abs = t->nextRxTstamp / sps;
+      int slot_in_frame = (int)(slot_abs % 20);
+      /* TDD pattern: 7D+1S+2U per 10 slots → UL = slots 8,9 in half-frame */
+      int slot_in_period = (int)(slot_abs % 10);
+      int is_ul_slot = (slot_in_period >= 8);
+      if (is_ul_slot) {
+        _ul_slot_cnt++;
+        if (has_any) _ul_slot_nz++;
+      }
+
+      if (_v7rd_cnt <= 10 || (has_any && _v7rd_cnt <= 500)
+          || _v7rd_cnt % 2000 == 0) {
+        volatile uint64_t *_prx = (volatile uint64_t *)
+            (t->gpu_ipc_v7.shm_raw + _V7_OFF_LAST_UL_RX_TS);
+        uint64_t phead = *_prx;
+        int64_t gap = (int64_t)phead - (int64_t)t->nextRxTstamp;
+        LOG_I(HW, "[V7_RD] #%lu ts=%lu slot=%lu(f%lu.s%d) %s%s "
+              "ant_max=[%d,%d,%d,%d] "
+              "nz=%lu/%lu(%.1f%%) ul_nz=%lu/%lu(%.1f%%) gap=%ld\n",
+              (unsigned long)_v7rd_cnt,
+              (unsigned long)t->nextRxTstamp,
+              (unsigned long)slot_abs,
+              (unsigned long)(slot_abs / 20),
+              slot_in_frame,
+              has_any ? "DATA" : "EMPTY",
+              is_ul_slot ? "[UL]" : "",
+              (int)max_all[0], (int)max_all[1],
+              (int)max_all[2], (int)max_all[3],
+              (unsigned long)_v7rd_nz, (unsigned long)_v7rd_cnt,
+              _v7rd_cnt > 0 ? 100.0*(double)_v7rd_nz/(double)_v7rd_cnt : 0.0,
+              (unsigned long)_ul_slot_nz, (unsigned long)_ul_slot_cnt,
+              _ul_slot_cnt > 0 ? 100.0*(double)_ul_slot_nz/(double)_ul_slot_cnt : 0.0,
+              (long)gap);
+      }
+    }
     *ptimestamp = t->nextRxTstamp;
     t->nextRxTstamp += nsamps;
     return nsamps;
@@ -2390,6 +2495,11 @@ static int rfsimulator_reset_stats(openair0_device *device) {
 }
 static void rfsimulator_end(openair0_device *device) {
   rfsimulator_state_t* s = device->priv;
+#ifdef USE_GPU_IPC_V7
+  if (s->use_gpu_ipc_v7) {
+    gpu_ipc_v7_cleanup(&s->gpu_ipc_v7);
+  }
+#endif
 #ifdef USE_GPU_IPC_V6
   if (s->use_gpu_ipc_v6) {
     gpu_ipc_v6_cleanup(&s->gpu_ipc_v6);

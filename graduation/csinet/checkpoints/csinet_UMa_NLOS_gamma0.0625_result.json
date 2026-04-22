@@ -1,0 +1,8 @@
+{
+  "scenario": "UMa_NLOS",
+  "gamma": 0.0625,
+  "M": 16,
+  "test_nmse_dB": 4.4806774811467855,
+  "test_cos_sim": -0.000312124757329002,
+  "best_val_nmse_dB": 4.160228242364527
+}

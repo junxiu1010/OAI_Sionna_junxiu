@@ -674,15 +674,23 @@ static float compute_pmi_correlation(const NR_UE_info_t *ue1,
   return corr;
 }
 
+typedef struct {
+  uint16_t rnti;
+  float    corr;
+} sus_rejected_t;
+
 static int sus_pf_user_selection(const gNB_MAC_INST *mac,
                                  UEsched_t *UE_sorted,
                                  int num_candidates,
                                  int max_mu_users,
                                  float corr_threshold,
-                                 NR_UE_info_t **selected)
+                                 NR_UE_info_t **selected,
+                                 sus_rejected_t *rejected,
+                                 int *n_rejected)
 {
   if (num_candidates <= 0) return 0;
   int n_sel = 0;
+  *n_rejected = 0;
 
   for (int i = 0; i < num_candidates && UE_sorted[i].UE != NULL; i++) {
     if (n_sel >= max_mu_users) break;
@@ -701,14 +709,47 @@ static int sus_pf_user_selection(const gNB_MAC_INST *mac,
 
     if (max_corr < corr_threshold) {
       selected[n_sel++] = cand;
-      LOG_D(NR_MAC, "[SUS] Added UE %04x (PF=%.3f, max_corr=%.3f) as MU user %d\n",
-            cand->rnti, UE_sorted[i].coef, max_corr, n_sel);
     } else {
-      LOG_I(NR_MAC, "[SUS-CORR] UE %04x rejected: max_corr=%.4f >= thr=%.3f\n",
-            cand->rnti, max_corr, corr_threshold);
+      if (rejected && *n_rejected < MAX_MOBILES_PER_GNB) {
+        rejected[*n_rejected].rnti = cand->rnti;
+        rejected[*n_rejected].corr = max_corr;
+        (*n_rejected)++;
+      }
     }
   }
   return n_sel;
+}
+
+static int mu_mimo_group_counter = 0;
+
+static void log_mu_mimo_group(frame_t frame, slot_t slot,
+                              NR_UE_info_t **group, int n_group,
+                              int n_pool,
+                              const sus_rejected_t *rejected, int n_rejected,
+                              bool use_zf)
+{
+  mu_mimo_group_counter++;
+  LOG_I(NR_MAC, "┌─ MU-MIMO Group #%d  [frame %d, slot %d]  %d UEs selected from %d\n",
+        mu_mimo_group_counter, frame, slot, n_group, n_pool);
+  for (int k = 0; k < n_group; k++) {
+    NR_sched_pdsch_t *sp = &group[k]->UE_sched_ctrl.sched_pdsch;
+    LOG_I(NR_MAC, "│  UE (RNTI=0x%04x)  DMRS port=%d  RB %d+%d  MCS=%-3d 1L  pm=%d (%s)\n",
+          group[k]->rnti, k, sp->rbStart, sp->rbSize,
+          sp->mcs, sp->pm_index, use_zf ? "ZF" : "Type-II");
+  }
+  if (n_rejected > 0) {
+    char buf[512];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "│  [SUS] rejected: ");
+    for (int r = 0; r < n_rejected && pos < (int)sizeof(buf) - 30; r++) {
+      pos += snprintf(buf + pos, sizeof(buf) - pos, "0x%04x(corr=%.3f)%s",
+                      rejected[r].rnti, rejected[r].corr,
+                      (r < n_rejected - 1) ? ", " : "");
+    }
+    LOG_I(NR_MAC, "%s\n", buf);
+  }
+  LOG_I(NR_MAC, "└─ %d/%d UEs selected, %d DMRS ports → %d-layer spatial multiplexing\n",
+        n_group, n_pool, n_group, n_group);
 }
 
 static void pf_dl(module_id_t module_id,
@@ -912,9 +953,11 @@ static void pf_dl(module_id_t module_id,
     if (n_pool >= 2) {
       int max_mu = (N_tx < SUS_MAX_MU_USERS) ? N_tx : SUS_MAX_MU_USERS;
       NR_UE_info_t *sus_selected[SUS_MAX_MU_USERS] = {NULL};
+      sus_rejected_t sus_rej[MAX_MOBILES_PER_GNB];
+      int n_sus_rej = 0;
       int n_sus = sus_pf_user_selection(mac, sus_pool, n_pool, max_mu,
                                         (float)SUS_CORR_THRESHOLD_X1000 / 1000.0f,
-                                        sus_selected);
+                                        sus_selected, sus_rej, &n_sus_rej);
 
       if (n_sus >= 2) {
         NR_UE_info_t *confirmed[SUS_MAX_MU_USERS] = {NULL};
@@ -1015,7 +1058,7 @@ static void pf_dl(module_id_t module_id,
               rballoc[rb + rbStart_sus + bwpStart] |= slbm;
             n_rb_sched[sus_beam_idx] -= rbSize_sus;
 
-            LOG_I(NR_MAC, "[SUS-FIRST] f=%d s=%d selected %d/%d UEs from pool=%d, RB %d+%d\n",
+            LOG_D(NR_MAC, "[SUS-FIRST] f=%d s=%d selected %d/%d UEs from pool=%d, RB %d+%d\n",
                   frame, slot, n_confirmed, n_sus, n_pool, rbStart_sus, rbSize_sus);
 
             /* === Phase 1: Reconstruct channel directions from Type-II PMI === */
@@ -1098,9 +1141,9 @@ static void pf_dl(module_id_t module_id,
                 }
               }
               sus_first_count++;
-              LOG_I(NR_MAC, "[SUS-FIRST]   UE[%d] %04x port=%d pm=%d zf=%d\n",
-                    k, ue_k->rnti, k, sp_k->pm_index, use_zf ? 1 : 0);
             }
+            log_mu_mimo_group(frame, slot, confirmed, n_confirmed,
+                              n_pool, sus_rej, n_sus_rej, use_zf);
           } else {
             LOG_D(NR_MAC, "[SUS-FIRST] RB block too small (%d < %d), skipping MU-MIMO\n",
                   maxRB_sus, min_rbSize);
@@ -1327,9 +1370,11 @@ static void pf_dl(module_id_t module_id,
 
     int max_mu = (N_tx < SUS_MAX_MU_USERS) ? N_tx : SUS_MAX_MU_USERS;
     NR_UE_info_t *selected[SUS_MAX_MU_USERS] = {NULL};
+    sus_rejected_t p2_rej[MAX_MOBILES_PER_GNB];
+    int n_p2_rej = 0;
     int n_sel = sus_pf_user_selection(mac, mu_cand, n_cand, max_mu,
                                       (float)SUS_CORR_THRESHOLD_X1000 / 1000.0f,
-                                      selected);
+                                      selected, p2_rej, &n_p2_rej);
 
     if (n_sel < 2 && n_cand >= 2) {
       LOG_I(NR_MAC, "[SUS-REJECT] f=%d s=%d n_cand=%d n_sel=%d (corr_thr=%.3f)\n",
@@ -1338,8 +1383,6 @@ static void pf_dl(module_id_t module_id,
 
     if (n_sel >= 2) {
       NR_sched_pdsch_t *sp_lead = &selected[0]->UE_sched_ctrl.sched_pdsch;
-      LOG_I(NR_MAC, "[MU-MIMO SUS] Selected %d UEs, lead=%04x RB %d+%d\n",
-            n_sel, selected[0]->rnti, sp_lead->rbStart, sp_lead->rbSize);
 
       /* Pass 1: BWP validation — build confirmed list */
       NR_UE_info_t *p2_confirmed[SUS_MAX_MU_USERS] = {NULL};
@@ -1436,9 +1479,9 @@ static void pf_dl(module_id_t module_id,
                                           mac->radio_config.pdsch_AntennaPorts.XP);
           }
 
-          LOG_I(NR_MAC, "[MU-MIMO SUS]   UE[%d] %04x DMRS port=%d secondary=%d pm_idx=%d zf=%d\n",
-                k, ue_k->rnti, k, (k > 0), sp_k->pm_index, p2_use_zf ? 1 : 0);
         }
+        log_mu_mimo_group(frame, slot, p2_confirmed, n_p2,
+                          n_cand, p2_rej, n_p2_rej, p2_use_zf);
       }
     }
   }
@@ -1622,7 +1665,7 @@ nfapi_nr_dl_tti_pdsch_pdu_rel15_t *prepare_pdsch_pdu(nfapi_nr_dl_tti_request_pdu
   pdsch_pdu->maintenance_parms_v3.tbSizeLbrmBytes = nr_compute_tbslbrm(pdsch_pdu->mcsTable[0], dl_bw_tbslbrm, nl_tbslbrm);
   pdsch_pdu->maintenance_parms_v3.ldpcBaseGraph = get_BG(sched_pdsch->tb_size << 3, sched_pdsch->R);
   // Precoding and beamforming
-  pdsch_pdu->precodingAndBeamforming.num_prgs = 0;
+  pdsch_pdu->precodingAndBeamforming.num_prgs = 1;
   pdsch_pdu->precodingAndBeamforming.prg_size = pdsch_pdu->rbSize;
   pdsch_pdu->precodingAndBeamforming.dig_bf_interfaces = 0;
   int final_pm_idx = sched_pdsch->pm_index;

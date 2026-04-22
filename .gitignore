@@ -10,7 +10,21 @@ __pycache__/
 
 # Log files
 logs/
+logs_old/
+logs_exp
 *.log
+
+# Backup files
+*.bak
+*.bak2
+*.bak4
+*.bak_experiment
+*.bak_orig
+*.bak_sweep
+
+# Large dataset files
+*.h5
+*.hdf5
 
 # IDE
 .vscode/

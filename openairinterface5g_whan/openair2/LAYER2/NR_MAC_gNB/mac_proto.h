@@ -419,7 +419,7 @@ void compute_zf_precoding(const nfapi_nr_pm_pdu_t *h_est,
 
 uint8_t get_mcs_from_cqi(int mcs_table, int cqi_table, int cqi_idx);
 
-uint8_t get_dl_nrOfLayers(const NR_UE_sched_ctrl_t *sched_ctrl, const nr_dci_format_t dci_format);
+uint8_t get_dl_nrOfLayers(NR_UE_sched_ctrl_t *sched_ctrl, const nr_dci_format_t dci_format);
 int get_ul_nrOfLayers(const NR_UE_sched_ctrl_t *sched_ctrl, const nr_dci_format_t dci_format);
 
 void free_sched_pucch_list(NR_UE_sched_ctrl_t *sched_ctrl);
@@ -484,6 +484,7 @@ bool nr_mac_check_release(NR_UE_sched_ctrl_t *sched_ctrl, int rnti);
 void nr_mac_trigger_release_complete(gNB_MAC_INST *mac, int rnti);
 void nr_mac_release_ue(gNB_MAC_INST *mac, int rnti);
 bool nr_mac_request_release_ue(const gNB_MAC_INST *nrmac, int rnti);
+void gnb_rlc_rlf_handler(int rnti);
 
 void nr_mac_trigger_ul_failure(NR_UE_sched_ctrl_t *sched_ctrl, NR_SubcarrierSpacing_t subcarrier_spacing);
 void nr_mac_reset_ul_failure(NR_UE_sched_ctrl_t *sched_ctrl);

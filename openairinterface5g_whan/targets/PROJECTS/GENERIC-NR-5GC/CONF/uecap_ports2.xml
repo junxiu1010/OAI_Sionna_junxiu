@@ -141,6 +141,22 @@
                                     <maxNumberCSI-RS-PerResourceSet>4</maxNumberCSI-RS-PerResourceSet>
                                 </singlePanel>
                             </type1>
+                            <type2-PortSelection>
+                                <supportedCSI-RS-ResourceList>
+                                    <SupportedCSI-RS-Resource>
+                                        <maxNumberTxPortsPerResource><p4/></maxNumberTxPortsPerResource>
+                                        <maxNumberResourcesPerBand>8</maxNumberResourcesPerBand>
+                                        <totalNumberTxPortsPerBand>32</totalNumberTxPortsPerBand>
+                                    </SupportedCSI-RS-Resource>
+                                    <SupportedCSI-RS-Resource>
+                                        <maxNumberTxPortsPerResource><p8/></maxNumberTxPortsPerResource>
+                                        <maxNumberResourcesPerBand>8</maxNumberResourcesPerBand>
+                                        <totalNumberTxPortsPerBand>64</totalNumberTxPortsPerBand>
+                                    </SupportedCSI-RS-Resource>
+                                </supportedCSI-RS-ResourceList>
+                                <parameterLx>2</parameterLx>
+                                <amplitudeScalingType><wideband/></amplitudeScalingType>
+                            </type2-PortSelection>
                         </codebookParameters>
                         <csi-RS-IM-ReceptionForFeedback>
                             <maxConfigNumberNZP-CSI-RS-PerCC>8</maxConfigNumberNZP-CSI-RS-PerCC>

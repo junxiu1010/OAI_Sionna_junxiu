@@ -97,7 +97,7 @@
 #define MAX_NUM_CORESET 12
 #define MAX_NUM_CCE 90
 /*!\brief Maximum number of random access process */
-#define NR_NB_RA_PROC_MAX 4
+#define NR_NB_RA_PROC_MAX 16
 #define MAX_NUM_OF_SSB 64
 #define MAX_NUM_NR_PRACH_PREAMBLES 64
 
@@ -668,6 +668,9 @@ typedef struct {
   NR_bler_stats_t dl_bler_stats;
   NR_bler_stats_t ul_bler_stats;
 
+  /// BLER-based rank adaptation: 1 = forced to single layer
+  uint8_t dl_rank_forced_1;
+
   uint16_t ta_frame;
   int16_t ta_update;
   bool ta_apply;
@@ -756,6 +759,8 @@ typedef struct NR_bler_options {
   uint8_t min_mcs;
   uint8_t max_mcs;
   uint8_t harq_round_max;
+  float filter_coeff;
+  uint8_t update_frames;
 } NR_bler_options_t;
 
 typedef struct nr_mac_rrc_ul_if_s {

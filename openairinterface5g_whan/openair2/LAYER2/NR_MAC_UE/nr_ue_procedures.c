@@ -571,6 +571,18 @@ static int nr_ue_process_dci_ul_01(NR_UE_MAC_INST_t *mac,
   // - SECOND_DAI
   // - SRS_RESOURCE_IND
 
+  /* Early sanity checks to reject PDCCH blind-decode false positives */
+  if (dci->time_domain_assignment.val > 3) {
+    LOG_D(NR_MAC, "[%d.%d] DCI 0_1 false positive: TDA=%d (max 3). Discarding.\n",
+          frame, slot, dci->time_domain_assignment.val);
+    return -1;
+  }
+  if (dci->mcs > 28) {
+    LOG_D(NR_MAC, "[%d.%d] DCI 0_1 false positive: MCS=%d (max 28). Discarding.\n",
+          frame, slot, dci->mcs);
+    return -1;
+  }
+
   /* CSI_REQUEST */
   long csi_K2 = -1;
   csi_payload_t csi_report = {0};
@@ -1054,6 +1066,19 @@ static int nr_ue_process_dci_dl_11(NR_UE_MAC_INST_t *mac,
           dci->bwp_indicator.val);
     return -1;
   }
+  /* Early sanity checks to reject PDCCH blind-decode false positives.
+     The gNB only uses TDA 0-2 and MCS 0-28; wildly out-of-range values
+     indicate the decoded DCI payload is not a real grant for this UE. */
+  if (dci->time_domain_assignment.val > 3) {
+    LOG_D(NR_MAC, "[%d.%d] DCI 1_1 false positive: TDA=%d (max 3). Discarding.\n",
+          frame, slot, dci->time_domain_assignment.val);
+    return -1;
+  }
+  if (dci->mcs > 28) {
+    LOG_D(NR_MAC, "[%d.%d] DCI 1_1 false positive: MCS=%d (max 28). Discarding.\n",
+          frame, slot, dci->mcs);
+    return -1;
+  }
   NR_UE_DL_BWP_t *current_DL_BWP = mac->current_DL_BWP;
   NR_PDSCH_Config_t *pdsch_Config = current_DL_BWP->pdsch_Config;
   fapi_nr_dl_config_request_t *dl_config = get_dl_config_request(mac, slot);
@@ -1429,6 +1454,10 @@ nr_dci_format_t nr_ue_process_dci_indication_pdu(NR_UE_MAC_INST_t *mac, frame_t 
   int ret = nr_ue_process_dci(mac, frame, slot, mac->def_dci_pdu_rel15[slot] + format, dci, format);
   if (ret < 0) {
     mac->stats.bad_dci++;
+    LOG_D(NR_MAC,
+          "[%d.%d] Discarded bad DCI (rnti %x, format %d, n_CCE %d, payload %llx) — cumulated bad_dci=%d\n",
+          frame, slot, dci->rnti, dci->dci_format, dci->n_CCE,
+          *(unsigned long long *)dci->payloadBits, mac->stats.bad_dci);
     return NR_DCI_NONE;
   }
   return format;
@@ -2962,10 +2991,11 @@ csi_payload_t get_csirs_RI_PMI_CQI_payload(NR_UE_MAC_INST_t *mac,
             uint8_t fallback_phase[2 * FAPI_NR_TYPE2_MAX_BEAMS][FAPI_NR_TYPE2_MAX_LAYERS];
             int use_fallback = (num_sb == 0);
             if (use_fallback) {
+              int fb_mask = (csi_report->type2_phase_alphabet == 8) ? 0x7 : 0x3;
               uint32_t seed = (uint32_t)((uint32_t)getpid() * 2654435761U);
               for (int c2 = 0; c2 < 2 * FAPI_NR_TYPE2_MAX_BEAMS; c2++)
                 for (int l2 = 0; l2 < FAPI_NR_TYPE2_MAX_LAYERS; l2++)
-                  fallback_phase[c2][l2] = (seed >> (c2 * 2 + l2)) & 0x3;
+                  fallback_phase[c2][l2] = (seed >> (c2 * 2 + l2)) & fb_mask;
             }
 
             static const double qpsk_ph[4] = {0.0, M_PI / 2, M_PI, 3 * M_PI / 2};
@@ -2992,7 +3022,10 @@ csi_payload_t get_csirs_RI_PMI_CQI_payload(NR_UE_MAC_INST_t *mac,
                   }
                   double avg_angle = atan2(sum_im, sum_re);
                   if (avg_angle < 0) avg_angle += 2.0 * M_PI;
-                  avg_phase[c][lay] = (uint8_t)((int)(avg_angle / (M_PI / 2) + 0.5) % 4);
+                  if (phase_alphabet == 8)
+                    avg_phase[c][lay] = (uint8_t)((int)(avg_angle / (M_PI / 4) + 0.5) % 8);
+                  else
+                    avg_phase[c][lay] = (uint8_t)((int)(avg_angle / (M_PI / 2) + 0.5) % 4);
                 }
               }
             }
@@ -3005,10 +3038,12 @@ csi_payload_t get_csirs_RI_PMI_CQI_payload(NR_UE_MAC_INST_t *mac,
 
             // 1) Phases (gNB reads LAST → pack FIRST at LSB), reverse loop order
             int nlim = (num_layers < FAPI_NR_TYPE2_MAX_LAYERS) ? num_layers : FAPI_NR_TYPE2_MAX_LAYERS;
+            int phase_bits = (phase_alphabet == 8) ? 3 : 2;
+            int phase_mask = (phase_alphabet == 8) ? 0x7 : 0x3;
             for (int lay = nlim - 1; lay >= 0; lay--) {
               for (int c = total_coeffs - 1; c >= 0; c--) {
-                wb_pmi |= ((uint64_t)(avg_phase[c][lay] & 0x3)) << wb_bits;
-                wb_bits += 2;
+                wb_pmi |= ((uint64_t)(avg_phase[c][lay] & phase_mask)) << wb_bits;
+                wb_bits += phase_bits;
               }
             }
 

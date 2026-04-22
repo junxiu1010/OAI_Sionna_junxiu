@@ -88,6 +88,66 @@ def unpack_header(b):
     size, nb, ts, frame, subframe = struct.unpack(HDR_FMT_LE, b)
     return size, nb, ts, frame, subframe
 
+# ── CsiNet Sidecar Hook (Phase 4 Integration) ──
+_CSINET_HOOK = None
+
+def get_csinet_hook():
+    """Lazy-init the CsiNet channel hook if CSINET_ENABLED env var is set."""
+    global _CSINET_HOOK
+    if _CSINET_HOOK is not None:
+        return _CSINET_HOOK
+    if os.environ.get("CSINET_ENABLED", "0") == "1":
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.environ.get("CSINET_PATH",
+                "/workspace/graduation/csinet"))
+            from integration.channel_hook import ChannelHook
+            from integration.csinet_engine import CsiNetInferenceEngine
+            from integration.csi_injection import CSIInjector
+
+            hook = ChannelHook(enabled=True,
+                               csi_rs_period=int(os.environ.get("CSINET_PERIOD", "20")))
+            mode = os.environ.get("CSINET_MODE", "baseline")
+            gamma = float(os.environ.get("CSINET_GAMMA", "0.25"))
+            scenario = os.environ.get("CSINET_SCENARIO", "UMi_NLOS")
+            ckpt_dir = os.environ.get("CSINET_CHECKPOINT_DIR", "/workspace/csinet_checkpoints")
+
+            diff_enabled = os.environ.get("CSINET_DIFF_ENABLED", "0") == "1"
+            diff_threshold = float(os.environ.get("CSINET_DIFF_THRESHOLD", "0.01"))
+            diff_max_stale = int(os.environ.get("CSINET_DIFF_MAX_STALE", "100"))
+
+            engine = CsiNetInferenceEngine(
+                mode=mode, compression_ratio=gamma,
+                checkpoint_dir=ckpt_dir, scenario=scenario,
+                diff_enabled=diff_enabled,
+                diff_threshold=diff_threshold,
+                diff_max_stale=diff_max_stale)
+            injector = CSIInjector()
+
+            def on_channel_captured(cell_idx, ue_idx, H_freq):
+                R_H, pdp = hook.get_statistics(cell_idx, ue_idx, n_samples=50)
+                if engine.diff_conditioner is not None:
+                    H_hat, codeword, diff_info = engine.encode_decode_differential(
+                        H_freq, R_H, pdp, cell_idx, ue_idx)
+                else:
+                    H_hat, codeword = engine.encode_decode(H_freq, R_H, pdp)
+                injector.process_channel(cell_idx, ue_idx, H_hat)
+
+            hook.register_callback(on_channel_captured)
+            hook._engine = engine
+            hook._injector = injector
+            _CSINET_HOOK = hook
+            diff_str = (f", differential=th{diff_threshold}/stale{diff_max_stale}"
+                        if diff_enabled else "")
+            print("[CsiNet] Sidecar hook initialized: "
+                  f"mode={mode}, gamma={gamma}, scenario={scenario}, "
+                  f"ckpt_dir={ckpt_dir}{diff_str}")
+        except Exception as e:
+            print(f"[CsiNet] Hook init failed: {e}")
+            import traceback; traceback.print_exc()
+            _CSINET_HOOK = None
+    return _CSINET_HOOK
+
 MAX_LOG = 300
 LOG_LINES = []
 DL_LOG_CNT = 0
@@ -209,6 +269,7 @@ noise_mode = "none"
 noise_enabled = False
 noise_std_abs = None
 Speed = 3
+ue_speeds = None  # per-UE speeds list [m/s]; None = use global Speed for all
 
 DL_USE_IDENTITY_CHANNEL = False
 PURE_DL_BYPASS = True   # DIAG: skip OFDM pipeline for DL, raw copy gNB TX → UE RX
@@ -1076,6 +1137,27 @@ class GPUSlotPipeline:
             else:
                 self._gpu_compute_core(pl_linear, snr_db, noise_on, noise_std_abs)
                 self.warmup_count += 1
+
+            _POST_LIMIT = 28000.0
+            out_peak = float(cp.max(cp.abs(self.gpu_out)))
+            if out_peak > _POST_LIMIT:
+                _rescale = _POST_LIMIT / out_peak
+                self.gpu_out *= cp.float64(_rescale)
+                n_rx = self.n_rx
+                self._tmp_out_2d_final = self.gpu_out.reshape(self.total_cpx, n_rx)
+                self._buf_iq_out_3d[:, :, 0] = cp.clip(
+                    cp.around(self._tmp_out_2d_final.real), -32768, 32767)
+                self._buf_iq_out_3d[:, :, 1] = cp.clip(
+                    cp.around(self._tmp_out_2d_final.imag), -32768, 32767)
+                self.gpu_iq_out[:] = self._buf_iq_out_3d.ravel().astype(cp.int16)
+                if not hasattr(self, '_post_limit_cnt'):
+                    self._post_limit_cnt = 0
+                self._post_limit_cnt += 1
+                if self._post_limit_cnt <= 10 or self._post_limit_cnt % 2000 == 0:
+                    print(f"[POST-LIMIT] slot#{self.slot_counter} "
+                          f"out_peak={out_peak:.0f} rescale={_rescale:.4f} "
+                          f"cnt={self._post_limit_cnt}")
+
             if do_dual:
                 e_gpu_e.record(self.stream)
 
@@ -1211,6 +1293,27 @@ class GPUSlotPipeline:
             else:
                 self._gpu_compute_core(pl_linear, snr_db, noise_on, noise_std_abs)
                 self.warmup_count += 1
+
+            _POST_LIMIT = 28000.0
+            out_peak = float(cp.max(cp.abs(self.gpu_out)))
+            if out_peak > _POST_LIMIT:
+                _rescale = _POST_LIMIT / out_peak
+                self.gpu_out *= cp.float64(_rescale)
+                n_rx = self.n_rx
+                self._tmp_out_2d_final = self.gpu_out.reshape(self.total_cpx, n_rx)
+                self._buf_iq_out_3d[:, :, 0] = cp.clip(
+                    cp.around(self._tmp_out_2d_final.real), -32768, 32767)
+                self._buf_iq_out_3d[:, :, 1] = cp.clip(
+                    cp.around(self._tmp_out_2d_final.imag), -32768, 32767)
+                self.gpu_iq_out[:] = self._buf_iq_out_3d.ravel().astype(cp.int16)
+                if not hasattr(self, '_post_limit_cnt'):
+                    self._post_limit_cnt = 0
+                self._post_limit_cnt += 1
+                if self._post_limit_cnt <= 10 or self._post_limit_cnt % 2000 == 0:
+                    print(f"[POST-LIMIT] slot#{self.slot_counter} "
+                          f"out_peak={out_peak:.0f} rescale={_rescale:.4f} "
+                          f"cnt={self._post_limit_cnt}")
+
             if do_dual:
                 e_gpu_e.record(self.stream)
 
@@ -1695,8 +1798,12 @@ class UnifiedChannelProducerProcess(_mp_ctx.Process):
         gnb_nx, gnb_ny = cfg['gnb_nx'], cfg['gnb_ny']
         ue_nx, ue_ny = cfg['ue_nx'], cfg['ue_ny']
         Speed_local = cfg['Speed']
-        mean_xpr = cfg['mean_xpr']
-        stddev_xpr = cfg['stddev_xpr']
+        _xpr_mean = {"UMi-LOS": 9, "UMi-NLOS": 8, "UMa-LOS": 8, "UMa-NLOS": 7}
+        _xpr_std  = {"UMi-LOS": 3, "UMi-NLOS": 3, "UMa-LOS": 4, "UMa-NLOS": 4}
+        _scenario = cfg.get('scenario', 'UMa-NLOS')
+        mean_xpr = _xpr_mean.get(_scenario, 7)
+        stddev_xpr = _xpr_std.get(_scenario, 4)
+        print(f"[ChannelProducer] scenario={_scenario} → XPR mean={mean_xpr}dB std={stddev_xpr}dB")
         pol_mode = cfg.get('polarization', 'single')
         pol_type = "cross" if pol_mode == "dual" else "V"
 
@@ -1722,27 +1829,134 @@ class UnifiedChannelProducerProcess(_mp_ctx.Process):
 
         print(f"[v4 UnifiedChannelProducerProcess] Sionna init start (N_UE={N_UE})")
 
+        _ue_speeds_list = cfg.get('ue_speeds')
+        if _ue_speeds_list and len(_ue_speeds_list) >= N_UE:
+            _speed_vec = [_ue_speeds_list[i] for i in range(N_UE)]
+            _mean_per_ue = _tf.constant(
+                [[_speed_vec] * batch_size], dtype=_tf.float32)
+            _mean_per_ue = _tf.reshape(_mean_per_ue, [batch_size, N_UE, 1])
+            _mean_per_ue = _tf.broadcast_to(_mean_per_ue, [batch_size, N_UE, 3])
+            velocities = _tf.abs(_tf.random.normal(
+                shape=[batch_size, N_UE, 3], dtype=_tf.float32) * 0.1 + _mean_per_ue)
+            print(f"[ChannelProducer] per-UE speeds (m/s): {_speed_vec}")
+        else:
+            velocities = _tf.abs(_tf.random.normal(
+                shape=[batch_size, N_UE, 3], mean=Speed_local, stddev=0.1, dtype=_tf.float32))
+        # ── 3GPP TR 38.901 topology computation ────────────────────
+        _bs_h = float(cfg.get('bs_height_m', 25.0))
+        _ue_h = float(cfg.get('ue_height_m', 1.5))
+        _min_d = float(cfg.get('min_ue_dist_m', 35.0))
+        _max_d = float(cfg.get('max_ue_dist_m', 500.0))
+        _sf_std = float(cfg.get('shadow_fading_std_dB', 6.0))
+        _kf_mean = cfg.get('k_factor_mean_dB')
+        _kf_std = cfg.get('k_factor_std_dB')
+
+        import math as _math
+
+        # 3GPP scenario defaults (TR 38.901 Table 7.4.1-1)
+        _SCENARIO_DEFAULTS = {
+            "UMi-LOS":  {"bs_h": 10, "min_d": 10, "max_d": 150, "sf_std": 4.0,
+                          "kf_mean": 9.0, "kf_std": 5.0},
+            "UMi-NLOS": {"bs_h": 10, "min_d": 10, "max_d": 150, "sf_std": 7.82,
+                          "kf_mean": None, "kf_std": None},
+            "UMa-LOS":  {"bs_h": 25, "min_d": 35, "max_d": 500, "sf_std": 4.0,
+                          "kf_mean": 9.0, "kf_std": 3.5},
+            "UMa-NLOS": {"bs_h": 25, "min_d": 35, "max_d": 500, "sf_std": 6.0,
+                          "kf_mean": None, "kf_std": None},
+        }
+        _sdef = _SCENARIO_DEFAULTS.get(_scenario, _SCENARIO_DEFAULTS["UMa-NLOS"])
+        if _kf_mean is None:
+            _kf_mean = _sdef["kf_mean"]
+        if _kf_std is None:
+            _kf_std = _sdef["kf_std"]
+
+        # UE horizontal distance: uniform in [min_d, max_d] per UE
+        d_2d_np = np.random.uniform(_min_d, _max_d, size=(batch_size, N_UE))
+        delta_h = _bs_h - _ue_h
+        d_3d_np = np.sqrt(d_2d_np**2 + delta_h**2)
+
+        # Azimuth angle from BS to UE (random in sector)
+        _sector_half = float(cfg.get('sector_half_deg', 90.0)) * _math.pi / 180.0
+        azimuth_np = np.random.uniform(-_sector_half, _sector_half,
+                                        size=(batch_size, N_UE))
+
+        # LOS probability model (TR 38.901 Table 7.4.2-1)
+        def _los_prob(d2d, scenario):
+            if "LOS" in scenario:
+                return np.ones_like(d2d)
+            if "NLOS" in scenario:
+                return np.zeros_like(d2d)
+            if "UMi" in scenario:
+                return np.where(d2d <= 18, 1.0, 18.0/d2d * (1 - np.exp(-d2d/36)) + np.exp(-d2d/36))
+            else:  # UMa
+                c_prime = np.where(_ue_h <= 13, 0.0,
+                                   (((_ue_h - 13.0)/10.0)**1.5) * 1.0)
+                p_los = (np.where(d2d <= 18, 1.0,
+                         (18.0/d2d + np.exp(-d2d/63) * (1 - 18.0/d2d)) *
+                         (1 + c_prime * 5.0/4.0 * (d2d/100)**3 * np.exp(-d2d/150))))
+                return np.clip(p_los, 0, 1)
+
+        los_prob_np = _los_prob(d_2d_np, _scenario)
+        los_draw = np.random.uniform(0, 1, size=(batch_size, N_UE))
+        los_np = (los_draw < los_prob_np)  # True = LOS
+
+        # Elevation angles
+        elev_rad = np.arctan2(delta_h, d_2d_np)
+        los_aoa_np = azimuth_np
+        los_aod_np = azimuth_np + _math.pi  # opposite direction
+        los_zoa_np = _math.pi / 2 - elev_rad
+        los_zod_np = _math.pi / 2 + elev_rad
+
+        # Shadow fading (log-normal per UE)
+        sf_dB = np.random.normal(0, _sf_std, size=(batch_size, N_UE))
+
+        # K-factor (LOS only, per UE)
+        if _kf_mean is not None and _kf_std is not None:
+            kf_dB = np.random.normal(_kf_mean, _kf_std, size=(batch_size, N_UE))
+            kf_dB = np.where(los_np, kf_dB, -100.0)  # NLOS → K=-100dB (≈0 linear)
+        else:
+            kf_dB = np.full((batch_size, N_UE), -100.0)
+
+        print(f"[ChannelProducer] 3GPP topology: BS_h={_bs_h}m UE_h={_ue_h}m "
+              f"d_2d=[{_min_d:.0f},{_max_d:.0f}]m SF_σ={_sf_std}dB "
+              f"K_μ={_kf_mean}dB K_σ={_kf_std}dB")
+        print(f"[ChannelProducer] d_3d: mean={d_3d_np.mean():.1f}m "
+              f"min={d_3d_np.min():.1f}m max={d_3d_np.max():.1f}m")
+        print(f"[ChannelProducer] LOS ratio: {los_np.mean()*100:.1f}% "
+              f"({los_np.sum()}/{los_np.size})")
+        print(f"[ChannelProducer] Shadow fading: mean={sf_dB.mean():.2f}dB std={sf_dB.std():.2f}dB")
+        if _kf_mean is not None:
+            _kf_los = kf_dB[los_np]
+            if len(_kf_los) > 0:
+                print(f"[ChannelProducer] K-factor (LOS): mean={_kf_los.mean():.1f}dB std={_kf_los.std():.1f}dB")
+
+        # Expand to [batch, N_BS, N_UE] (N_BS=1)
+        los_aoa = _tf.constant(los_aoa_np[:, np.newaxis, :], dtype=_tf.float32)
+        los_aod = _tf.constant(los_aod_np[:, np.newaxis, :], dtype=_tf.float32)
+        los_zoa = _tf.constant(los_zoa_np[:, np.newaxis, :], dtype=_tf.float32)
+        los_zod = _tf.constant(los_zod_np[:, np.newaxis, :], dtype=_tf.float32)
+        los = _tf.constant(los_np[:, np.newaxis, :])
+        distance_3d = _tf.constant(d_3d_np[:, np.newaxis, :], dtype=_tf.float32)
+
+        tx_orientations = _tf.random.normal(
+            shape=[batch_size, N_BS, 3], mean=0, stddev=PI/5, dtype=_tf.float32)
+        rx_orientations = _tf.random.normal(
+            shape=[batch_size, N_UE, 3], mean=0, stddev=PI/5, dtype=_tf.float32)
+
+        # Apply shadow fading to ray powers
+        sf_linear = 10.0 ** (-sf_dB / 10.0)  # [batch, N_UE]
+        _sf_scale = _tf.constant(
+            sf_linear[:, np.newaxis, :, np.newaxis, np.newaxis],
+            dtype=power_rays.dtype)
+        power_rays_sf = power_rays * _sf_scale
+
         xpr_pdp = 10**(_tf.random.normal(
             shape=[batch_size, N_BS, N_UE, 1, phi_r_rays.shape[-1]],
             mean=mean_xpr, stddev=stddev_xpr
         )/10)
         PDP = Rays(
-            delays=tau_rays, powers=power_rays, aoa=phi_r_rays, aod=phi_t_rays,
+            delays=tau_rays, powers=power_rays_sf, aoa=phi_r_rays, aod=phi_t_rays,
             zoa=theta_r_rays, zod=theta_t_rays, xpr=xpr_pdp)
-
-        velocities = _tf.abs(_tf.random.normal(
-            shape=[batch_size, N_UE, 3], mean=Speed_local, stddev=0.1, dtype=_tf.float32))
-        los_aoa = _tf.zeros([batch_size, N_BS, N_UE])
-        los_aod = _tf.zeros([batch_size, N_BS, N_UE])
-        los_zoa = _tf.zeros([batch_size, N_BS, N_UE])
-        los_zod = _tf.zeros([batch_size, N_BS, N_UE])
-        los = _tf.random.uniform(
-            shape=[batch_size, N_BS, N_UE], minval=0, maxval=2, dtype=_tf.int32) > 0
-        distance_3d = _tf.ones([1, N_BS, N_UE])
-        tx_orientations = _tf.random.normal(
-            shape=[batch_size, N_BS, 3], mean=0, stddev=PI/5, dtype=_tf.float32)
-        rx_orientations = _tf.random.normal(
-            shape=[batch_size, N_UE, 3], mean=0, stddev=PI/5, dtype=_tf.float32)
 
         topology = Topology(
             velocities, "rx", los_aoa, los_aod, los_zoa, los_zod,
@@ -1892,13 +2106,25 @@ class Proxy:
                  num_ues=1,
                  polarization="single",
                  p1b_npz=None, ue_rx_indices=None,
-                 use_xla=False):
+                 use_xla=False,
+                 bs_height_m=25.0, ue_height_m=1.5,
+                 isd_m=500, min_ue_dist_m=35, max_ue_dist_m=500,
+                 shadow_fading_std_dB=6.0,
+                 k_factor_mean_dB=None, k_factor_std_dB=None):
         self.mode = mode
         self.num_ues = num_ues
         self.polarization = polarization
         self.p1b_npz = p1b_npz
         self.ue_rx_indices = ue_rx_indices
         self.use_xla = use_xla
+        self.bs_height_m = bs_height_m
+        self.ue_height_m = ue_height_m
+        self.isd_m = isd_m
+        self.min_ue_dist_m = min_ue_dist_m
+        self.max_ue_dist_m = max_ue_dist_m
+        self.shadow_fading_std_dB = shadow_fading_std_dB
+        self.k_factor_mean_dB = k_factor_mean_dB
+        self.k_factor_std_dB = k_factor_std_dB
         self._stalled_ue_logged = set()
         self.gnb_ant = gnb_ant
         self.ue_ant = ue_ant
@@ -2046,11 +2272,9 @@ class Proxy:
         self.num_rx = N
         self.num_tx = 1
 
-        mean_xpr_list = {"UMi-LOS": 9, "UMi-NLOS": 8, "UMa-LOS": 8, "UMa-NLOS": 7}
-        stddev_xpr_list = {"UMi-LOS": 3, "UMi-NLOS": 3, "UMa-LOS": 4, "UMa-NLOS": 4}
-
         print(f"[v4] Starting UnifiedChannelProducerProcess via spawn (N_UE={N})...")
 
+        scenario = getattr(self, 'scenario', 'UMa-NLOS')
         syncs = [IPCRingBufferSync(maxlen=buffer_len, ctx=_mp_ctx) for _ in range(N)]
         handle_q = _mp_ctx.Queue()
         stop_ev = _mp_ctx.Event()
@@ -2068,11 +2292,19 @@ class Proxy:
             'num_rx': self.num_rx, 'num_tx': self.num_tx,
             'num_ues': N,
             'Speed': Speed,
-            'mean_xpr': mean_xpr_list["UMa-NLOS"],
-            'stddev_xpr': stddev_xpr_list["UMa-NLOS"],
+            'ue_speeds': ue_speeds,
+            'scenario': scenario,
             'gpu_num': gpu_num,
             'use_xla': self.use_xla,
             'polarization': self.polarization,
+            'bs_height_m': self.bs_height_m,
+            'ue_height_m': self.ue_height_m,
+            'isd_m': self.isd_m,
+            'min_ue_dist_m': self.min_ue_dist_m,
+            'max_ue_dist_m': self.max_ue_dist_m,
+            'shadow_fading_std_dB': self.shadow_fading_std_dB,
+            'k_factor_mean_dB': self.k_factor_mean_dB,
+            'k_factor_std_dB': self.k_factor_std_dB,
         }
 
         if self.p1b_npz and self.ue_rx_indices:
@@ -2368,6 +2600,11 @@ class Proxy:
             for j in range(min(n_r, n_t)):
                 pad[:, j, j, :] = 1.0
             channels = lib.concatenate([channels, pad])
+
+        if direction == "DL":
+            csinet_hook = get_csinet_hook()
+            if csinet_hook is not None and csinet_hook.enabled:
+                csinet_hook.capture(0, ue_idx, channels)
 
         if DL_USE_IDENTITY_CHANNEL and direction == "DL":
             n_r, n_t = channels.shape[1], channels.shape[2]
@@ -2928,56 +3165,62 @@ class Proxy:
                         if not self._ul_aligned_to_ue:
                             self._ul_aligned_to_ue = True
                             _spf = total_cpx * 20
+                            _slots_per_frame = 20
                             _old_head = proxy_ul_head_combined
 
-                            proxy_ul_head_combined = \
-                                ((proxy_ul_head_combined + total_cpx - 1)
-                                 // total_cpx) * total_cpx
+                            _ue_write_ts = min(
+                                self.ipc_ues[k].get_last_ul_tx_ts()
+                                for k in active_set)
 
-                            for k in active_set:
-                                _ue_last_ts = self.ipc_ues[k].get_last_ul_tx_ts()
-                                if _ue_last_ts > 0:
-                                    self._ul_ue_offsets[k] = int(
-                                        _ue_last_ts - proxy_ul_head_combined)
-                                else:
-                                    self._ul_ue_offsets[k] = 0
-                                self._prev_ue_heads[k] = ue_heads.get(k, 0)
+                            _gnb_consumer = self.ipc_gnb.get_ul_consumer_ts()
+                            _gnb_next_slot = int((_gnb_consumer + 1 + total_cpx - 1) // total_cpx)
+                            _gnb_slot_mod = _gnb_next_slot % _slots_per_frame
 
-                            self.ipc_gnb.set_last_ul_rx_ts(
-                                int(proxy_ul_head_combined) - 1)
-                            self._ul_rx_ts_high = max(
-                                self._ul_rx_ts_high,
-                                int(proxy_ul_head_combined) - 1)
+                            _ue_slot = int(_ue_write_ts) // total_cpx
+                            _ue_slot_mod = _ue_slot % _slots_per_frame
+
+                            _slot_adj = (_ue_slot_mod - _gnb_slot_mod) % _slots_per_frame
+                            _aligned_slot = _ue_slot - _slot_adj
+                            _sync_ts = _aligned_slot * total_cpx
+                            if _sync_ts <= _gnb_consumer:
+                                _aligned_slot += _slots_per_frame
+                                _sync_ts = _aligned_slot * total_cpx
+
+                            proxy_ul_head_combined = _sync_ts
+
                             self.ipc_gnb.set_ul_sync_ts(
                                 int(proxy_ul_head_combined))
 
-                            print(f"[UL ACTIVATE] UE detected — "
+                            for k in active_set:
+                                self._ul_ue_offsets[k] = 0
+                                self._prev_ue_heads[k] = ue_heads.get(k, 0)
+
+                            print(f"[UL ACTIVATE] TDD-aligned sync — "
                                   f"proxy_ul_head={proxy_ul_head_combined} "
-                                  f"(aligned from {_old_head}, "
-                                  f"frame={proxy_ul_head_combined//_spf}, "
-                                  f"slot={proxy_ul_head_combined//total_cpx%20}) "
+                                  f"(was {_old_head}, "
+                                  f"ue_write_ts={_ue_write_ts}) "
+                                  f"sync_ts={proxy_ul_head_combined} "
+                                  f"(frame={proxy_ul_head_combined//_spf}, "
+                                  f"slot={proxy_ul_head_combined//total_cpx%_slots_per_frame}) "
+                                  f"gnb_consumer={_gnb_consumer} "
+                                  f"gnb_next_slot={_gnb_next_slot}(mod{_gnb_slot_mod}) "
+                                  f"ue_slot={_ue_slot}(mod{_ue_slot_mod}) "
+                                  f"slot_adj={_slot_adj} "
                                   f"proxy_dl_head={proxy_dl_head} "
                                   f"(frame={int(proxy_dl_head)//_spf}) "
                                   f"ue_offsets={self._ul_ue_offsets} "
                                   f"ue_heads={dict(ue_heads)} "
-                                  f"last_ul_rx_high={self._ul_rx_ts_high} "
-                                  f"SET_UL_SYNC_TS={proxy_ul_head_combined}")
+                                  f"last_ul_rx_high={self._ul_rx_ts_high}")
 
                         if self._ul_aligned_to_ue:
                             for k in active_set:
                                 if k not in self._ul_ue_offsets:
                                     if k in ue_heads and ue_heads[k] > 0:
-                                        _ue_last_ts = self.ipc_ues[k].get_last_ul_tx_ts()
-                                        if _ue_last_ts > 0:
-                                            self._ul_ue_offsets[k] = int(
-                                                _ue_last_ts - proxy_ul_head_combined)
-                                        else:
-                                            self._ul_ue_offsets[k] = 0
+                                        self._ul_ue_offsets[k] = 0
                                         self._prev_ue_heads[k] = ue_heads[k]
                                         print(f"[UL OFFSET] UE[{k}] "
-                                              f"offset={self._ul_ue_offsets[k]} "
-                                              f"(ue_last_ts={_ue_last_ts} "
-                                              f"ue_head={ue_heads[k]} "
+                                              f"offset=0 "
+                                              f"(ue_head={ue_heads[k]} "
                                               f"proxy_head={proxy_ul_head_combined})")
 
                             if proxy_ul_head_combined == 0:
@@ -2989,20 +3232,13 @@ class Proxy:
                                 else:
                                     proxy_ul_head_combined = 0
                                 for k in active_set:
-                                    _ue_last_ts = self.ipc_ues[k].get_last_ul_tx_ts()
-                                    if _ue_last_ts > 0 and proxy_ul_head_combined > 0:
-                                        self._ul_ue_offsets[k] = int(
-                                            _ue_last_ts - proxy_ul_head_combined)
-                                    else:
-                                        self._ul_ue_offsets[k] = 0
+                                    self._ul_ue_offsets[k] = 0
                                 if proxy_ul_head_combined > 0:
                                     self.ipc_gnb.set_last_ul_rx_ts(
                                         int(proxy_ul_head_combined) - 1)
                                     self._ul_rx_ts_high = max(
                                         self._ul_rx_ts_high,
                                         int(proxy_ul_head_combined) - 1)
-                                    self.ipc_gnb.set_ul_sync_ts(
-                                        int(proxy_ul_head_combined))
                                 print(f"[UL HEAD INIT] cts={_cts} "
                                       f"proxy_ul_head={proxy_ul_head_combined} "
                                       f"ue_offsets={self._ul_ue_offsets}")
@@ -3296,11 +3532,32 @@ def main():
     ap.add_argument("--no-xla", dest='use_xla', action="store_false")
     ap.set_defaults(use_xla=False)
 
+    # 3GPP TR 38.901 topology parameters
+    ap.add_argument("--bs-height-m", type=float, default=25.0,
+                    help="BS antenna height in meters (UMi=10, UMa=25)")
+    ap.add_argument("--ue-height-m", type=float, default=1.5,
+                    help="UE height in meters (1.5~2.5)")
+    ap.add_argument("--isd-m", type=float, default=500,
+                    help="Inter-Site Distance in meters (UMi=200, UMa=500)")
+    ap.add_argument("--min-ue-dist-m", type=float, default=35,
+                    help="Minimum BS-UE horizontal distance in meters")
+    ap.add_argument("--max-ue-dist-m", type=float, default=500,
+                    help="Maximum BS-UE horizontal distance in meters")
+    ap.add_argument("--shadow-fading-std-dB", type=float, default=6.0,
+                    help="Shadow fading std dev in dB (UMi-LOS=4, UMi-NLOS=7.82, UMa-LOS=4, UMa-NLOS=6)")
+    ap.add_argument("--k-factor-mean-dB", type=float, default=None,
+                    help="K-factor mean in dB (LOS only; UMi-LOS=9, UMa-LOS=9)")
+    ap.add_argument("--k-factor-std-dB", type=float, default=None,
+                    help="K-factor std dev in dB (LOS only; UMi-LOS=5, UMa-LOS=3.5)")
+
     ap.add_argument("--p1b-npz", type=str, default=None,
                     help="P1B npz file path for per-UE independent ray data")
     ap.add_argument("--ue-rx-indices", type=str, default=None,
                     help="Per-UE RX indices (comma-separated, e.g. '100,500') "
                          "or 'random'. Auto-random if --p1b-npz given without this.")
+    ap.add_argument("--ue-speeds", type=str, default=None,
+                    help="Per-UE speeds in km/h (comma-separated, e.g. '3,30,120,3'). "
+                         "Converted to m/s for Sionna velocity tensor.")
 
     args = ap.parse_args()
 
@@ -3322,7 +3579,16 @@ def main():
                 sys.exit(1)
             validate_rx_indices(args.p1b_npz, resolved_rx_indices)
 
-    global path_loss_dB, pathLossLinear, snr_dB, noise_enabled, noise_mode, noise_dBFS, noise_std_abs, DL_USE_IDENTITY_CHANNEL
+    global path_loss_dB, pathLossLinear, snr_dB, noise_enabled, noise_mode, noise_dBFS, noise_std_abs, DL_USE_IDENTITY_CHANNEL, ue_speeds
+
+    if args.ue_speeds:
+        ue_speeds = [float(s) / 3.6 for s in args.ue_speeds.split(",")]
+        if len(ue_speeds) != args.num_ues:
+            print(f"[ERROR] --ue-speeds count ({len(ue_speeds)}) != --num-ues ({args.num_ues})")
+            sys.exit(1)
+        print(f"[v4] Per-UE speeds: {args.ue_speeds} km/h → {[f'{s:.2f}' for s in ue_speeds]} m/s")
+    else:
+        ue_speeds = None
     DL_USE_IDENTITY_CHANNEL = True  # DIAG: force identity for BLER root-cause test (was: args.identity_channel)
     if DL_USE_IDENTITY_CHANNEL:
         print("[CONFIG] DL_USE_IDENTITY_CHANNEL=True — forcing H=I for DL (diagnostic mode)")
@@ -3355,6 +3621,11 @@ def main():
     print("=" * 80)
     print(f"Mode: {args.mode.upper()}")
     print(f"UEs: {args.num_ues}")
+    if ue_speeds:
+        for i, s in enumerate(ue_speeds):
+            print(f"  UE{i} speed: {s*3.6:.1f} km/h ({s:.2f} m/s)")
+    else:
+        print(f"  Global speed: {Speed} m/s ({Speed*3.6:.1f} km/h)")
     if args.p1b_npz:
         rx_str = ", ".join(f"UE{i}=RX{rx}" for i, rx in enumerate(resolved_rx_indices))
         print(f"P1B Ray Data: {args.p1b_npz}")
@@ -3376,6 +3647,10 @@ def main():
           f"window={args.profile_window} samples, "
           f"dual_timer={'ON' if args.dual_timer_compare else 'OFF'}")
     print(f"Custom Channel: {'Enabled' if args.custom_channel else 'Disabled'}")
+    print(f"3GPP Topology: BS_h={args.bs_height_m}m UE_h={args.ue_height_m}m "
+          f"ISD={args.isd_m}m d=[{args.min_ue_dist_m},{args.max_ue_dist_m}]m")
+    print(f"  Shadow Fading σ={args.shadow_fading_std_dB}dB  "
+          f"K-factor μ={args.k_factor_mean_dB}dB σ={args.k_factor_std_dB}dB")
     print(f"Path Loss: {path_loss_dB} dB (linear={pathLossLinear:.6f})")
     if noise_mode == "relative":
         print(f"AWGN Noise: Relative SNR mode (SNR={snr_dB} dB)")
@@ -3437,6 +3712,14 @@ def main():
         p1b_npz=args.p1b_npz,
         ue_rx_indices=resolved_rx_indices,
         use_xla=args.use_xla,
+        bs_height_m=args.bs_height_m,
+        ue_height_m=args.ue_height_m,
+        isd_m=args.isd_m,
+        min_ue_dist_m=args.min_ue_dist_m,
+        max_ue_dist_m=args.max_ue_dist_m,
+        shadow_fading_std_dB=args.shadow_fading_std_dB,
+        k_factor_mean_dB=args.k_factor_mean_dB,
+        k_factor_std_dB=args.k_factor_std_dB,
     )
 
     def _sigterm_handler(signum, frame):

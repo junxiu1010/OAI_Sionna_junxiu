@@ -1,0 +1,98 @@
+[
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.25,
+    "M": 64,
+    "test_nmse_dB": -4.121414007162853,
+    "test_cos_sim": 0.7770010530948639,
+    "best_val_nmse_dB": -4.01628834788357
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.125,
+    "M": 32,
+    "test_nmse_dB": -6.230783111391469,
+    "test_cos_sim": 0.8676796704530716,
+    "best_val_nmse_dB": -6.088213407583919
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.0625,
+    "M": 16,
+    "test_nmse_dB": -7.878393970602399,
+    "test_cos_sim": 0.9111346453428268,
+    "best_val_nmse_dB": -7.634049398795501
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.03125,
+    "M": 8,
+    "test_nmse_dB": -7.104488199731094,
+    "test_cos_sim": 0.8900743275880814,
+    "best_val_nmse_dB": -6.8888094663237185
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.25,
+    "M": 64,
+    "test_nmse_dB": 3.207873272831476,
+    "test_cos_sim": 0.0292571559548378,
+    "best_val_nmse_dB": 3.289716774880123
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.125,
+    "M": 32,
+    "test_nmse_dB": 7.209269989229698,
+    "test_cos_sim": 0.009940072079189122,
+    "best_val_nmse_dB": 7.185980369473933
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.0625,
+    "M": 16,
+    "test_nmse_dB": 9.725319012966908,
+    "test_cos_sim": -0.0027569373705773614,
+    "best_val_nmse_dB": 9.853370372372513
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.03125,
+    "M": 8,
+    "test_nmse_dB": 1.2093491749167025,
+    "test_cos_sim": 0.0014754966832697392,
+    "best_val_nmse_dB": 1.1811368967949605
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.25,
+    "M": 64,
+    "test_nmse_dB": 0.7648241534053558,
+    "test_cos_sim": 0.08378315344452858,
+    "best_val_nmse_dB": 0.7606431726903167
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.125,
+    "M": 32,
+    "test_nmse_dB": 0.7253348553182701,
+    "test_cos_sim": 0.02952897222712636,
+    "best_val_nmse_dB": 0.6841710969678054
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.0625,
+    "M": 16,
+    "test_nmse_dB": 4.4806774811467855,
+    "test_cos_sim": -0.000312124757329002,
+    "best_val_nmse_dB": 4.160228242364527
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.03125,
+    "M": 8,
+    "test_nmse_dB": 4.2758903121094525,
+    "test_cos_sim": 0.0005728905234718695,
+    "best_val_nmse_dB": 4.406348372196973
+  }
+]
