@@ -95,24 +95,37 @@ def get_csinet_hook():
             gamma = float(os.environ.get("CSINET_GAMMA", "0.25"))
             scenario = os.environ.get("CSINET_SCENARIO", "UMi_NLOS")
             ckpt_dir = os.environ.get("CSINET_CHECKPOINT_DIR", "/workspace/csinet_checkpoints")
-            engine = CsiNetInferenceEngine(mode=mode,
-                                           compression_ratio=gamma,
-                                           checkpoint_dir=ckpt_dir,
-                                           scenario=scenario)
+
+            diff_enabled = os.environ.get("CSINET_DIFF_ENABLED", "0") == "1"
+            diff_threshold = float(os.environ.get("CSINET_DIFF_THRESHOLD", "0.01"))
+            diff_max_stale = int(os.environ.get("CSINET_DIFF_MAX_STALE", "100"))
+
+            engine = CsiNetInferenceEngine(
+                mode=mode, compression_ratio=gamma,
+                checkpoint_dir=ckpt_dir, scenario=scenario,
+                diff_enabled=diff_enabled,
+                diff_threshold=diff_threshold,
+                diff_max_stale=diff_max_stale)
             injector = CSIInjector()
 
             def on_channel_captured(cell_idx, ue_idx, H_freq):
                 R_H, pdp = hook.get_statistics(cell_idx, ue_idx, n_samples=50)
-                H_hat, codeword = engine.encode_decode(H_freq, R_H, pdp)
+                if engine.diff_conditioner is not None:
+                    H_hat, codeword, diff_info = engine.encode_decode_differential(
+                        H_freq, R_H, pdp, cell_idx, ue_idx)
+                else:
+                    H_hat, codeword = engine.encode_decode(H_freq, R_H, pdp)
                 injector.process_channel(cell_idx, ue_idx, H_hat)
 
             hook.register_callback(on_channel_captured)
             hook._engine = engine
             hook._injector = injector
             _CSINET_HOOK = hook
+            diff_str = (f", differential=th{diff_threshold}/stale{diff_max_stale}"
+                        if diff_enabled else "")
             print("[CsiNet] Sidecar hook initialized: "
                   f"mode={mode}, gamma={gamma}, scenario={scenario}, "
-                  f"ckpt_dir={ckpt_dir}")
+                  f"ckpt_dir={ckpt_dir}{diff_str}")
         except Exception as e:
             print(f"[CsiNet] Hook init failed: {e}")
             import traceback; traceback.print_exc()
