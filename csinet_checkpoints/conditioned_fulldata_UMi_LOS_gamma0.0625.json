@@ -1,0 +1,7 @@
+{
+  "scenario": "UMi_LOS",
+  "gamma": 0.0625,
+  "M": 16,
+  "test_nmse_dB": -16.32,
+  "test_cos_sim": 0.9878
+}

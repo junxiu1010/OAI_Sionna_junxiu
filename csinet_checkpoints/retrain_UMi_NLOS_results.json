@@ -1,0 +1,34 @@
+[
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.25,
+    "M": 64,
+    "test_nmse_dB": -21.604772071308467,
+    "test_cos_sim": 0.9966377317905426,
+    "best_val_nmse_dB": -19.700282811108664
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.125,
+    "M": 32,
+    "test_nmse_dB": -18.463128070029533,
+    "test_cos_sim": 0.9927218854427338,
+    "best_val_nmse_dB": -17.032804450051493
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.0625,
+    "M": 16,
+    "test_nmse_dB": -14.995453308165285,
+    "test_cos_sim": 0.9832041710615158,
+    "best_val_nmse_dB": -14.04598209790893
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.03125,
+    "M": 8,
+    "test_nmse_dB": -10.176159475978563,
+    "test_cos_sim": 0.9478350728750229,
+    "best_val_nmse_dB": -9.813857279511266
+  }
+]

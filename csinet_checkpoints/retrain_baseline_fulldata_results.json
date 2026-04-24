@@ -1,0 +1,86 @@
+[
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.25,
+    "M": 64,
+    "test_nmse_dB": -25.51,
+    "test_cos_sim": 0.9986
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.125,
+    "M": 32,
+    "test_nmse_dB": -20.44,
+    "test_cos_sim": 0.9955
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.0625,
+    "M": 16,
+    "test_nmse_dB": -15.77,
+    "test_cos_sim": 0.9862
+  },
+  {
+    "scenario": "UMi_LOS",
+    "gamma": 0.03125,
+    "M": 8,
+    "test_nmse_dB": -11.38,
+    "test_cos_sim": 0.9602
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.25,
+    "M": 64,
+    "test_nmse_dB": -23.74,
+    "test_cos_sim": 0.9979
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.125,
+    "M": 32,
+    "test_nmse_dB": -19.73,
+    "test_cos_sim": 0.9945
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.0625,
+    "M": 16,
+    "test_nmse_dB": -14.55,
+    "test_cos_sim": 0.981
+  },
+  {
+    "scenario": "UMi_NLOS",
+    "gamma": 0.03125,
+    "M": 8,
+    "test_nmse_dB": -9.66,
+    "test_cos_sim": 0.9408
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.25,
+    "M": 64,
+    "test_nmse_dB": -15.75,
+    "test_cos_sim": 0.9857
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.125,
+    "M": 32,
+    "test_nmse_dB": -10.7,
+    "test_cos_sim": 0.9526
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.0625,
+    "M": 16,
+    "test_nmse_dB": -7.02,
+    "test_cos_sim": 0.885
+  },
+  {
+    "scenario": "UMa_NLOS",
+    "gamma": 0.03125,
+    "M": 8,
+    "test_nmse_dB": -4.46,
+    "test_cos_sim": 0.7805
+  }
+]

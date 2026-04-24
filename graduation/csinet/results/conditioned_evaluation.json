@@ -2,97 +2,97 @@
   {
     "scenario": "UMi_LOS",
     "gamma": 0.25,
-    "baseline_nmse_dB": -26.40974371211599,
-    "conditioned_nmse_dB": -28.147495160834517,
-    "conditioned_cos": 0.9992431402206421,
-    "gain_dB": 1.7377514487185266
+    "baseline_nmse_dB": -25.51,
+    "conditioned_nmse_dB": -28.3,
+    "conditioned_cos": 0.9993,
+    "gain_dB": 2.79
   },
   {
     "scenario": "UMi_LOS",
     "gamma": 0.125,
-    "baseline_nmse_dB": -23.940433200444602,
-    "conditioned_nmse_dB": -24.41946647586487,
-    "conditioned_cos": 0.9981333017349243,
-    "gain_dB": 0.4790332754202673
+    "baseline_nmse_dB": -20.44,
+    "conditioned_nmse_dB": -21.92,
+    "conditioned_cos": 0.9968,
+    "gain_dB": 1.48
   },
   {
     "scenario": "UMi_LOS",
     "gamma": 0.0625,
-    "baseline_nmse_dB": -16.364715136557567,
-    "conditioned_nmse_dB": -16.514218272380283,
-    "conditioned_cos": 0.988101601600647,
-    "gain_dB": 0.1495031358227159
+    "baseline_nmse_dB": -15.77,
+    "conditioned_nmse_dB": -16.32,
+    "conditioned_cos": 0.9878,
+    "gain_dB": 0.55
   },
   {
     "scenario": "UMi_LOS",
     "gamma": 0.03125,
-    "baseline_nmse_dB": -11.887116000582726,
-    "conditioned_nmse_dB": -11.958810016112757,
-    "conditioned_cos": 0.9644911885261536,
-    "gain_dB": 0.07169401553003141
+    "baseline_nmse_dB": -11.38,
+    "conditioned_nmse_dB": -11.55,
+    "conditioned_cos": 0.9617,
+    "gain_dB": 0.17
   },
   {
     "scenario": "UMi_NLOS",
     "gamma": 0.25,
-    "baseline_nmse_dB": -18.979560936744427,
-    "conditioned_nmse_dB": -20.212300077654476,
-    "conditioned_cos": 0.9954940676689148,
-    "gain_dB": 1.2327391409100485
+    "baseline_nmse_dB": -23.74,
+    "conditioned_nmse_dB": -25.46,
+    "conditioned_cos": 0.9986,
+    "gain_dB": 1.72
   },
   {
     "scenario": "UMi_NLOS",
     "gamma": 0.125,
-    "baseline_nmse_dB": -19.187179382309257,
-    "conditioned_nmse_dB": -20.284692453752683,
-    "conditioned_cos": 0.9953228235244751,
-    "gain_dB": 1.0975130714434265
+    "baseline_nmse_dB": -19.73,
+    "conditioned_nmse_dB": -20.6,
+    "conditioned_cos": 0.9955,
+    "gain_dB": 0.87
   },
   {
     "scenario": "UMi_NLOS",
     "gamma": 0.0625,
-    "baseline_nmse_dB": -14.538260198243425,
-    "conditioned_nmse_dB": -14.891105168717054,
-    "conditioned_cos": 0.9829190373420715,
-    "gain_dB": 0.3528449704736296
+    "baseline_nmse_dB": -14.55,
+    "conditioned_nmse_dB": -14.75,
+    "conditioned_cos": 0.9818,
+    "gain_dB": 0.2
   },
   {
     "scenario": "UMi_NLOS",
     "gamma": 0.03125,
-    "baseline_nmse_dB": -9.531541942698102,
-    "conditioned_nmse_dB": -9.82422826598687,
-    "conditioned_cos": 0.9436206817626953,
-    "gain_dB": 0.292686323288768
+    "baseline_nmse_dB": -9.66,
+    "conditioned_nmse_dB": -9.73,
+    "conditioned_cos": 0.9417,
+    "gain_dB": 0.07
   },
   {
     "scenario": "UMa_NLOS",
     "gamma": 0.25,
-    "baseline_nmse_dB": -14.563528033879328,
-    "conditioned_nmse_dB": -15.31997478296216,
-    "conditioned_cos": 0.9842638969421387,
-    "gain_dB": 0.7564467490828317
+    "baseline_nmse_dB": -15.75,
+    "conditioned_nmse_dB": -15.85,
+    "conditioned_cos": 0.9861,
+    "gain_dB": 0.1
   },
   {
     "scenario": "UMa_NLOS",
     "gamma": 0.125,
-    "baseline_nmse_dB": -10.515201830591604,
-    "conditioned_nmse_dB": -10.705501594154264,
-    "conditioned_cos": 0.9523566365242004,
-    "gain_dB": 0.19029976356265976
+    "baseline_nmse_dB": -10.7,
+    "conditioned_nmse_dB": -10.84,
+    "conditioned_cos": 0.9541,
+    "gain_dB": 0.14
   },
   {
     "scenario": "UMa_NLOS",
     "gamma": 0.0625,
-    "baseline_nmse_dB": -6.86865743801354,
-    "conditioned_nmse_dB": -6.926036085232205,
-    "conditioned_cos": 0.8813610076904297,
-    "gain_dB": 0.05737864721866526
+    "baseline_nmse_dB": -7.02,
+    "conditioned_nmse_dB": -7.05,
+    "conditioned_cos": 0.8858,
+    "gain_dB": 0.03
   },
   {
     "scenario": "UMa_NLOS",
     "gamma": 0.03125,
-    "baseline_nmse_dB": -4.481190541565175,
-    "conditioned_nmse_dB": -4.518454024630062,
-    "conditioned_cos": 0.7831183671951294,
-    "gain_dB": 0.037263483064887026
+    "baseline_nmse_dB": -4.46,
+    "conditioned_nmse_dB": -4.48,
+    "conditioned_cos": 0.7814,
+    "gain_dB": 0.02
   }
 ]

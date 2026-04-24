@@ -36,19 +36,16 @@ import h5py
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from models.csinet import CsiNetAutoencoder
-from models.stat_autoencoder import StatisticsAutoencoder, vectorize_covariance
+from models.stat_autoencoder import StatisticsAutoencoder
 from models.conditioned_csinet import ConditionedCsiNet
 from integration.csinet_engine import load_weights_by_structure
 
 NT = 4
 NR = 2
 NC_PRIME = 32
-COV_LATENT = 32
-PDP_LATENT = 16
+COV_LATENT = 16
+PDP_LATENT = 8
 COND_DIM = COV_LATENT + PDP_LATENT
-COV_DIM = NT * NR
-COV_VEC_DIM = COV_DIM * (COV_DIM + 1)
-PDP_DIM = COV_VEC_DIM
 GAMMA = 0.25
 M = int(NT * NC_PRIME * GAMMA)
 BITS_PER_FLOAT = 32
@@ -91,7 +88,7 @@ def load_raw_H(data_dir, scenario, split="test"):
     return H, loc, R_H, PDP
 
 
-def load_models(ckpt_dir, scenario):
+def load_models(ckpt_dir, scenario, data_dir):
     tf.keras.backend.clear_session()
 
     baseline = CsiNetAutoencoder(NT, NC_PRIME, GAMMA)
@@ -100,8 +97,15 @@ def load_models(ckpt_dir, scenario):
     if os.path.exists(bpath):
         baseline.load_weights(bpath)
 
-    stat_ae = StatisticsAutoencoder(COV_VEC_DIM, PDP_DIM, COV_LATENT, PDP_LATENT)
-    stat_ae([tf.zeros([1, COV_VEC_DIM]), tf.zeros([1, PDP_DIM])])
+    raw_path = os.path.join(data_dir, f"dataset_{scenario}.h5")
+    with h5py.File(raw_path, "r") as f:
+        R_H_sample = f["R_H"][:1]
+        PDP_sample = f["PDP"][:1]
+    cov_dim = int(np.prod(R_H_sample.shape[1:]))
+    pdp_dim = PDP_sample.shape[-1]
+
+    stat_ae = StatisticsAutoencoder(cov_dim, pdp_dim, COV_LATENT, PDP_LATENT)
+    stat_ae([tf.zeros([1, cov_dim]), tf.zeros([1, pdp_dim])])
     spath = os.path.join(ckpt_dir, f"stat_ae_{scenario}.weights.h5")
     if os.path.exists(spath):
         try:
@@ -191,7 +195,7 @@ def run_part_a(data_dir, ckpt_dir, out_dir):
     for scenario in SCENARIOS:
         print(f"\n  --- {scenario} ---")
         X_test, R_H, PDP, loc_test = load_preprocessed(data_dir, scenario)
-        baseline_model, stat_ae, cond_model = load_models(ckpt_dir, scenario)
+        baseline_model, stat_ae, cond_model = load_models(ckpt_dir, scenario, data_dir)
 
         n_test = len(X_test)
         unique_locs = np.unique(loc_test)
@@ -210,9 +214,12 @@ def run_part_a(data_dir, ckpt_dir, out_dir):
             n_loc = int(mask.sum())
             r_h = R_H[min(int(loc_id), len(R_H) - 1)]
             pdp_v = PDP[min(int(loc_id), len(PDP) - 1)]
-            r_vec = vectorize_covariance(tf.constant(r_h[np.newaxis]))
-            c = stat_ae.get_condition_vector(
-                r_vec, tf.constant(pdp_v[np.newaxis]))
+            r_flat = tf.constant(
+                r_h.reshape(1, -1).astype(np.float32))
+            p_flat = tf.constant(pdp_v[np.newaxis].astype(np.float32))
+            z_cov = stat_ae.cov_enc(r_flat)
+            z_pdp = stat_ae.pdp_enc(p_flat)
+            c = tf.concat([z_cov, z_pdp], axis=-1)
             c_rep = tf.repeat(c, n_loc, axis=0)
             z = cond_model.encoder(x_loc, c_rep, training=False)
             cond_out[mask] = cond_model.decoder(

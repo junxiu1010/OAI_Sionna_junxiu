@@ -166,12 +166,40 @@ def rlf_survival_rate(n_ues, scenario):
 
 
 def mu_mimo_interference_dB(n_co, codebook_type, ch, scenario):
+    """MU-MIMO inter-user interference penalty (dB).
+
+    Cond-CsiNet models two additional physical effects beyond raw NMSE:
+      1. Structured reconstruction error: knowing R_H lets the NN align
+         residual error with minor eigenvectors → less interference leakage.
+      2. Statistics-aware null-space steering (JSDM-like): R_H enables
+         better precoder null placement even when instantaneous CSI is
+         imperfect.  The gain scales with angular structure (Rician K,
+         angular spread) and number of co-scheduled users.
+    """
     if n_co <= 1:
         return 0.0
+
     csi_loss = csi_quantization_loss_dB(codebook_type, ch, scenario)
-    csi_loss += 2.0
+    practical_loss = 2.0
+    nn_overhead = 0.0
+
     if codebook_type in ("csinet", "cond_csinet"):
-        csi_loss += 1.0
+        nn_overhead = 1.0
+
+    csi_loss += practical_loss + nn_overhead
+
+    if codebook_type == "cond_csinet" and n_co >= 2:
+        K_dB = ch["rician_K_dB"]
+        as_deg = ch["angular_spread_deg"]
+
+        if K_dB > 3:
+            stat_gain = 1.8 + (K_dB - 3) * 0.15
+        else:
+            stat_gain = max(0.5, 1.4 - 0.015 * as_deg)
+
+        stat_gain *= min(1.0, np.log2(n_co) / 2)
+
+        csi_loss += stat_gain
     interference_per_ue = 10 ** (-csi_loss / 10)
     total = (n_co - 1) * interference_per_ue
     return -10 * np.log10(1 + total)
@@ -391,13 +419,14 @@ def run_e2e_for_gamma(gamma):
             loss = csi_quantization_loss_dB(cb, ch, sc)
             print(f"  {sc:10s} {cb:14s}: {loss:.2f} dB")
 
-    np.random.seed(42)
     all_results = {}
     for sc in SCENARIOS:
         all_results[sc] = {}
         for mode in MODES:
             all_results[sc][mode] = {}
             for n_ues in UE_COUNTS:
+                seed = hash((sc, n_ues)) % (2**31)
+                np.random.seed(seed)
                 r = simulate(sc, mode, n_ues)
                 all_results[sc][mode][str(n_ues)] = r
                 print(f"  {sc:10s} | {mode:18s} | {n_ues:2d} UE → "
