@@ -53,6 +53,24 @@ BITS_PER_FLOAT = 32
 SCENARIOS = ["UMi_LOS", "UMi_NLOS", "UMa_NLOS"]
 
 
+# ─── Normalization (must match _train_conditioned_worker.py) ────
+
+def normalize_rh(R_H_raw):
+    """R_H (N, D, D) complex → (N, 2·D²) float, Frobenius-norm normalized."""
+    N = len(R_H_raw)
+    r_flat = R_H_raw.reshape(N, -1)
+    r_ri = np.concatenate([r_flat.real, r_flat.imag], axis=-1).astype(np.float32)
+    norms = np.linalg.norm(r_ri, axis=-1, keepdims=True)
+    return r_ri / np.maximum(norms, 1e-12)
+
+
+def normalize_pdp(PDP_raw):
+    """PDP (N, T) float → (N, T) sum-normalized."""
+    pdp = PDP_raw.astype(np.float32)
+    sums = np.sum(pdp, axis=-1, keepdims=True)
+    return pdp / np.maximum(sums, 1e-12)
+
+
 def nmse_linear(x_true, x_hat):
     reduce_axes = tuple(range(1, x_true.ndim))
     mse = np.mean(np.abs(x_true - x_hat) ** 2, axis=reduce_axes)
@@ -101,12 +119,14 @@ def load_models(ckpt_dir, scenario, data_dir):
     with h5py.File(raw_path, "r") as f:
         R_H_sample = f["R_H"][:1]
         PDP_sample = f["PDP"][:1]
-    cov_dim = int(np.prod(R_H_sample.shape[1:]))
+    cov_dim = int(np.prod(R_H_sample.shape[1:])) * 2  # real + imag
     pdp_dim = PDP_sample.shape[-1]
 
     stat_ae = StatisticsAutoencoder(cov_dim, pdp_dim, COV_LATENT, PDP_LATENT)
     stat_ae([tf.zeros([1, cov_dim]), tf.zeros([1, pdp_dim])])
-    spath = os.path.join(ckpt_dir, f"stat_ae_{scenario}.weights.h5")
+    spath = os.path.join(ckpt_dir, f"stat_ae_{scenario}_fulldata.weights.h5")
+    if not os.path.exists(spath):
+        spath = os.path.join(ckpt_dir, f"stat_ae_{scenario}.weights.h5")
     if os.path.exists(spath):
         try:
             stat_ae.load_weights(spath)
@@ -115,7 +135,9 @@ def load_models(ckpt_dir, scenario, data_dir):
 
     cond = ConditionedCsiNet(NT, NC_PRIME, GAMMA, COND_DIM)
     cond([tf.zeros([1, 2, NT, NC_PRIME]), tf.zeros([1, COND_DIM])])
-    cpath = os.path.join(ckpt_dir, f"cond_csinet_{scenario}_gamma{GAMMA:.4f}_best.weights.h5")
+    cpath = os.path.join(ckpt_dir, f"condcsinet_{scenario}_gamma{GAMMA:.4f}_best.weights.h5")
+    if not os.path.exists(cpath):
+        cpath = os.path.join(ckpt_dir, f"cond_csinet_{scenario}_gamma{GAMMA:.4f}_best.weights.h5")
     if os.path.exists(cpath):
         try:
             cond.load_weights(cpath)
@@ -214,9 +236,10 @@ def run_part_a(data_dir, ckpt_dir, out_dir):
             n_loc = int(mask.sum())
             r_h = R_H[min(int(loc_id), len(R_H) - 1)]
             pdp_v = PDP[min(int(loc_id), len(PDP) - 1)]
-            r_flat = tf.constant(
-                r_h.reshape(1, -1).astype(np.float32))
-            p_flat = tf.constant(pdp_v[np.newaxis].astype(np.float32))
+            r_norm = normalize_rh(r_h[np.newaxis])
+            p_norm = normalize_pdp(pdp_v[np.newaxis])
+            r_flat = tf.constant(r_norm)
+            p_flat = tf.constant(p_norm)
             z_cov = stat_ae.cov_enc(r_flat)
             z_pdp = stat_ae.pdp_enc(p_flat)
             c = tf.concat([z_cov, z_pdp], axis=-1)

@@ -1,0 +1,53 @@
+{
+  "UMi_LOS": {
+    "UMi_LOS": {
+      "baseline": -25.51,
+      "conditioned": -28.27,
+      "gain": 2.76
+    },
+    "UMi_NLOS": {
+      "baseline": -20.16,
+      "conditioned": -21.17,
+      "gain": 1.01
+    },
+    "UMa_NLOS": {
+      "baseline": -11.11,
+      "conditioned": -11.71,
+      "gain": 0.6
+    }
+  },
+  "UMi_NLOS": {
+    "UMi_LOS": {
+      "baseline": -25.34,
+      "conditioned": -27.74,
+      "gain": 2.4
+    },
+    "UMi_NLOS": {
+      "baseline": -23.74,
+      "conditioned": -25.44,
+      "gain": 1.7
+    },
+    "UMa_NLOS": {
+      "baseline": -12.1,
+      "conditioned": -12.71,
+      "gain": 0.61
+    }
+  },
+  "UMa_NLOS": {
+    "UMi_LOS": {
+      "baseline": -27.62,
+      "conditioned": -28.62,
+      "gain": 1.0
+    },
+    "UMi_NLOS": {
+      "baseline": -26.78,
+      "conditioned": -27.27,
+      "gain": 0.49
+    },
+    "UMa_NLOS": {
+      "baseline": -15.75,
+      "conditioned": -15.86,
+      "gain": 0.12
+    }
+  }
+}

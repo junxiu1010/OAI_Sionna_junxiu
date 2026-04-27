@@ -1,0 +1,176 @@
+{
+  "UMi_LOS": {
+    "enc_film1": {
+      "gamma_mean": 1.022700309753418,
+      "gamma_dev": 0.09574797004461288,
+      "beta_mean": -0.020175570622086525,
+      "gamma_var_across_locs": 0.020505495369434357,
+      "beta_var_across_locs": 0.009282704442739487,
+      "n_ch": 16
+    },
+    "enc_film2": {
+      "gamma_mean": 1.0377461910247803,
+      "gamma_dev": 0.07019800692796707,
+      "beta_mean": -0.011458470486104488,
+      "gamma_var_across_locs": 0.007074200082570314,
+      "beta_var_across_locs": 0.009471243247389793,
+      "n_ch": 8
+    },
+    "enc_film3": {
+      "gamma_mean": 1.1362463235855103,
+      "gamma_dev": 0.13624638319015503,
+      "beta_mean": 0.09337551146745682,
+      "gamma_var_across_locs": 0.028315972536802292,
+      "beta_var_across_locs": 0.011138489469885826,
+      "n_ch": 4
+    },
+    "dec_blk0_film1": {
+      "gamma_mean": 1.0498530864715576,
+      "gamma_dev": 0.07731707394123077,
+      "beta_mean": -0.029561461880803108,
+      "gamma_var_across_locs": 0.005311290733516216,
+      "beta_var_across_locs": 0.012361928820610046,
+      "n_ch": 8
+    },
+    "dec_blk0_film2": {
+      "gamma_mean": 1.0918796062469482,
+      "gamma_dev": 0.09187958389520645,
+      "beta_mean": -0.11613635718822479,
+      "gamma_var_across_locs": 0.0031988839618861675,
+      "beta_var_across_locs": 0.004270433448255062,
+      "n_ch": 2
+    },
+    "dec_blk1_film1": {
+      "gamma_mean": 1.0073984861373901,
+      "gamma_dev": 0.07757668942213058,
+      "beta_mean": 0.013644087128341198,
+      "gamma_var_across_locs": 0.009970350190997124,
+      "beta_var_across_locs": 0.0033720643259584904,
+      "n_ch": 8
+    },
+    "dec_blk1_film2": {
+      "gamma_mean": 1.242722749710083,
+      "gamma_dev": 0.24272280931472778,
+      "beta_mean": 0.16545021533966064,
+      "gamma_var_across_locs": 0.013313276693224907,
+      "beta_var_across_locs": 0.008179552853107452,
+      "n_ch": 2
+    }
+  },
+  "UMi_NLOS": {
+    "enc_film1": {
+      "gamma_mean": 0.922862708568573,
+      "gamma_dev": 0.11980216950178146,
+      "beta_mean": -0.03273409232497215,
+      "gamma_var_across_locs": 0.01160457544028759,
+      "beta_var_across_locs": 0.008000407367944717,
+      "n_ch": 16
+    },
+    "enc_film2": {
+      "gamma_mean": 0.9881815314292908,
+      "gamma_dev": 0.05043293535709381,
+      "beta_mean": 0.025245599448680878,
+      "gamma_var_across_locs": 0.005459195002913475,
+      "beta_var_across_locs": 0.006116336211562157,
+      "n_ch": 8
+    },
+    "enc_film3": {
+      "gamma_mean": 1.1339341402053833,
+      "gamma_dev": 0.13393421471118927,
+      "beta_mean": 0.09299054741859436,
+      "gamma_var_across_locs": 0.01296179834753275,
+      "beta_var_across_locs": 0.006579697132110596,
+      "n_ch": 4
+    },
+    "dec_blk0_film1": {
+      "gamma_mean": 0.9660688638687134,
+      "gamma_dev": 0.03501491621136665,
+      "beta_mean": -0.03134181350469589,
+      "gamma_var_across_locs": 0.0058039212599396706,
+      "beta_var_across_locs": 0.006615357473492622,
+      "n_ch": 8
+    },
+    "dec_blk0_film2": {
+      "gamma_mean": 1.1318122148513794,
+      "gamma_dev": 0.1318121701478958,
+      "beta_mean": 0.002362182829529047,
+      "gamma_var_across_locs": 0.007270746864378452,
+      "beta_var_across_locs": 0.008887706324458122,
+      "n_ch": 2
+    },
+    "dec_blk1_film1": {
+      "gamma_mean": 0.9947541952133179,
+      "gamma_dev": 0.032020509243011475,
+      "beta_mean": 0.005336711183190346,
+      "gamma_var_across_locs": 0.005588633939623833,
+      "beta_var_across_locs": 0.0047420174814760685,
+      "n_ch": 8
+    },
+    "dec_blk1_film2": {
+      "gamma_mean": 1.0856475830078125,
+      "gamma_dev": 0.0856475830078125,
+      "beta_mean": 0.29753589630126953,
+      "gamma_var_across_locs": 0.005657672882080078,
+      "beta_var_across_locs": 0.01823471486568451,
+      "n_ch": 2
+    }
+  },
+  "UMa_NLOS": {
+    "enc_film1": {
+      "gamma_mean": 0.9842777848243713,
+      "gamma_dev": 0.03342447429895401,
+      "beta_mean": -0.001387071330100298,
+      "gamma_var_across_locs": 0.011174153536558151,
+      "beta_var_across_locs": 0.01834506168961525,
+      "n_ch": 16
+    },
+    "enc_film2": {
+      "gamma_mean": 0.9961512684822083,
+      "gamma_dev": 0.036844708025455475,
+      "beta_mean": 0.027601366862654686,
+      "gamma_var_across_locs": 0.005352531094104052,
+      "beta_var_across_locs": 0.011939285323023796,
+      "n_ch": 8
+    },
+    "enc_film3": {
+      "gamma_mean": 1.1251165866851807,
+      "gamma_dev": 0.12511655688285828,
+      "beta_mean": 0.07160990685224533,
+      "gamma_var_across_locs": 0.01500899251550436,
+      "beta_var_across_locs": 0.008053313940763474,
+      "n_ch": 4
+    },
+    "dec_blk0_film1": {
+      "gamma_mean": 0.9985754489898682,
+      "gamma_dev": 0.10270755738019943,
+      "beta_mean": -0.017162106931209564,
+      "gamma_var_across_locs": 0.011936869472265244,
+      "beta_var_across_locs": 0.01832183077931404,
+      "n_ch": 8
+    },
+    "dec_blk0_film2": {
+      "gamma_mean": 1.2124141454696655,
+      "gamma_dev": 0.21241408586502075,
+      "beta_mean": 0.06205347925424576,
+      "gamma_var_across_locs": 0.012638529762625694,
+      "beta_var_across_locs": 0.019301123917102814,
+      "n_ch": 2
+    },
+    "dec_blk1_film1": {
+      "gamma_mean": 1.0402133464813232,
+      "gamma_dev": 0.054063063114881516,
+      "beta_mean": -0.00022032708511687815,
+      "gamma_var_across_locs": 0.007762974593788385,
+      "beta_var_across_locs": 0.00815772544592619,
+      "n_ch": 8
+    },
+    "dec_blk1_film2": {
+      "gamma_mean": 1.0834616422653198,
+      "gamma_dev": 0.08346159011125565,
+      "beta_mean": 0.15477542579174042,
+      "gamma_var_across_locs": 0.0065620094537734985,
+      "beta_var_across_locs": 0.010899944230914116,
+      "n_ch": 2
+    }
+  }
+}

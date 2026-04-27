@@ -6,6 +6,8 @@ Conditioned CsiNet worker — 합리적 학습 전략
 - Phase 1: FiLM warmup (FiLM 변수만 학습, LR=1e-3)
 - Phase 2: Full fine-tune (전체 변수, LR=3e-4)
 - Data: fulldata (floor=1e-30, 필터링 없음)
+- R_H: real+imag concat + Frobenius-norm normalize  (cov_dim=128)
+- PDP: sum-normalize to probability distribution      (pdp_dim=72)
 """
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -42,6 +44,24 @@ LR_PHASE1 = 1e-3
 LR_PHASE2 = 3e-4
 
 
+# ─── Normalization ──────────────────────────────────────
+
+def normalize_rh(R_H_raw):
+    """R_H (N, D, D) complex → (N, 2·D²) float, Frobenius-norm normalized."""
+    N = len(R_H_raw)
+    r_flat = R_H_raw.reshape(N, -1)
+    r_ri = np.concatenate([r_flat.real, r_flat.imag], axis=-1).astype(np.float32)
+    norms = np.linalg.norm(r_ri, axis=-1, keepdims=True)
+    return r_ri / np.maximum(norms, 1e-12)
+
+
+def normalize_pdp(PDP_raw):
+    """PDP (N, T) float → (N, T) sum-normalized (probability distribution)."""
+    pdp = PDP_raw.astype(np.float32)
+    sums = np.sum(pdp, axis=-1, keepdims=True)
+    return pdp / np.maximum(sums, 1e-12)
+
+
 # ─── Data ───────────────────────────────────────────────
 
 def load_fulldata(scenario):
@@ -70,10 +90,11 @@ def load_fulldata(scenario):
 def get_or_train_stat_ae(scenario, R_H_train, PDP_train, R_H_val, PDP_val):
     ckpt = os.path.join(CKPT_DIR, f"stat_ae_{scenario}_fulldata.weights.h5")
 
-    R_H_flat_tr = R_H_train.reshape(len(R_H_train), -1).astype(np.float32)
-    PDP_flat_tr = PDP_train.astype(np.float32)
+    R_H_flat_tr = normalize_rh(R_H_train)
+    PDP_flat_tr = normalize_pdp(PDP_train)
     cov_dim = R_H_flat_tr.shape[-1]
     pdp_dim = PDP_flat_tr.shape[-1]
+    print(f"  StatAE input dims: cov={cov_dim}, pdp={pdp_dim}", flush=True)
 
     stat_ae = StatisticsAutoencoder(
         cov_dim=cov_dim, pdp_dim=pdp_dim,
@@ -86,8 +107,8 @@ def get_or_train_stat_ae(scenario, R_H_train, PDP_train, R_H_val, PDP_val):
         return stat_ae
 
     print(f"  Training StatAE for {scenario}...", flush=True)
-    R_H_flat_val = R_H_val.reshape(len(R_H_val), -1).astype(np.float32)
-    PDP_flat_val = PDP_val.astype(np.float32)
+    R_H_flat_val = normalize_rh(R_H_val)
+    PDP_flat_val = normalize_pdp(PDP_val)
 
     STAT_EPOCHS = 200
     steps = STAT_EPOCHS * ((len(R_H_flat_tr) + BATCH_SIZE - 1) // BATCH_SIZE)
@@ -132,8 +153,8 @@ def get_or_train_stat_ae(scenario, R_H_train, PDP_train, R_H_val, PDP_val):
 
 
 def encode_conditions(stat_ae, R_H, PDP):
-    R_flat = R_H.reshape(len(R_H), -1).astype(np.float32)
-    P_flat = PDP.astype(np.float32)
+    R_flat = normalize_rh(R_H)
+    P_flat = normalize_pdp(PDP)
     z_cov = stat_ae.cov_enc(R_flat).numpy()
     z_pdp = stat_ae.pdp_enc(P_flat).numpy()
     return np.concatenate([z_cov, z_pdp], axis=-1).astype(np.float32)

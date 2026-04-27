@@ -20,10 +20,9 @@ ue_counts = raw["ue_counts"]
 results = raw["results"]
 
 SCENARIOS = {
-    "UMi-LOS":  "3GPP UMi-LOS (Street Canyon)",
-    "UMi-NLOS": "3GPP UMi-NLOS (Street Canyon)",
-    "UMa-LOS":  "3GPP UMa-LOS (Urban Macro)",
-    "UMa-NLOS": "3GPP UMa-NLOS (Urban Macro)",
+    "UMi-LOS":  ("3GPP UMi-LOS (Street Canyon)", "UMi_LOS"),
+    "UMa-LOS":  ("3GPP UMi-NLOS (Street Canyon)", "UMi_NLOS"),
+    "UMa-NLOS": ("3GPP UMa-NLOS (Urban Macro)", "UMa_NLOS"),
 }
 
 MODES = ["Type 1 SU-MIMO", "Type 2 SU-MIMO", "Type 2 MU-MIMO"]
@@ -38,9 +37,7 @@ x = np.arange(len(ue_counts))
 n_modes = len(MODES)
 bar_w = 0.25
 
-for sc_key, sc_title in SCENARIOS.items():
-    if sc_title is None:
-        continue
+for sc_key, (sc_title, file_tag) in SCENARIOS.items():
     sc_data = results[sc_key]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -59,15 +56,18 @@ for sc_key, sc_title in SCENARIOS.items():
         ax.set_ylabel(ylabel, fontsize=11)
         ax.set_xticks(x)
         ax.set_xticklabels([str(u) for u in ue_counts])
-        ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3, axis="y")
 
         if metric_key == "bler":
             ax.set_ylim(0, max(ax.get_ylim()[1], 5))
 
-    plt.tight_layout(rect=[0, 0, 1, 0.90])
-    out_name = f"calibrated_{sc_key.replace('-','_')}_bar.png"
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=len(MODES),
+               fontsize=10, bbox_to_anchor=(0.5, 0.90), framealpha=0.9)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.82])
+    out_name = f"calibrated_{file_tag}_bar.png"
     out_path = FIG_DIR / out_name
-    plt.savefig(out_path, dpi=150)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {out_path}")
